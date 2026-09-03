@@ -1,0 +1,10 @@
+{
+  "colors": {
+    "primary": "{{colors.primary.default.color}}",
+    "on_primary": "{{colors.on_primary.default.color}}",
+    "surface": "{{colors.surface.default.color}}",
+    "on_surface": "{{colors.on_surface.default.color}}",
+    "surface_alpha": "rgba({{colors.surface.default.rgb}}, 0.7)",
+    "primary_alpha": "rgba({{colors.primary.default.rgb}}, 0.4)"
+  }
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=Zenith-Shell Context & Connectivity Daemon
+PartOf=graphical-session.target
+After=graphical-session.target quickshell.service
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=simple
+ExecStart=%h/.config/quickshell/scripts/daemon/context_daemon_v2.py
+Restart=on-failure
+RestartSec=2
+Slice=session.slice
+MemoryMax=250M
+CPUQuota=20%
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

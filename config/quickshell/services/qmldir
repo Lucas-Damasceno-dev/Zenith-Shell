@@ -1,0 +1,23 @@
+singleton BatteryStatsService 1.0 BatteryStatsService.qml
+singleton AudioStatusService 1.0 AudioStatusService.qml
+singleton NetworkStatusService 1.0 NetworkStatusService.qml
+singleton SystemMetricsService 1.0 SystemMetricsService.qml
+singleton ExtendedMetricsService 1.0 ExtendedMetricsService.qml
+singleton WeatherStatusService 1.0 WeatherStatusService.qml
+singleton PrivacyService 1.0 PrivacyService.qml
+singleton NixMonitorService 1.0 NixMonitorService.qml
+singleton QuickNotesService 1.0 QuickNotesService.qml
+singleton ProductivityService 1.0 ProductivityService.qml
+singleton USBService 1.0 USBService.qml
+singleton KeyboardLayoutService 1.0 KeyboardLayoutService.qml
+singleton WallpaperService 1.0 WallpaperService.qml
+singleton ConnectivityService 1.0 ConnectivityService.qml
+GpuMonitor 1.0 GpuMonitor.qml
+TimedProcess 1.0 TimedProcess.qml
+CommandRunner 1.0 CommandRunner.qml
+SettingsStore 1.0 SettingsStore.qml
+GpuChart 1.0 GpuChart.qml
+singleton KdeConnectService 1.0 KdeConnectService.qml
+singleton ScreenFilterService 1.0 ScreenFilterService.qml
+singleton HyprlandRuntimeService 1.0 HyprlandRuntimeService.qml
+singleton UtilityService 1.0 UtilityService.qml

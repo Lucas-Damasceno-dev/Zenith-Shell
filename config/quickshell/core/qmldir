@@ -1,0 +1,14 @@
+singleton DesignTokens 1.0 DesignTokens.qml
+singleton ColorScheme 1.0 ColorScheme.qml
+singleton FeatureFlags 1.0 FeatureFlags.qml
+singleton EventBus 1.0 EventBus.qml
+singleton ConfigFacade 1.0 ConfigFacade.qml
+singleton PopupUtils 1.0 PopupUtils.qml
+singleton ShellController 1.0 ShellController.qml
+singleton MinuteTicker 1.0 MinuteTicker.qml
+singleton MetricsTicker 1.0 MetricsTicker.qml
+singleton Logger 1.0 Logger.qml
+singleton RuntimePaths 1.0 RuntimePaths.qml
+AnimatedWindow 1.0 AnimatedWindow.qml
+PopupWindow 1.0 PopupWindow.qml
+singleton Style 1.0 Style.qml

@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# System and logs
+*.log
+*.tmp
+.cache/
+
+# User overrides
+config/hypr/monitors.conf
+config/hypr/workspaces.conf
+config/hypr/hyprland-gui.conf
+
+# Lock files that should be user-specific
+result
+result-*

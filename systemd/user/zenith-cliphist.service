@@ -1,0 +1,13 @@
+[Unit]
+Description=Zenith-Shell Clipboard History Watcher
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash -c 'wl-paste --type text --watch cliphist store & wl-paste --type image --watch cliphist store & wait'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

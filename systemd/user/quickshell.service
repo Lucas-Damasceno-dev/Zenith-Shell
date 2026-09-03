@@ -1,0 +1,21 @@
+[Unit]
+Description=Zenith-Shell Quickshell Desktop Environment
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=simple
+ExecStart=quickshell --no-duplicate
+Restart=on-failure
+RestartSec=3
+Slice=session.slice
+MemoryMax=800M
+MemoryHigh=700M
+CPUWeight=200
+Environment=QT_QPA_PLATFORM=wayland
+Environment=QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+Environment=QT_ICON_THEME=Papirus-Dark
+
+[Install]
+WantedBy=graphical-session.target

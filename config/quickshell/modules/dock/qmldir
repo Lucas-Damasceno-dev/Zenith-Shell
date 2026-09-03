@@ -1,0 +1,13 @@
+Dock 1.0 Dock.qml
+DockItem 1.0 DockItem.qml
+DockSeparator 1.0 DockSeparator.qml
+DockTooltip 1.0 DockTooltip.qml
+singleton DockService 1.0 DockService.qml
+DockContextMenu 1.0 DockContextMenu.qml
+DockMprisPill 1.0 DockMprisPill.qml
+DockTraySection 1.0 DockTraySection.qml
+DockTrash 1.0 DockTrash.qml
+DockUtilities 1.0 DockUtilities.qml
+DockPreview 1.0 DockPreview.qml
+DockScratchpad 1.0 DockScratchpad.qml
+DockRecentFiles 1.0 DockRecentFiles.qml
