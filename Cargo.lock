@@ -1810,8 +1810,10 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
+ "cosmic-text",
  "smithay-client-toolkit",
  "thiserror",
+ "tiny-skia",
  "tracing",
  "wayland-client",
  "wayland-protocols",

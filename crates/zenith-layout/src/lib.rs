@@ -48,7 +48,9 @@ pub struct NodeStyle {
     pub border_color: Color,
     pub border_width: f32,
     pub border_radius: f32,
+    pub flex_grow: f32,
 }
+
 
 impl Default for NodeStyle {
     fn default() -> Self {
@@ -65,7 +67,9 @@ impl Default for NodeStyle {
             border_color: Color::transparent(),
             border_width: 0.0,
             border_radius: 0.0,
+            flex_grow: 0.0,
         }
+
     }
 }
 
@@ -172,7 +176,9 @@ impl LayoutEngine {
             flex_direction: style.flex_direction,
             justify_content: style.justify_content,
             align_items: style.align_items,
+            flex_grow: style.flex_grow,
             gap: Size {
+
                 width: length(style.gap),
                 height: length(style.gap),
             },

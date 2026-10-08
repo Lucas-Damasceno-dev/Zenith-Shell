@@ -84,7 +84,10 @@ pub struct WaylandApp {
     pub layout_engine: LayoutEngine,
     pub runtime: LuauRuntime,
     pub root_ui: UiNode,
+    pub font_system: cosmic_text::FontSystem,
+    pub swash_cache: cosmic_text::SwashCache,
 }
+
 
 impl WaylandApp {
     /// Initialize the Wayland connection, registries, Luau runtime, and layer shell bar.
@@ -117,6 +120,8 @@ impl WaylandApp {
             layout_engine,
             runtime,
             root_ui,
+            font_system: cosmic_text::FontSystem::new(),
+            swash_cache: cosmic_text::SwashCache::new(),
         };
 
         app.create_bar(&qh)?;
@@ -178,37 +183,151 @@ impl WaylandApp {
         // Compute Taffy layout on the Luau tree
         let computed_boxes = self.layout_engine.compute(&self.root_ui, width as f32, height as f32);
 
-        for b in &computed_boxes {
-            let x_start = (b.x as usize).min(width as usize);
-            let x_end = ((b.x + b.width) as usize).min(width as usize);
-            let y_start = (b.y as usize).min(height as usize);
-            let y_end = ((b.y + b.height) as usize).min(height as usize);
+        // Pass 1: Vector painting via tiny-skia on top of SHM canvas
+        {
+            let mut pixmap = tiny_skia::PixmapMut::from_bytes(canvas, width, height)
+                .ok_or("Failed to wrap SHM canvas with tiny-skia PixmapMut")?;
 
-            let bg_color = b.background_color.to_argb_u32();
-            let border_color = b.border_color.to_argb_u32();
-            let has_border = b.border_width > 0.0 && b.border_color.a > 0;
+            for b in &computed_boxes {
+                if b.width <= 0.0 || b.height <= 0.0 {
+                    continue;
+                }
 
-            for y in y_start..y_end {
-                for x in x_start..x_end {
-                    let is_border_pixel = has_border && (
-                        x < x_start + b.border_width as usize
-                        || x >= x_end.saturating_sub(b.border_width as usize)
-                        || y < y_start + b.border_width as usize
-                        || y >= y_end.saturating_sub(b.border_width as usize)
-                    );
+                let radius = b.border_radius.max(0.0);
+                let rect = tiny_skia::Rect::from_xywh(b.x, b.y, b.width, b.height);
+                if let Some(r) = rect {
+                    let path = if radius > 0.0 {
+                        let r = radius.min(b.width / 2.0).min(b.height / 2.0);
+                        let mut pb = tiny_skia::PathBuilder::new();
+                        let x = b.x;
+                        let y = b.y;
+                        let w = b.width;
+                        let h = b.height;
 
-                    let pixel = if is_border_pixel { border_color } else { bg_color };
+                        pb.move_to(x + r, y);
+                        pb.line_to(x + w - r, y);
+                        pb.quad_to(x + w, y, x + w, y + r);
+                        pb.line_to(x + w, y + h - r);
+                        pb.quad_to(x + w, y + h, x + w - r, y + h);
+                        pb.line_to(x + r, y + h);
+                        pb.quad_to(x, y + h, x, y + h - r);
+                        pb.line_to(x, y + r);
+                        pb.quad_to(x, y, x + r, y);
+                        pb.close();
+                        pb.finish()
+                    } else {
+                        Some(tiny_skia::PathBuilder::from_rect(r))
+                    };
 
-                    let idx = (y * width as usize + x) * 4;
-                    if idx + 3 < canvas.len() {
-                        canvas[idx] = (pixel & 0xFF) as u8;
-                        canvas[idx + 1] = ((pixel >> 8) & 0xFF) as u8;
-                        canvas[idx + 2] = ((pixel >> 16) & 0xFF) as u8;
-                        canvas[idx + 3] = ((pixel >> 24) & 0xFF) as u8;
+                    let path = match path {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    // Fill background with anti-aliasing
+                    if b.background_color.a > 0 {
+                        let mut fill_paint = tiny_skia::Paint::default();
+                        fill_paint.anti_alias = true;
+                        fill_paint.set_color_rgba8(
+                            b.background_color.r,
+                            b.background_color.g,
+                            b.background_color.b,
+                            b.background_color.a,
+                        );
+                        pixmap.fill_path(
+                            &path,
+                            &fill_paint,
+                            tiny_skia::FillRule::Winding,
+                            tiny_skia::Transform::identity(),
+                            None,
+                        );
+                    }
+
+                    // Stroke border with anti-aliasing
+                    if b.border_width > 0.0 && b.border_color.a > 0 {
+                        let mut stroke_paint = tiny_skia::Paint::default();
+                        stroke_paint.anti_alias = true;
+                        stroke_paint.set_color_rgba8(
+                            b.border_color.r,
+                            b.border_color.g,
+                            b.border_color.b,
+                            b.border_color.a,
+                        );
+
+                        let stroke = tiny_skia::Stroke {
+                            width: b.border_width,
+                            ..Default::default()
+                        };
+
+                        pixmap.stroke_path(
+                            &path,
+                            &stroke_paint,
+                            &stroke,
+                            tiny_skia::Transform::identity(),
+                            None,
+                        );
                     }
                 }
             }
+        } // pixmap borrow of canvas is dropped here
+
+        // Pass 2: Draw shaped glyphs with cosmic-text onto the anti-aliased canvas
+        for b in &computed_boxes {
+            if let Some((ref text, color, font_size)) = b.text {
+                let line_height = font_size * 1.3;
+                let metrics = cosmic_text::Metrics::new(font_size, line_height);
+                let mut buffer = cosmic_text::Buffer::new(&mut self.font_system, metrics);
+                buffer.set_text(
+                    text,
+                    &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
+                    cosmic_text::Shaping::Advanced,
+                    None,
+                );
+
+                buffer.shape_until_scroll(&mut self.font_system, false);
+
+                let cosmic_color = cosmic_text::Color::rgba(color.r, color.g, color.b, color.a);
+                let bx = b.x as i32;
+                // Center text vertically inside its computed bounding box
+                let text_offset_y = ((b.height - line_height) / 2.0).max(0.0) as i32;
+                let by = b.y as i32 + text_offset_y;
+
+                buffer.draw(
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    cosmic_color,
+                    |gx, gy, _gw, _gh, glyph_color| {
+                        let px = bx + gx;
+                        let py = by + gy;
+                        if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
+                            let idx = (py as usize * width as usize + px as usize) * 4;
+                            let alpha = glyph_color.a() as u32;
+                            if alpha > 0 && idx + 3 < canvas.len() {
+                                let bg_b = canvas[idx] as u32;
+                                let bg_g = canvas[idx + 1] as u32;
+                                let bg_r = canvas[idx + 2] as u32;
+                                let bg_a = canvas[idx + 3] as u32;
+
+                                let fg_b = glyph_color.b() as u32;
+                                let fg_g = glyph_color.g() as u32;
+                                let fg_r = glyph_color.r() as u32;
+
+                                let out_r = (fg_r * alpha + bg_r * (255 - alpha)) / 255;
+                                let out_g = (fg_g * alpha + bg_g * (255 - alpha)) / 255;
+                                let out_b = (fg_b * alpha + bg_b * (255 - alpha)) / 255;
+                                let out_a = alpha + (bg_a * (255 - alpha)) / 255;
+
+                                canvas[idx] = out_b as u8;
+                                canvas[idx + 1] = out_g as u8;
+                                canvas[idx + 2] = out_r as u8;
+                                canvas[idx + 3] = out_a as u8;
+                            }
+                        }
+                    },
+                );
+            }
         }
+
 
         if let Some(ref surface) = self.bar_surface {
             buffer.attach_to(surface.wl_surface())?;
@@ -218,6 +337,7 @@ impl WaylandApp {
 
         Ok(())
     }
+
 }
 
 // SCTK Delegate implementations

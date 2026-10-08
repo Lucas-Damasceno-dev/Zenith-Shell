@@ -198,7 +198,13 @@ impl LuauRuntime {
             }
         }
 
+        if let Ok(grow) = tbl.get::<f32>("flex_grow") {
+            style.flex_grow = grow;
+        }
+
+
         if let Ok(gap) = tbl.get::<f32>("gap") {
+
             style.gap = gap;
         }
 
