@@ -138,11 +138,22 @@ impl LuauRuntime {
         zenith_table.set("Services", services_table)?;
         zenith_table.set("Theme", theme_fn)?;
 
+        // Zenith.exec(command)
+        let exec_fn = lua.create_function(|_, cmd: String| {
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .spawn();
+            Ok(())
+        })?;
+        zenith_table.set("exec", exec_fn)?;
+
         lua.globals().set("Zenith", zenith_table)?;
 
         info!("Luau Runtime initialized successfully");
         Ok(Self { lua })
     }
+
 
     /// Load and evaluate a Luau script string, returning the root UI node.
     pub fn eval_ui(&self, script: &str) -> Result<UiNode, LuaError> {
@@ -152,6 +163,19 @@ impl LuauRuntime {
             _ => Err(LuaError::runtime("Script must return a Zenith UI node table")),
         }
     }
+
+    /// Trigger a registered click action by command or function key.
+    pub fn trigger_click(&self, action: &str) -> Result<(), LuaError> {
+        if action.starts_with("cmd:") {
+            let cmd = &action[4..];
+            let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+        } else {
+            // Check if action corresponds to a shell command directly
+            let _ = std::process::Command::new("sh").arg("-c").arg(action).spawn();
+        }
+        Ok(())
+    }
+
 
     fn parse_ui_node(tbl: &LuaTable) -> Result<UiNode, LuaError> {
         let node_type: String = tbl.get("__type").unwrap_or_else(|_| "Box".to_string());
@@ -178,8 +202,20 @@ impl LuauRuntime {
                 }
             }
 
-            Ok(UiNode::Box { style, children })
+            let on_click: Option<String> = if let Ok(func) = tbl.get::<LuaFunction>("on_click") {
+                let key = format!("click_{:p}", &func as *const _);
+                if let Ok(reg) = tbl.get::<LuaTable>("__registry") {
+                    let _ = reg.set(key.clone(), func);
+                }
+                Some(key)
+            } else {
+                tbl.get::<String>("on_click").ok()
+            };
+
+
+            Ok(UiNode::Box { style, children, on_click })
         }
+
     }
 
     fn parse_style(tbl: &LuaTable) -> Result<NodeStyle, LuaError> {

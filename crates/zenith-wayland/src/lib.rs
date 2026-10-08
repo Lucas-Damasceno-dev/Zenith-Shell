@@ -6,6 +6,11 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
+        Capability, SeatHandler, SeatState,
+    },
+    delegate_seat, delegate_pointer,
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -17,6 +22,7 @@ use smithay_client_toolkit::{
         slot::SlotPool,
         Shm, ShmHandler,
     },
+
 };
 use tracing::{error, info};
 use wayland_client::{
@@ -72,11 +78,15 @@ return Zenith.Box({
 pub struct WaylandApp {
     pub registry_state: RegistryState,
     pub output_state: OutputState,
+    pub seat_state: SeatState,
     pub compositor_state: CompositorState,
     pub shm: Shm,
     pub pool: SlotPool,
     pub layer_shell: LayerShell,
     pub bar_surface: Option<LayerSurface>,
+    pub pointer: Option<wayland_client::protocol::wl_pointer::WlPointer>,
+    pub pointer_pos: (f64, f64),
+    pub computed_boxes: Vec<zenith_layout::ComputedBox>,
     pub width: u32,
     pub height: u32,
     pub configured: bool,
@@ -87,6 +97,7 @@ pub struct WaylandApp {
     pub font_system: cosmic_text::FontSystem,
     pub swash_cache: cosmic_text::SwashCache,
 }
+
 
 
 impl WaylandApp {
@@ -101,6 +112,7 @@ impl WaylandApp {
         let shm = Shm::bind(&globals, &qh)?;
         let pool = SlotPool::new(1920 * 40 * 4, &shm)?;
 
+        let seat_state = SeatState::new(&globals, &qh);
         let runtime = LuauRuntime::new()?;
         let root_ui = runtime.eval_ui(DEFAULT_LUAU_SCRIPT)?;
         let layout_engine = LayoutEngine::new();
@@ -108,11 +120,15 @@ impl WaylandApp {
         let mut app = Self {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
+            seat_state,
             compositor_state,
             shm,
             pool,
             layer_shell,
             bar_surface: None,
+            pointer: None,
+            pointer_pos: (0.0, 0.0),
+            computed_boxes: Vec::new(),
             width: 1920,
             height: 38,
             configured: false,
@@ -125,6 +141,7 @@ impl WaylandApp {
         };
 
         app.create_bar(&qh)?;
+
 
         Ok((app, conn, event_queue))
     }
@@ -181,14 +198,16 @@ impl WaylandApp {
         canvas.fill(0);
 
         // Compute Taffy layout on the Luau tree
-        let computed_boxes = self.layout_engine.compute(&self.root_ui, width as f32, height as f32);
+        self.computed_boxes = self.layout_engine.compute(&self.root_ui, width as f32, height as f32);
 
         // Pass 1: Vector painting via tiny-skia on top of SHM canvas
         {
             let mut pixmap = tiny_skia::PixmapMut::from_bytes(canvas, width, height)
+
                 .ok_or("Failed to wrap SHM canvas with tiny-skia PixmapMut")?;
 
-            for b in &computed_boxes {
+            for b in &self.computed_boxes {
+
                 if b.width <= 0.0 || b.height <= 0.0 {
                     continue;
                 }
@@ -272,8 +291,9 @@ impl WaylandApp {
         } // pixmap borrow of canvas is dropped here
 
         // Pass 2: Draw shaped glyphs with cosmic-text onto the anti-aliased canvas
-        for b in &computed_boxes {
+        for b in &self.computed_boxes {
             if let Some((ref text, color, font_size)) = b.text {
+
                 let line_height = font_size * 1.3;
                 let metrics = cosmic_text::Metrics::new(font_size, line_height);
                 let mut buffer = cosmic_text::Buffer::new(&mut self.font_system, metrics);
@@ -345,14 +365,113 @@ delegate_compositor!(WaylandApp);
 delegate_output!(WaylandApp);
 delegate_shm!(WaylandApp);
 delegate_layer!(WaylandApp);
+delegate_seat!(WaylandApp);
+delegate_pointer!(WaylandApp);
 delegate_registry!(WaylandApp);
 
 impl ProvidesRegistryState for WaylandApp {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
+
+impl SeatHandler for WaylandApp {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wayland_client::protocol::wl_seat::WlSeat) {
+        if self.pointer.is_none() {
+            if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
+                info!("Acquired Wayland pointer from seat");
+                self.pointer = Some(ptr);
+            }
+        }
+    }
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
+                info!("Acquired Wayland pointer on capability");
+                self.pointer = Some(ptr);
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            self.pointer = None;
+        }
+    }
+
+    fn remove_seat(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+        self.pointer = None;
+    }
+}
+
+impl PointerHandler for WaylandApp {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wayland_client::protocol::wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.pointer_pos = event.position;
+                }
+                PointerEventKind::Press { button, .. } => {
+                    if button == BTN_LEFT {
+                        let (px, py) = self.pointer_pos;
+                        // Find clicked box with on_click handler (deepest/innermost box)
+                        let mut clicked_action: Option<String> = None;
+                        for b in self.computed_boxes.iter().rev() {
+                            if px >= b.x as f64
+                                && px <= (b.x + b.width) as f64
+                                && py >= b.y as f64
+                                && py <= (b.y + b.height) as f64
+                            {
+                                if let Some(ref action) = b.on_click {
+                                    clicked_action = Some(action.clone());
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(action) = clicked_action {
+                            info!("Triggering Luau on_click: {}", action);
+                            if let Err(e) = self.runtime.trigger_click(&action) {
+                                error!("Error executing on_click action: {}", e);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 
 impl CompositorHandler for WaylandApp {
     fn scale_factor_changed(

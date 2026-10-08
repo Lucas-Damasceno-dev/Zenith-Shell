@@ -79,6 +79,7 @@ pub enum UiNode {
     Box {
         style: NodeStyle,
         children: Vec<UiNode>,
+        on_click: Option<String>,
     },
     Text {
         text: String,
@@ -100,7 +101,9 @@ pub struct ComputedBox {
     pub border_width: f32,
     pub border_radius: f32,
     pub text: Option<(String, Color, f32)>,
+    pub on_click: Option<String>,
 }
+
 
 /// Engine to calculate layout positions for an entire UI tree.
 pub struct LayoutEngine {
@@ -136,11 +139,12 @@ impl LayoutEngine {
 
     fn build_taffy_node(&mut self, node: &UiNode) -> NodeId {
         match node {
-            UiNode::Box { style, children } => {
+            UiNode::Box { style, children, .. } => {
                 let child_nodes: Vec<NodeId> = children.iter().map(|c| self.build_taffy_node(c)).collect();
                 let taffy_style = Self::convert_style(style);
                 self.taffy.new_with_children(taffy_style, &child_nodes).unwrap()
             }
+
             UiNode::Text { style, text, font_size, .. } => {
                 let mut taffy_style = Self::convert_style(style);
                 if style.width.is_none() {
@@ -199,7 +203,7 @@ impl LayoutEngine {
         let abs_y = parent_y + layout.location.y;
 
         match node {
-            UiNode::Box { style, children } => {
+            UiNode::Box { style, children, on_click } => {
                 out.push(ComputedBox {
                     x: abs_x,
                     y: abs_y,
@@ -210,6 +214,7 @@ impl LayoutEngine {
                     border_width: style.border_width,
                     border_radius: style.border_radius,
                     text: None,
+                    on_click: on_click.clone(),
                 });
 
                 let child_ids = self.taffy.children(node_id).unwrap();
@@ -228,8 +233,10 @@ impl LayoutEngine {
                     border_width: style.border_width,
                     border_radius: style.border_radius,
                     text: Some((text.clone(), *color, *font_size)),
+                    on_click: None,
                 });
             }
         }
+
     }
 }

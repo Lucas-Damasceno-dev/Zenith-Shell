@@ -48,11 +48,12 @@ return Zenith.Box({
         -- ═════════════════════════════════════════════════════════════
         -- 1. LEFT CLUSTER: Launcher + Workspaces + Active App
         -- ═════════════════════════════════════════════════════════════
-        -- NixOS Launcher Pill
+        -- NixOS Launcher Pill (Interactive)
         Zenith.Box({
             padding = { x = 12, y = 4 },
             border_radius = 8,
             background = c_primary,
+            on_click = "cmd:notify-send 'Zenith Shell' 'Launcher clicked!' -i preferences-system",
             children = {
                 Zenith.Text({
                     text = "󱄅 NixOS",
@@ -61,6 +62,7 @@ return Zenith.Box({
                 })
             }
         }),
+
 
         -- Workspace Indicator Cluster
         Zenith.Box({
@@ -247,6 +249,7 @@ return Zenith.Box({
             padding = { x = 10, y = 4 },
             border_radius = 8,
             background = Zenith.hex("#e63946"),
+            on_click = "cmd:notify-send 'Zenith Shell' 'Power menu triggered' -u critical",
             children = {
                 Zenith.Text({
                     text = "⏻",
@@ -255,6 +258,7 @@ return Zenith.Box({
                 })
             }
         }),
+
     }
 })
 
