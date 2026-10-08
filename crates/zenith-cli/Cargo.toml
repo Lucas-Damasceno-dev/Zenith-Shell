@@ -16,3 +16,5 @@ tracing = "0.1"
 wayland-client = "0.31"
 smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"] }
 calloop = "0.13"
+calloop-wayland-source = "0.3"
+notify = "8.0"
