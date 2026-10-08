@@ -1,0 +1,24 @@
+[package]
+name = "zenith-wayland"
+version.workspace = true
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zenith-core = { path = "../zenith-core" }
+zenith-layout = { path = "../zenith-layout" }
+zenith-runtime = { path = "../zenith-runtime" }
+smithay-client-toolkit = { version = "0.19", default-features = true }
+cosmic-text = "0.19"
+tiny-skia = "0.12"
+wayland-client = "0.31"
+
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.13"
+calloop-wayland-source = "0.3"
+tracing = "0.1"
+thiserror = "1.0"
+
+

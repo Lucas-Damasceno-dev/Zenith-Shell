@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zenith-core",
+    "crates/zenith-wayland",
+    "crates/zenith-layout",
+    "crates/zenith-services",
+    "crates/zenith-runtime",
+    "crates/zenith-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Lucas Damasceno"]
+license = "MIT"
+repository = "https://github.com/Lucas-Damasceno-dev/Zenith-Shell"

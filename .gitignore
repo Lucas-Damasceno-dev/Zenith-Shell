@@ -17,3 +17,7 @@ config/hypr/hyprland-gui.conf
 # Lock files that should be user-specific
 result
 result-*
+
+# Rust build artifacts
+target/
+
