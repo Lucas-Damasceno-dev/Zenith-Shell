@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/zenith-core",
     "crates/zenith-wayland",
+    "crates/zenith-layout",
+    "crates/zenith-runtime",
     "crates/zenith-cli",
 ]
 

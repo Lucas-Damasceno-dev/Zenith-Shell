@@ -1,0 +1,13 @@
+[package]
+name = "zenith-layout"
+version.workspace = true
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zenith-core = { path = "../zenith-core" }
+taffy = "0.14"
+cosmic-text = "0.19"
+tracing = "0.1"
+thiserror = "1.0"

@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 zenith-core = { path = "../zenith-core" }
+zenith-layout = { path = "../zenith-layout" }
+zenith-runtime = { path = "../zenith-runtime" }
 smithay-client-toolkit = { version = "0.19", default-features = true }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }

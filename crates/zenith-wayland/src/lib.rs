@@ -24,6 +24,49 @@ use wayland_client::{
     protocol::{wl_output, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
+use zenith_layout::{LayoutEngine, UiNode};
+use zenith_runtime::LuauRuntime;
+
+/// Default Luau script to configure the status bar interface.
+pub const DEFAULT_LUAU_SCRIPT: &str = r##"
+return Zenith.Box({
+    direction = "row",
+    height = 38,
+    padding = { x = 12, y = 4 },
+    gap = 12,
+    background = Zenith.hex("#12131cF6"),
+    border_color = Zenith.hex("#7c4dff"),
+    border_width = 1,
+    children = {
+        Zenith.Box({
+            padding = { x = 10, y = 4 },
+            border_radius = 6,
+            background = Zenith.hex("#7c4dff"),
+            children = {
+                Zenith.Text({ text = "ZENITH v2", font_size = 12, color = Zenith.hex("#FFFFFF") })
+            }
+        }),
+        Zenith.Box({
+            padding = { x = 20, y = 4 },
+            border_radius = 6,
+            background = Zenith.hex("#252839CC"),
+            border_color = Zenith.hex("#3b3f58"),
+            border_width = 1,
+            children = {
+                Zenith.Text({ text = "Rust + Luau + Smithay", font_size = 12, color = Zenith.hex("#e0e2ee") })
+            }
+        }),
+        Zenith.Box({
+            padding = { x = 12, y = 4 },
+            border_radius = 6,
+            background = Zenith.hex("#1f2130"),
+            children = {
+                Zenith.Text({ text = "100% | 144Hz", font_size = 12, color = Zenith.hex("#a6accd") })
+            }
+        })
+    }
+})
+"##;
 
 /// Main application state for Wayland event handling.
 pub struct WaylandApp {
@@ -38,10 +81,13 @@ pub struct WaylandApp {
     pub height: u32,
     pub configured: bool,
     pub running: bool,
+    pub layout_engine: LayoutEngine,
+    pub runtime: LuauRuntime,
+    pub root_ui: UiNode,
 }
 
 impl WaylandApp {
-    /// Initialize the Wayland connection, registries, and layer shell bar.
+    /// Initialize the Wayland connection, registries, Luau runtime, and layer shell bar.
     pub fn init() -> Result<(Self, Connection, wayland_client::EventQueue<Self>), Box<dyn std::error::Error>> {
         let conn = Connection::connect_to_env()?;
         let (globals, event_queue) = registry_queue_init(&conn)?;
@@ -51,6 +97,10 @@ impl WaylandApp {
         let layer_shell = LayerShell::bind(&globals, &qh)?;
         let shm = Shm::bind(&globals, &qh)?;
         let pool = SlotPool::new(1920 * 40 * 4, &shm)?;
+
+        let runtime = LuauRuntime::new()?;
+        let root_ui = runtime.eval_ui(DEFAULT_LUAU_SCRIPT)?;
+        let layout_engine = LayoutEngine::new();
 
         let mut app = Self {
             registry_state: RegistryState::new(&globals),
@@ -64,6 +114,9 @@ impl WaylandApp {
             height: 38,
             configured: false,
             running: true,
+            layout_engine,
+            runtime,
+            root_ui,
         };
 
         app.create_bar(&qh)?;
@@ -83,7 +136,6 @@ impl WaylandApp {
             None,
         );
 
-        // Configure bar anchoring and sizing
         layer_surface.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
         layer_surface.set_size(0, self.height);
         layer_surface.set_exclusive_zone(self.height as i32);
@@ -96,7 +148,14 @@ impl WaylandApp {
         Ok(())
     }
 
-    /// Draw a test modern status bar into the SHM buffer.
+    /// Re-evaluates Luau script and updates the UI tree.
+    pub fn reload_script(&mut self, script: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.root_ui = self.runtime.eval_ui(script)?;
+        self.draw()?;
+        Ok(())
+    }
+
+    /// Draw the computed Luau layout into the SHM buffer.
     pub fn draw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if !self.configured {
             return Ok(());
@@ -113,33 +172,40 @@ impl WaylandApp {
             wl_shm::Format::Argb8888,
         )?;
 
-        // Background color: Material Dark (#14151e, semi-transparent 0xF4)
-        let bg_color: u32 = 0xF414151e;
-        // Bottom border color: Accent violet (#7c4dff, 0xFF)
-        let border_color: u32 = 0xFF7c4dff;
-        // Accent pill in the center (x: center - 80 .. center + 80, y: 6 .. height - 6)
-        let pill_color: u32 = 0x5532344a;
-        let center_x = width / 2;
-        let pill_start = center_x.saturating_sub(80);
-        let pill_end = center_x.saturating_add(80);
+        // Clear canvas
+        canvas.fill(0);
 
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = if y == height - 1 {
-                    border_color
-                } else if x >= pill_start && x <= pill_end && y >= 6 && y <= height - 7 {
-                    pill_color
-                } else {
-                    bg_color
-                };
+        // Compute Taffy layout on the Luau tree
+        let computed_boxes = self.layout_engine.compute(&self.root_ui, width as f32, height as f32);
 
-                let idx = ((y * width + x) * 4) as usize;
-                if idx + 3 < canvas.len() {
-                    // ARGB8888 is little-endian: [B, G, R, A]
-                    canvas[idx] = (pixel & 0xFF) as u8;
-                    canvas[idx + 1] = ((pixel >> 8) & 0xFF) as u8;
-                    canvas[idx + 2] = ((pixel >> 16) & 0xFF) as u8;
-                    canvas[idx + 3] = ((pixel >> 24) & 0xFF) as u8;
+        for b in &computed_boxes {
+            let x_start = (b.x as usize).min(width as usize);
+            let x_end = ((b.x + b.width) as usize).min(width as usize);
+            let y_start = (b.y as usize).min(height as usize);
+            let y_end = ((b.y + b.height) as usize).min(height as usize);
+
+            let bg_color = b.background_color.to_argb_u32();
+            let border_color = b.border_color.to_argb_u32();
+            let has_border = b.border_width > 0.0 && b.border_color.a > 0;
+
+            for y in y_start..y_end {
+                for x in x_start..x_end {
+                    let is_border_pixel = has_border && (
+                        x < x_start + b.border_width as usize
+                        || x >= x_end.saturating_sub(b.border_width as usize)
+                        || y < y_start + b.border_width as usize
+                        || y >= y_end.saturating_sub(b.border_width as usize)
+                    );
+
+                    let pixel = if is_border_pixel { border_color } else { bg_color };
+
+                    let idx = (y * width as usize + x) * 4;
+                    if idx + 3 < canvas.len() {
+                        canvas[idx] = (pixel & 0xFF) as u8;
+                        canvas[idx + 1] = ((pixel >> 8) & 0xFF) as u8;
+                        canvas[idx + 2] = ((pixel >> 16) & 0xFF) as u8;
+                        canvas[idx + 3] = ((pixel >> 24) & 0xFF) as u8;
+                    }
                 }
             }
         }
