@@ -309,7 +309,16 @@ impl HyprlandService {
                 spawn_event_listener(event_sock, cmd_sock, state.clone());
 
                 // Auto-configure hardware blur and ignorezero rules in Hyprland
-                Self::apply_glassmorphism_rules();
+                let rules = [
+                    ("layerrule", "blur, zenith-bar"),
+                    ("layerrule", "ignorezero, zenith-bar"),
+                    ("layerrule", "blur, zenith-popup-.*"),
+                    ("layerrule", "ignorezero, zenith-popup-.*"),
+                ];
+                for (k, v) in rules {
+                    let cmd = format!("keyword {} {}\n", k, v);
+                    let _ = send_socket_command(&cmd_sock, &cmd);
+                }
 
                 state
             } else {
