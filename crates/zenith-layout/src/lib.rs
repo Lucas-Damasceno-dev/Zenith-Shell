@@ -33,6 +33,15 @@ impl Color {
     }
 }
 
+/// Shadow parameters for vector drop shadows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowStyle {
+    pub color: Color,
+    pub blur: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
 /// Node style properties for Zenith UI elements.
 #[derive(Debug, Clone)]
 pub struct NodeStyle {
@@ -49,6 +58,7 @@ pub struct NodeStyle {
     pub border_width: f32,
     pub border_radius: f32,
     pub flex_grow: f32,
+    pub shadow: Option<ShadowStyle>,
 }
 
 
@@ -68,6 +78,7 @@ impl Default for NodeStyle {
             border_width: 0.0,
             border_radius: 0.0,
             flex_grow: 0.0,
+            shadow: None,
         }
 
     }
@@ -100,6 +111,7 @@ pub struct ComputedBox {
     pub border_color: Color,
     pub border_width: f32,
     pub border_radius: f32,
+    pub shadow: Option<ShadowStyle>,
     pub text: Option<(String, Color, f32)>,
     pub on_click: Option<String>,
 }
@@ -213,6 +225,7 @@ impl LayoutEngine {
                     border_color: style.border_color,
                     border_width: style.border_width,
                     border_radius: style.border_radius,
+                    shadow: style.shadow,
                     text: None,
                     on_click: on_click.clone(),
                 });
@@ -232,6 +245,7 @@ impl LayoutEngine {
                     border_color: style.border_color,
                     border_width: style.border_width,
                     border_radius: style.border_radius,
+                    shadow: style.shadow,
                     text: Some((text.clone(), *color, *font_size)),
                     on_click: None,
                 });

@@ -16,18 +16,22 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Modular UI Kit** | `modules/bar/` widgets | ✅ **Implemented** (`config/zenith/lib/widgets/*`) | Milestone 4 |
 | **Pointer Clicks** | QML `MouseArea` | ✅ **Implemented** (Wayland seat hit-testing) | Milestone 2 |
 | **Sub-10ms Reload** | `just qs-restart` (~1.5s) | ✅ **Implemented** (File watcher notify: 6.8ms) | Milestone 1 |
-| **Workspaces IPC** | Hyprland IPC in QML | ⏳ **In Progress** (`zenith-services/hyprland.rs`) | **Milestone 5** |
-| **Window Title** | Active window QML property | ⏳ **In Progress** (`hyprland.rs activewindow`) | **Milestone 5** |
-| **Audio Popup** | `overlays/AudioPopup.qml` | ⏳ **Planned** (`overlays/AudioPopup.luau`) | **Milestone 6** |
-| **Network Popup** | `overlays/NetworkPopup.qml` | ⏳ **Planned** (`overlays/NetworkPopup.luau`) | **Milestone 6** |
-| **Calendar Popup** | `overlays/CalendarPopup.qml` | ⏳ **Planned** (`overlays/CalendarPopup.luau`) | **Milestone 6** |
-| **Power Menu** | `modules/dashboard/PowerMenu.qml` | ⏳ **Planned** (`overlays/PowerMenu.luau`) | **Milestone 6** |
-| **Desktop Dock** | `modules/dock/Dock.qml` | ⏳ **Planned** (`modules/dock/dock.luau`) | **Milestone 8** |
-| **MPRIS2 Media Player** | `services/MprisService.qml` | ⏳ **Planned** (`zenith-services/mpris.rs`) | **Milestone 8** |
-| **Notification Center** | `modules/notifications/` | ⏳ **Planned** (`zenith-services/notifications.rs`) | **Milestone 8** |
-| **OSD HUD** | `overlays/OSD.qml` | ⏳ **Planned** (`overlays/osd.luau`) | **Milestone 8** |
-| **Desktop Canvas** | `modules/canvas/DesktopCanvas.qml` | ⏳ **Planned** (Background layer shell window) | **Milestone 8** |
-| **NixOS Flake Integration**| `default.nix` in Home Manager | ⏳ **Planned** (Native flake build + systemd unit) | **Milestone 9** |
+| **Workspaces IPC** | Hyprland IPC in QML | ✅ **Implemented** (`zenith-services/hyprland.rs`) | **Milestone 5** |
+| **Window Title** | Active window QML property | ✅ **Implemented** (`hyprland.rs activewindow`) | **Milestone 5** |
+| **Audio Popup** | `overlays/AudioPopup.qml` | ✅ **Implemented** (`overlays/AudioPopup.luau`) | **Milestone 6** |
+| **Network Popup** | `overlays/NetworkPopup.qml` | ✅ **Implemented** (`overlays/NetworkPopup.luau`) | **Milestone 6** |
+| **Calendar Popup** | `overlays/CalendarPopup.qml` | ✅ **Implemented** (`overlays/CalendarPopup.luau`) | **Milestone 6** |
+| **Power Menu** | `modules/dashboard/PowerMenu.qml` | ✅ **Implemented** (`overlays/PowerMenu.luau`) | **Milestone 6** |
+| **Drop Shadows & Blur** | QML RectangularGlow & Blur | ✅ **Implemented** (Tiny-Skia shadows + Hyprland blur) | **Milestone 7** |
+| **Spring Animations** | QML NumberAnimation | ✅ **Implemented** (`zenith-core::SpringAnimation`) | **Milestone 7** |
+| **App Launcher** | `modules/launcher/` | ✅ **Implemented** (`overlays/Launcher.luau` + `launcher.rs`) | **Milestone 8** |
+| **MPRIS2 Media Player** | `services/MprisService.qml` | ✅ **Implemented** (`zenith-services/mpris.rs` + `MediaPopup.luau`) | **Milestone 8** |
+| **Notification Center** | `modules/notifications/` | ✅ **Implemented** (`zenith-services/notifications.rs` + `NotificationCenter.luau`) | **Milestone 8** |
+| **OSD HUD** | `overlays/OSD.qml` | ✅ **Implemented** (`overlays/OSD.luau`) | **Milestone 8** |
+| **NixOS Flake Integration**| `default.nix` in Home Manager | ✅ **Implemented** (`flake.nix` + `home-manager.nix`) | **Milestone 9** |
+| **Interactive Dock** | `modules/dock/Dock.qml` | ✅ **Implemented** (`config/zenith/dock.luau` + `overlays/Dock.luau`) | **Milestone 10** |
+| **Dynamic Island HUD** | `modules/island/DynamicIsland.qml` | ✅ **Implemented** (`config/zenith/island.luau` + `overlays/DynamicIsland.luau`) | **Milestone 10** |
+| **Desktop Canvas** | `modules/canvas/DesktopCanvas.qml` | ✅ **Implemented** (`config/zenith/canvas.luau` + `overlays/DesktopCanvas.luau`) | **Milestone 10** |
 
 ---
 

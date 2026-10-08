@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zenith-core = { path = "../zenith-core" }
+zenith-services = { path = "../zenith-services" }
 zenith-wayland = { path = "../zenith-wayland" }
 tracing = "0.1"
 wayland-client = "0.31"

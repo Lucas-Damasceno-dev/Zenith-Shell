@@ -7,111 +7,84 @@ let
   cfg = config.programs.zenith-shell;
   system = pkgs.stdenv.hostPlatform.system;
 
-  quickshell-pkg = (quickshell.packages.${system}.default or pkgs.quickshell).withModules [
-    pkgs.qt6.qtsvg
-    pkgs.qt6.qtimageformats
-    pkgs.qt6.qtmultimedia
-    pkgs.qt6.qt5compat
-    pkgs.pipewire
-    pkgs.libpulseaudio
-  ];
+  zenith-pkg = (self.packages.${system}.zenith-shell or pkgs.zenith-shell);
 
-  qsRuntimeDeps = with pkgs; [
-    bash coreutils findutils fd gnugrep gawk jq procps file
-    git curl socat expect
-    systemd util-linux udisks2
-    networkmanager bluez playerctl upower power-profiles-daemon
-    brightnessctl grim slurp wf-recorder hyprpicker swappy wl-clipboard awww gnused
-    tesseract libnotify xdg-utils imagemagick cliphist
-    pipewire wireplumber pulseaudio hyprland
-    (python3.withPackages (ps: [ ps.dbus-fast ps.requests ]))
+  runtimeDeps = with pkgs; [
+    bash
+    coreutils
+    procps
+    systemd
+    networkmanager
+    playerctl
+    upower
+    pipewire
+    wireplumber
+    hyprland
   ];
 in
 {
   options.programs.zenith-shell = {
-    enable = mkEnableOption "Zenith-Shell Quickshell & Hyprland Rice";
+    enable = mkEnableOption "Zenith-Shell (Engine v2) — Wayland Desktop Shell in Rust + Luau";
 
-    terminal = mkOption {
-      type = types.str;
-      default = "kitty";
-      description = "Default terminal emulator";
+    package = mkOption {
+      type = types.package;
+      default = zenith-pkg;
+      description = "Zenith shell package to install";
     };
 
-    browser = mkOption {
-      type = types.str;
-      default = "brave";
-      description = "Default web browser";
+    configDir = mkOption {
+      type = types.nullOr types.path;
+      default = ../config/zenith;
+      description = "Path to Zenith declarative Luau configurations";
     };
 
-    fileManager = mkOption {
-      type = types.str;
-      default = "thunar";
-      description = "Default graphical file manager";
-    };
-
-    enableSystemdServices = mkOption {
+    enableLiveSymlink = mkOption {
       type = types.bool;
       default = true;
-      description = "Whether to enable quickshell and context daemon systemd user services";
+      description = "Symlink config directly into ~/.config/zenith for sub-10ms live iteration without rebuilding";
+    };
+
+    enableSystemd = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Enable systemd user service for Zenith Shell";
     };
   };
 
   config = mkIf cfg.enable {
-    home.packages = [ quickshell-pkg ] ++ qsRuntimeDeps;
+    home.packages = [ cfg.package ] ++ runtimeDeps;
 
-    xdg.configFile."quickshell".source = ../config/quickshell;
-    xdg.configFile."hypr".source = ../config/hypr;
-
-    systemd.user.services.quickshell = mkIf cfg.enableSystemdServices {
-      Unit = {
-        Description = "Zenith-Shell Desktop Environment";
-        After = [ "graphical-session.target" "hyprland-session.target" ];
-        PartOf = [ "hyprland-session.target" ];
-        ConditionEnvironment = "HYPRLAND_INSTANCE_SIGNATURE";
-      };
-      Service = {
-        Type = "simple";
-        ExecStart = "${quickshell-pkg}/bin/quickshell --no-duplicate";
-        Restart = "on-failure";
-        RestartSec = 3;
-        Slice = "session.slice";
-        MemoryMax = "800M";
-        MemoryHigh = "700M";
-        CPUWeight = 200;
-        Environment = [
-          "QT_QPA_PLATFORM=wayland"
-          "QT_WAYLAND_DISABLE_WINDOWDECORATION=1"
-          "QT_ICON_THEME=Papirus-Dark"
-          "PATH=${quickshell-pkg}/bin:${lib.makeBinPath qsRuntimeDeps}"
-        ];
-      };
-      Install = {
-        WantedBy = [ "hyprland-session.target" ];
-      };
+    xdg.configFile."zenith" = mkIf (cfg.configDir != null) {
+      source = if cfg.enableLiveSymlink then
+        config.lib.file.mkOutOfStoreSymlink cfg.configDir
+      else
+        cfg.configDir;
+      recursive = !cfg.enableLiveSymlink;
     };
 
-    systemd.user.services.zenith-context-daemon = mkIf cfg.enableSystemdServices {
+    systemd.user.services.zenith-shell = mkIf cfg.enableSystemd {
       Unit = {
-        Description = "Zenith-Shell Context & Connectivity Daemon";
+        Description = "Zenith Desktop Shell (Engine v2)";
         After = [ "graphical-session.target" "hyprland-session.target" ];
-        PartOf = [ "hyprland-session.target" ];
-        ConditionEnvironment = "HYPRLAND_INSTANCE_SIGNATURE";
+        PartOf = [ "graphical-session.target" ];
+        ConditionEnvironment = "WAYLAND_DISPLAY";
       };
       Service = {
         Type = "simple";
-        ExecStart = "${pkgs.python3.withPackages (ps: [ ps.dbus-fast ps.requests ])}/bin/python3 ${config.home.homeDirectory}/.config/quickshell/scripts/daemon/context_daemon_v2.py";
+        ExecStart = "${cfg.package}/bin/zenith daemon ${config.home.homeDirectory}/.config/zenith/bar.luau";
+        ExecReload = "${cfg.package}/bin/zenith reload";
         Restart = "on-failure";
         RestartSec = 2;
         Slice = "session.slice";
-        MemoryMax = "250M";
-        CPUQuota = "20%";
+        MemoryMax = "50M";
+        MemoryHigh = "35M";
+        CPUWeight = 200;
         Environment = [
-          "PATH=${quickshell-pkg}/bin:${lib.makeBinPath qsRuntimeDeps}"
-          "PYTHONUNBUFFERED=1"
+          "PATH=${cfg.package}/bin:${lib.makeBinPath runtimeDeps}"
         ];
       };
       Install = {
-        WantedBy = [ "hyprland-session.target" ];
+        WantedBy = [ "graphical-session.target" ];
       };
     };
   };

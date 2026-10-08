@@ -2,6 +2,9 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+pub mod spring;
+pub use spring::{SpringAnimation, SpringConfig};
+
 /// Initialize structured logging for the Zenith engine.
 pub fn init_logging() {
     tracing_subscriber::registry()

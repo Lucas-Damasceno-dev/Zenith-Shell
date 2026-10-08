@@ -1,11 +1,12 @@
 --!strict
--- Zenith UI Kit - Quick Status & Connectivity Component (Audio + Wifi + Battery + Power)
+-- Zenith UI Kit - Quick Status & Connectivity Component (Quickshell / Caelestia style)
 
 local function QuickStatus()
     local theme = Zenith.Theme()
     local battery = Zenith.Services.battery()
     local audio = Zenith.Services.audio()
     local net = Zenith.Services.network()
+    local notifs = Zenith.Services.Notifications()
 
     local bat_icon = "󰂄"
     local bat_pct = 100
@@ -24,62 +25,118 @@ local function QuickStatus()
         end
     end
 
-    local net_text = net.is_connected and (net.type == "wifi" and "󰖩 " .. net.ssid or "󰈀 Wired") or "󰤭 Disconnected"
-    local audio_text = audio.is_muted and "󰝟 Muted" or string.format(" %d%%", audio.volume)
+    local net_icon = if not net.is_connected then "󰤭" elseif net.type == "wifi" then "󰖩" else "󰈀"
+    local audio_icon = if audio.is_muted then "󰝟" elseif audio.volume > 50 then "" else ""
+
+    local notif_count = #notifs
+    local notif_icon = if notif_count > 0 then "󰂚 " .. tostring(notif_count) else "󰂜"
+    local notif_color = if notif_count > 0 then Zenith.hex(theme.primary) else Zenith.rgba(255, 255, 255, 120)
 
     return Zenith.Box({
         direction = "row",
-        gap = 6,
+        gap = 5,
         children = {
-            -- Network & Audio
+            -- Network Pill
             Zenith.Box({
                 direction = "row",
-                gap = 8,
-                padding = { x = 10, y = 4 },
-                border_radius = 8,
-                background = Zenith.hex(theme.surface),
-                border_color = Zenith.hex("#2d3748"),
+                gap = 5,
+                padding = { x = 9, y = 3 },
+                border_radius = 12,
+                background = Zenith.rgba(255, 255, 255, 10),
+                border_color = Zenith.rgba(255, 255, 255, 18),
                 border_width = 1,
-                on_click = "cmd:pavucontrol &",
+                on_click = "popup:toggle:NetworkPopup",
                 children = {
                     Zenith.Text({
-                        text = net_text,
+                        text = net_icon,
                         font_size = 11,
-                        color = Zenith.hex(theme.on_surface),
+                        color = net.is_connected and Zenith.hex("#a6e3a1") or Zenith.hex("#e06c75"),
                     }),
                     Zenith.Text({
-                        text = audio_text,
+                        text = net.is_connected and (#net.ssid > 0 and net.ssid or "Wired") or "Offline",
                         font_size = 11,
                         color = Zenith.hex(theme.on_surface),
                     }),
                 }
             }),
 
-            -- Battery
+            -- Audio Pill
             Zenith.Box({
-                padding = { x = 8, y = 4 },
-                border_radius = 8,
-                background = Zenith.hex(theme.surface_container),
+                direction = "row",
+                gap = 5,
+                padding = { x = 9, y = 3 },
+                border_radius = 12,
+                background = Zenith.rgba(255, 255, 255, 10),
+                border_color = Zenith.rgba(255, 255, 255, 18),
+                border_width = 1,
+                on_click = "popup:toggle:AudioPopup",
                 children = {
                     Zenith.Text({
-                        text = string.format("%s %d%%", bat_icon, bat_pct),
+                        text = audio_icon,
+                        font_size = 11,
+                        color = audio.is_muted and Zenith.hex("#e06c75") or Zenith.hex(theme.primary),
+                    }),
+                    Zenith.Text({
+                        text = string.format("%d%%", audio.volume),
+                        font_size = 11,
+                        color = audio.is_muted and Zenith.hex("#e06c75") or Zenith.hex(theme.on_surface),
+                    }),
+                }
+            }),
+
+            -- Battery Pill
+            Zenith.Box({
+                direction = "row",
+                gap = 5,
+                padding = { x = 9, y = 3 },
+                border_radius = 12,
+                background = Zenith.rgba(255, 255, 255, 10),
+                border_color = Zenith.rgba(255, 255, 255, 18),
+                border_width = 1,
+                children = {
+                    Zenith.Text({
+                        text = bat_icon,
                         font_size = 11,
                         color = Zenith.hex(theme.primary),
+                    }),
+                    Zenith.Text({
+                        text = string.format("%d%%", bat_pct),
+                        font_size = 11,
+                        color = Zenith.hex(theme.on_surface),
+                    }),
+                }
+            }),
+
+            -- Notification Center Bell Pill
+            Zenith.Box({
+                padding = { x = 9, y = 3 },
+                border_radius = 12,
+                background = notif_count > 0 and Zenith.rgba(122, 162, 247, 30) or Zenith.rgba(255, 255, 255, 10),
+                border_color = notif_count > 0 and Zenith.rgba(122, 162, 247, 80) or Zenith.rgba(255, 255, 255, 18),
+                border_width = 1,
+                on_click = "popup:toggle:NotificationCenter",
+                children = {
+                    Zenith.Text({
+                        text = notif_icon,
+                        font_size = 11,
+                        color = notif_color,
                     })
                 }
             }),
 
-            -- Power Button
+            -- Session / Power Button (End-4 style)
             Zenith.Box({
-                padding = { x = 10, y = 4 },
-                border_radius = 8,
-                background = Zenith.hex("#e63946"),
-                on_click = "cmd:notify-send 'Zenith Shell' 'Power session requested' -u critical",
+                padding = { x = 10, y = 3 },
+                border_radius = 12,
+                background = Zenith.rgba(230, 57, 70, 45),
+                border_color = Zenith.rgba(230, 57, 70, 95),
+                border_width = 1,
+                on_click = "popup:toggle:PowerMenu",
                 children = {
                     Zenith.Text({
-                        text = "⏻",
+                        text = "",
                         font_size = 12,
-                        color = Zenith.hex("#FFFFFF"),
+                        color = Zenith.hex("#ff7582"),
                     })
                 }
             })

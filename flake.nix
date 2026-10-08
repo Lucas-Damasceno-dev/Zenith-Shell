@@ -1,5 +1,5 @@
 {
-  description = "Zenith-Shell — Next-Gen Desktop Shell & Rice powered by Hyprland and Rust+Luau Engine";
+  description = "Zenith-Shell (Engine v2) — Wayland Desktop Shell Framework in Rust + Luau";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -29,16 +29,39 @@
             freetype
           ];
         in
-        {
-          default = pkgs.stdenv.mkDerivation {
+        rec {
+          zenith-shell = pkgs.rustPlatform.buildRustPackage {
             pname = "zenith-shell";
-            version = "1.0.0";
+            version = "0.2.0";
             src = ./.;
-            installPhase = ''
-              mkdir -p $out/share/zenith-shell
-              cp -r config systemd install.sh $out/share/zenith-shell/
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            cargoBuildFlags = [ "-p" "zenith-cli" ];
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+            ];
+
+            buildInputs = runtimeLibs;
+
+            postInstall = ''
+              mkdir -p $out/share/zenith
+              cp -r config/zenith/* $out/share/zenith/
             '';
+
+            meta = with pkgs.lib; {
+              description = "Zenith Desktop Shell (Engine v2) — Wayland Desktop Shell Framework in Rust + Luau";
+              homepage = "https://github.com/lucas/Zenith-Shell";
+              license = licenses.mit;
+              platforms = platforms.linux;
+              mainProgram = "zenith";
+            };
           };
+
+          default = zenith-shell;
         }
       );
 
@@ -65,6 +88,7 @@
               clippy
               rust-analyzer
               pkg-config
+              just
             ];
             buildInputs = runtimeLibs;
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;

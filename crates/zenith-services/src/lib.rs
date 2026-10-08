@@ -4,6 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use serde_json::Value;
 
+pub mod hyprland;
+pub use hyprland::{ActiveWindowSnapshot, ClientItem, HyprlandService, WorkspaceItem, WorkspacesSnapshot};
+
+pub mod launcher;
+pub use launcher::{AppEntry, LauncherService};
+
+pub mod mpris;
+pub use mpris::{MediaSnapshot, MprisService};
+
+pub mod notifications;
+pub use notifications::{NotificationItem, NotificationService};
+
 /// Snapshot of system memory status.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySnapshot {

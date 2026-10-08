@@ -1756,6 +1756,7 @@ dependencies = [
  "tracing",
  "wayland-client",
  "zenith-core",
+ "zenith-services",
  "zenith-wayland",
 ]
 
