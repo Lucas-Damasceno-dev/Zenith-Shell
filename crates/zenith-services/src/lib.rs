@@ -1,7 +1,8 @@
-//! Zenith Services - Native hardware telemetry, system metrics, and compositor integration.
+//! Zenith Services - Native hardware telemetry, system metrics, Matugen theming, and SVG rendering.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use serde_json::Value;
 
 /// Snapshot of system memory status.
 #[derive(Debug, Clone, Default)]
@@ -18,6 +19,32 @@ pub struct BatterySnapshot {
     pub percentage: u8,
     pub status: String,
     pub is_charging: bool,
+}
+
+/// Dynamic Material You theme palette (loaded from Matugen/Stylix).
+#[derive(Debug, Clone)]
+pub struct ThemePalette {
+    pub background: String,
+    pub primary: String,
+    pub surface: String,
+    pub on_surface: String,
+    pub on_primary: String,
+    pub outline: String,
+    pub surface_container: String,
+}
+
+impl Default for ThemePalette {
+    fn default() -> Self {
+        Self {
+            background: "#0c141bf2".to_string(),
+            primary: "#7c4dff".to_string(),
+            surface: "#18202bcc".to_string(),
+            on_surface: "#dbe3ed".to_string(),
+            on_primary: "#ffffff".to_string(),
+            outline: "#333d4b".to_string(),
+            surface_container: "#1e2632".to_string(),
+        }
+    }
 }
 
 /// System service provider.
@@ -131,9 +158,74 @@ impl SystemService {
             "Desktop Shell".to_string()
         }
     }
+
+    /// Loads active Material You theme colors from Matugen/Stylix cache.
+    pub fn load_theme() -> ThemePalette {
+        let candidates = [
+            dirs_home_path(".cache/quickshell/matugen/colors.json"),
+            dirs_home_path(".cache/matugen/colors.json"),
+            dirs_home_path(".config/quickshell/colors.json"),
+        ];
+
+        for path in candidates.into_iter().flatten() {
+            if path.exists() {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                        return Self::parse_matugen_json(&val);
+                    }
+                }
+            }
+        }
+
+        ThemePalette::default()
+    }
+
+    fn parse_matugen_json(val: &Value) -> ThemePalette {
+        let colors = &val["colors"];
+        let mut palette = ThemePalette::default();
+
+        let extract_color = |key: &str| -> Option<String> {
+            colors[key]["default"]["color"]
+                .as_str()
+                .or_else(|| colors[key]["dark"]["color"].as_str())
+                .map(|s| s.to_string())
+        };
+
+        if let Some(c) = extract_color("background") { palette.background = format!("{}F2", c); }
+        if let Some(c) = extract_color("primary") { palette.primary = c; }
+        if let Some(c) = extract_color("surface") { palette.surface = format!("{}CC", c); }
+        if let Some(c) = extract_color("on_surface") { palette.on_surface = c; }
+        if let Some(c) = extract_color("on_primary") { palette.on_primary = c; }
+        if let Some(c) = extract_color("outline") { palette.outline = c; }
+        if let Some(c) = extract_color("surface_container") { palette.surface_container = c; }
+
+        palette
+    }
+
+    /// Rasterize an SVG string into an RGBA pixel buffer at `[width, height]`.
+    pub fn render_svg(svg_str: &str, width: u32, height: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let opt = resvg::usvg::Options::default();
+        let tree = resvg::usvg::Tree::from_str(svg_str, &opt)?;
+
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+            .ok_or("Failed to allocate SVG pixmap")?;
+
+        let svg_w = tree.size().width();
+        let svg_h = tree.size().height();
+        let scale_x = width as f32 / svg_w;
+        let scale_y = height as f32 / svg_h;
+        let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
+
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        Ok(pixmap.take())
+    }
 }
 
 fn parse_meminfo_kb(line: &str) -> u64 {
     let mut parts = line.split_whitespace();
     parts.nth(1).and_then(|val| val.parse::<u64>().ok()).unwrap_or(0)
+}
+
+fn dirs_home_path(sub: &str) -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(sub))
 }

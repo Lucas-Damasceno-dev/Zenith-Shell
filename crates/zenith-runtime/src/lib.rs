@@ -108,7 +108,35 @@ impl LuauRuntime {
         })?;
         services_table.set("compositor", compositor_fn)?;
 
+        // Theme palette query
+        let theme_fn = lua.create_function(|lua, ()| {
+            let palette = zenith_services::SystemService::load_theme();
+            let tbl = lua.create_table()?;
+            tbl.set("background", palette.background)?;
+            tbl.set("primary", palette.primary)?;
+            tbl.set("surface", palette.surface)?;
+            tbl.set("on_surface", palette.on_surface)?;
+            tbl.set("on_primary", palette.on_primary)?;
+            tbl.set("outline", palette.outline)?;
+            tbl.set("surface_container", palette.surface_container)?;
+            Ok(tbl)
+        })?;
+        services_table.set("theme", theme_fn.clone())?;
+
+        // Svg rasterizer
+        let render_svg_fn = lua.create_function(|_, (svg_str, w, h): (String, u32, u32)| {
+            match zenith_services::SystemService::render_svg(&svg_str, w, h) {
+                Ok(bytes) => Ok(Some(bytes.len())),
+                Err(e) => {
+                    tracing::error!("SVG render error: {}", e);
+                    Ok(None)
+                }
+            }
+        })?;
+        services_table.set("render_svg", render_svg_fn)?;
+
         zenith_table.set("Services", services_table)?;
+        zenith_table.set("Theme", theme_fn)?;
 
         lua.globals().set("Zenith", zenith_table)?;
 

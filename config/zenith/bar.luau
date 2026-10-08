@@ -1,6 +1,8 @@
 --!strict
--- Zenith-Shell (v2) Default Status Bar Configuration in Luau
+-- Zenith-Shell (v2) Status Bar Configuration in Luau
+-- Dynamic Material You Theming via Matugen / Stylix
 
+local theme = Zenith.Theme()
 local time_str, date_str = Zenith.Services.time()
 local mem = Zenith.Services.memory()
 local compositor = Zenith.Services.compositor()
@@ -13,52 +15,52 @@ return Zenith.Box({
     height = 38,
     padding = { x = 14, y = 4 },
     gap = 10,
-    background = Zenith.hex("#11121bf2"),
-    border_color = Zenith.hex("#7c4dff"),
+    background = Zenith.hex(theme.background),
+    border_color = Zenith.hex(theme.primary),
     border_width = 1,
     children = {
-        -- Logo / Compositor pill
+        -- Logo / Compositor pill styled with Matugen primary accent
         Zenith.Box({
             padding = { x = 12, y = 4 },
             border_radius = 6,
-            background = Zenith.hex("#7c4dff"),
+            background = Zenith.hex(theme.primary),
             children = {
                 Zenith.Text({
                     text = "ZENITH • " .. compositor,
                     font_size = 12,
-                    color = Zenith.hex("#FFFFFF"),
+                    color = Zenith.hex(theme.on_primary),
                 })
             }
         }),
 
-        -- Memory telemetry pill
+        -- Memory telemetry pill styled with Matugen surface
         Zenith.Box({
             padding = { x = 14, y = 4 },
             border_radius = 6,
-            background = Zenith.hex("#1e202fcc"),
-            border_color = Zenith.hex("#33364f"),
+            background = Zenith.hex(theme.surface),
+            border_color = Zenith.hex(theme.outline),
             border_width = 1,
             children = {
                 Zenith.Text({
                     text = string.format("RAM: %d MB (%d%%)", mem.used_mb, mem.percent),
                     font_size = 12,
-                    color = Zenith.hex("#c5c9de"),
+                    color = Zenith.hex(theme.on_surface),
                 })
             }
         }),
 
-        -- Clock / Date / Power pill
+        -- Clock / Date / Power pill styled with Matugen surface container
         Zenith.Box({
             padding = { x = 14, y = 4 },
             border_radius = 6,
-            background = Zenith.hex("#181926"),
-            border_color = Zenith.hex("#2c2e42"),
+            background = Zenith.hex(theme.surface_container),
+            border_color = Zenith.hex(theme.outline),
             border_width = 1,
             children = {
                 Zenith.Text({
                     text = string.format("🕒 %s • %s • %s", time_str, date_str, battery_text),
                     font_size = 12,
-                    color = Zenith.hex("#a6accd"),
+                    color = Zenith.hex(theme.on_surface),
                 })
             }
         })
