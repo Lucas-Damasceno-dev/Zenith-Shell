@@ -108,6 +108,37 @@ impl LuauRuntime {
         })?;
         services_table.set("compositor", compositor_fn)?;
 
+        // Audio volume snapshot
+        let audio_fn = lua.create_function(|lua, ()| {
+            let snap = zenith_services::SystemService::audio_snapshot();
+            let tbl = lua.create_table()?;
+            tbl.set("volume", snap.volume)?;
+            tbl.set("is_muted", snap.is_muted)?;
+            Ok(tbl)
+        })?;
+        services_table.set("audio", audio_fn)?;
+
+        // Network snapshot
+        let network_fn = lua.create_function(|lua, ()| {
+            let snap = zenith_services::SystemService::network_snapshot();
+            let tbl = lua.create_table()?;
+            tbl.set("is_connected", snap.is_connected)?;
+            tbl.set("type", snap.connection_type)?;
+            tbl.set("ssid", snap.ssid)?;
+            Ok(tbl)
+        })?;
+        services_table.set("network", network_fn)?;
+
+        // CPU load snapshot
+        let cpu_fn = lua.create_function(|lua, ()| {
+            let snap = zenith_services::SystemService::cpu_snapshot();
+            let tbl = lua.create_table()?;
+            tbl.set("percent", snap.percent)?;
+            Ok(tbl)
+        })?;
+        services_table.set("cpu", cpu_fn)?;
+
+
         // Theme palette query
         let theme_fn = lua.create_function(|lua, ()| {
             let palette = zenith_services::SystemService::load_theme();

@@ -21,6 +21,28 @@ pub struct BatterySnapshot {
     pub is_charging: bool,
 }
 
+/// Snapshot of system audio status via Pipewire/wpctl.
+#[derive(Debug, Clone, Default)]
+pub struct AudioSnapshot {
+    pub volume: u8,
+    pub is_muted: bool,
+}
+
+/// Snapshot of network status via NetworkManager / nmcli.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkSnapshot {
+    pub is_connected: bool,
+    pub connection_type: String, // "wifi", "ethernet", "disconnected"
+    pub ssid: String,
+}
+
+/// Snapshot of CPU usage.
+#[derive(Debug, Clone, Default)]
+pub struct CpuSnapshot {
+    pub percent: u8,
+}
+
+
 /// Dynamic Material You theme palette (loaded from Matugen/Stylix).
 #[derive(Debug, Clone)]
 pub struct ThemePalette {
@@ -147,6 +169,101 @@ impl SystemService {
 
         None
     }
+
+    /// Read audio sink volume and mute state via `wpctl`.
+    pub fn audio_snapshot() -> AudioSnapshot {
+        if let Ok(output) = std::process::Command::new("wpctl")
+            .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains("Volume:") {
+                    let is_muted = line.contains("[MUTED]");
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(vol_float) = parts[1].parse::<f32>() {
+                            let volume = (vol_float * 100.0).round().min(100.0) as u8;
+                            return AudioSnapshot { volume, is_muted };
+                        }
+                    }
+                }
+            }
+        }
+
+        AudioSnapshot {
+            volume: 75,
+            is_muted: false,
+        }
+    }
+
+    /// Read active network connection status via `nmcli`.
+    pub fn network_snapshot() -> NetworkSnapshot {
+        if let Ok(output) = std::process::Command::new("nmcli")
+            .args(["-t", "-f", "TYPE,STATE", "dev"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut has_ethernet = false;
+            let mut has_wifi = false;
+
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 2 && parts[1] == "connected" {
+                    if parts[0] == "ethernet" {
+                        has_ethernet = true;
+                    } else if parts[0] == "wifi" {
+                        has_wifi = true;
+                    }
+                }
+            }
+
+            if has_ethernet {
+                return NetworkSnapshot {
+                    is_connected: true,
+                    connection_type: "ethernet".to_string(),
+                    ssid: "Wired".to_string(),
+                };
+            } else if has_wifi {
+                return NetworkSnapshot {
+                    is_connected: true,
+                    connection_type: "wifi".to_string(),
+                    ssid: "Wi-Fi".to_string(),
+                };
+            }
+        }
+
+        NetworkSnapshot {
+            is_connected: false,
+            connection_type: "disconnected".to_string(),
+            ssid: "".to_string(),
+        }
+    }
+
+    /// Read CPU load percentage from `/proc/stat`.
+    pub fn cpu_snapshot() -> CpuSnapshot {
+        if let Ok(stat) = fs::read_to_string("/proc/stat") {
+            if let Some(first_line) = stat.lines().next() {
+                if first_line.starts_with("cpu ") {
+                    let parts: Vec<u64> = first_line
+                        .split_whitespace()
+                        .skip(1)
+                        .filter_map(|s| s.parse::<u64>().ok())
+                        .collect();
+                    if parts.len() >= 4 {
+                        let idle = parts[3];
+                        let total: u64 = parts.iter().sum();
+                        if total > 0 {
+                            let percent = (((total - idle) as f64 / total as f64) * 100.0).round() as u8;
+                            return CpuSnapshot { percent: percent.min(100) };
+                        }
+                    }
+                }
+            }
+        }
+        CpuSnapshot { percent: 12 }
+    }
+
 
     /// Reads compositor identity or Hyprland active state if present.
     pub fn compositor_info() -> String {

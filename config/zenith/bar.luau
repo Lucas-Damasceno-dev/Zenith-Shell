@@ -8,6 +8,10 @@ local time_str, date_str = Zenith.Services.time()
 local mem = Zenith.Services.memory()
 local compositor = Zenith.Services.compositor()
 local battery = Zenith.Services.battery()
+local audio = Zenith.Services.audio()
+local net = Zenith.Services.network()
+local cpu = Zenith.Services.cpu()
+
 
 
 local bat_icon = "󰂄"
@@ -203,7 +207,7 @@ return Zenith.Box({
             border_width = 1,
             children = {
                 Zenith.Text({
-                    text = string.format(" CPU: 12%%  •  󰍛 RAM: %dMB (%d%%)", mem.used_mb, mem.percent),
+                    text = string.format(" CPU: %d%%  •  󰍛 RAM: %dMB (%d%%)", cpu.percent, mem.used_mb, mem.percent),
                     font_size = 11,
                     color = c_on_surface,
                 })
@@ -220,17 +224,18 @@ return Zenith.Box({
             border_width = 1,
             children = {
                 Zenith.Text({
-                    text = "󰖩 Wi-Fi",
+                    text = net.is_connected and (net.type == "wifi" and "󰖩 " .. net.ssid or "󰈀 Wired") or "󰤭 Disconnected",
                     font_size = 11,
                     color = c_on_surface,
                 }),
                 Zenith.Text({
-                    text = " 75%",
+                    text = audio.is_muted and "󰝟 Muted" or string.format(" %d%%", audio.volume),
                     font_size = 11,
                     color = c_on_surface,
                 }),
             }
         }),
+
 
         Zenith.Box({
             padding = { x = 8, y = 4 },
