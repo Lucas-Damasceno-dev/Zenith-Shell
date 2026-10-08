@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 pub struct WorkspaceItem {
     pub id: i32,
     pub name: String,
+    pub monitor: String,
     pub active: bool,
     pub urgent: bool,
     pub windows: u32,
@@ -60,6 +61,7 @@ struct HyprlandState {
     workspaces: Vec<WorkspaceItem>,
     active_window: ActiveWindowSnapshot,
     clients: Vec<ClientItem>,
+    gaps_out: u32,
     socket_dir: Option<PathBuf>,
 }
 
@@ -92,6 +94,13 @@ impl HyprlandService {
         let state = Self::get_state();
         let r = state.read().unwrap();
         r.clients.clone()
+    }
+
+    /// Retrieve dynamic gaps_out configured in Hyprland.
+    pub fn gaps_out() -> u32 {
+        let state = Self::get_state();
+        let r = state.read().unwrap();
+        r.gaps_out
     }
 
     /// Focus a window by address (e.g. `0x1234abcd`).
@@ -243,11 +252,13 @@ impl HyprlandService {
                         for item in items {
                             let id = item["id"].as_i64().unwrap_or(0) as i32;
                             let name = item["name"].as_str().unwrap_or("").to_string();
+                            let monitor = item["monitor"].as_str().unwrap_or("").to_string();
                             let windows = item["windows"].as_u64().unwrap_or(0) as u32;
                             let urgent = item["urgent"].as_bool().unwrap_or(false);
                             workspaces.push(WorkspaceItem {
                                 id,
                                 name,
+                                monitor,
                                 active: id == active_workspace,
                                 urgent,
                                 windows,
@@ -273,12 +284,15 @@ impl HyprlandService {
                     clients = parse_clients_json(&resp);
                 }
 
+                let gaps_out = query_gaps_out(&cmd_sock);
+
                 info!(
-                    "Hyprland IPC detected at {}. Initial workspace: {}, active window: '{}', clients: {}",
+                    "Hyprland IPC detected at {}. Initial workspace: {}, active window: '{}', clients: {}, gaps: {}",
                     dir.display(),
                     active_workspace,
                     active_window.class,
-                    clients.len()
+                    clients.len(),
+                    gaps_out
                 );
 
                 let state = Arc::new(RwLock::new(HyprlandState {
@@ -287,6 +301,7 @@ impl HyprlandService {
                     workspaces,
                     active_window,
                     clients,
+                    gaps_out,
                     socket_dir: Some(dir),
                 }));
 
@@ -347,6 +362,7 @@ impl HyprlandService {
                         class: "zenith".to_string(),
                     },
                     clients: fallback_clients,
+                    gaps_out: 10,
                     socket_dir: None,
                 }))
             }
@@ -509,6 +525,16 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 resync_clients(cmd_sock, state);
                 changed = true;
             }
+            "configreloaded" => {
+                let gaps = query_gaps_out(cmd_sock);
+                {
+                    let mut w = state.write().unwrap();
+                    w.gaps_out = gaps;
+                }
+                resync_workspaces(cmd_sock, state);
+                resync_clients(cmd_sock, state);
+                changed = true;
+            }
             _ => {}
         }
 
@@ -516,6 +542,27 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
             notify_change();
         }
     }
+}
+
+/// Query `general:gaps_out` setting from Hyprland IPC command socket.
+pub fn query_gaps_out(cmd_sock: &Path) -> u32 {
+    if let Ok(resp) = send_socket_command(cmd_sock, "j/getoption general:gaps_out") {
+        if let Ok(val) = serde_json::from_str::<Value>(&resp) {
+            if let Some(i) = val["int"].as_i64() {
+                if i >= 0 {
+                    return i as u32;
+                }
+            }
+            if let Some(s) = val["str"].as_str() {
+                if let Some(first) = s.split_whitespace().next() {
+                    if let Ok(parsed) = first.parse::<u32>() {
+                        return parsed;
+                    }
+                }
+            }
+        }
+    }
+    10
 }
 
 /// Parse JSON output from `j/clients` into structured `ClientItem` vec.
@@ -572,12 +619,14 @@ fn resync_workspaces(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
             for item in items {
                 let id = item["id"].as_i64().unwrap_or(0) as i32;
                 let name = item["name"].as_str().unwrap_or("").to_string();
+                let monitor = item["monitor"].as_str().unwrap_or("").to_string();
                 let windows = item["windows"].as_u64().unwrap_or(0) as u32;
                 let urgent = item["urgent"].as_bool().unwrap_or(false);
                 let active = id == active_id;
                 list.push(WorkspaceItem {
                     id,
                     name,
+                    monitor,
                     active,
                     urgent,
                     windows,
@@ -607,6 +656,7 @@ fn ensure_minimum_workspaces(workspaces: &mut Vec<WorkspaceItem>, active_id: i32
             workspaces.push(WorkspaceItem {
                 id,
                 name: id.to_string(),
+                monitor: String::new(),
                 active: id == active_id,
                 urgent: false,
                 windows: 0,
@@ -653,12 +703,13 @@ mod tests {
             is_hyprland: true,
             active_workspace: 1,
             workspaces: vec![
-                WorkspaceItem { id: 1, name: "1".into(), active: true, urgent: false, windows: 1 },
-                WorkspaceItem { id: 2, name: "2".into(), active: false, urgent: false, windows: 0 },
+                WorkspaceItem { id: 1, name: "1".into(), monitor: "DP-1".into(), active: true, urgent: false, windows: 1 },
+                WorkspaceItem { id: 2, name: "2".into(), monitor: "DP-1".into(), active: false, urgent: false, windows: 0 },
             ],
             active_window: ActiveWindowSnapshot::default(),
             clients: vec![],
             socket_dir: None,
+            gaps_out: 0,
         }));
 
         let dummy_path = Path::new("/dev/null");

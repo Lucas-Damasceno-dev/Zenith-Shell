@@ -16,6 +16,27 @@ pub use mpris::{MediaSnapshot, MprisService};
 pub mod notifications;
 pub use notifications::{NotificationItem, NotificationService};
 
+pub mod tray;
+pub use tray::{TrayItem, TrayService};
+
+pub mod cava;
+pub use cava::CavaService;
+
+pub mod network;
+pub use network::{NetworkService, NetworkStatus, WifiNetwork};
+
+pub mod bluetooth;
+pub use bluetooth::{BluetoothDevice, BluetoothService, BluetoothStatus};
+
+pub mod audio;
+pub use audio::{AudioDevice, AudioService};
+
+pub mod weather;
+pub use weather::{WeatherService, WeatherSnapshot};
+
+pub mod recorder;
+pub use recorder::RecorderService;
+
 /// Snapshot of system memory status.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySnapshot {

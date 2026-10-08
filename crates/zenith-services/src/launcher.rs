@@ -56,7 +56,7 @@ impl LauncherService {
 
         if q.is_empty() {
             let mut res = apps;
-            res.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            res.sort_by_key(|a| a.name.to_lowercase());
             res.truncate(limit);
             return res;
         }
@@ -135,22 +135,56 @@ impl LauncherService {
             return 80;
         }
 
-        // Fuzzy subsequence match in app name
-        if Self::fuzzy_subsequence(&name_lower, q) {
-            return 50;
+        // Advanced fuzzy subsequence match in app name
+        let fuzzy = Self::fuzzy_match_score(&name_lower, q);
+        if fuzzy > 0 {
+            return fuzzy;
         }
 
         0
     }
 
-    fn fuzzy_subsequence(text: &str, pattern: &str) -> bool {
-        let mut text_chars = text.chars();
-        for p in pattern.chars() {
-            if !text_chars.any(|c| c == p) {
-                return false;
-            }
+    fn fuzzy_match_score(text: &str, pattern: &str) -> i32 {
+        if pattern.is_empty() {
+            return 0;
         }
-        true
+        let text_lower: Vec<char> = text.to_lowercase().chars().collect();
+        let pat_lower: Vec<char> = pattern.to_lowercase().chars().collect();
+
+        let mut score = 0;
+        let mut t_idx = 0;
+        let mut p_idx = 0;
+        let mut prev_matched_idx: Option<usize> = None;
+
+        while t_idx < text_lower.len() && p_idx < pat_lower.len() {
+            if text_lower[t_idx] == pat_lower[p_idx] {
+                score += 10;
+                // Word boundary bonus
+                if t_idx == 0 || !text_lower[t_idx - 1].is_alphanumeric() {
+                    score += 30;
+                }
+                // Consecutive match bonus
+                if let Some(prev) = prev_matched_idx {
+                    if t_idx == prev + 1 {
+                        score += 20;
+                    } else {
+                        let gap = (t_idx - prev) as i32;
+                        score -= gap.min(10);
+                    }
+                }
+                prev_matched_idx = Some(t_idx);
+                p_idx += 1;
+            }
+            t_idx += 1;
+        }
+
+        if p_idx == pat_lower.len() {
+            score.max(1) + 60
+        } else if pat_lower.len() >= 4 && p_idx == pat_lower.len() - 1 {
+            score.max(1)
+        } else {
+            0
+        }
     }
 
     /// Strip XDG field codes (%f, %u, %F, %U, etc.) from desktop Exec string.

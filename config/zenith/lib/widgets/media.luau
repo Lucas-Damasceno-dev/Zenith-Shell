@@ -31,8 +31,20 @@ local function MediaWidget()
     else
         media.title
 
-    if #label > 30 then
-        label = label:sub(1, 27) .. "..."
+    if #label > 28 then
+        label = label:sub(1, 25) .. "..."
+    end
+
+    local spectrum = Zenith.Services.Spectrum(4)
+    local spectrum_bars = {}
+    for _, val in ipairs(spectrum) do
+        local bar_h = math.clamp(math.floor(val * 10) + 2, 2, 12)
+        table.insert(spectrum_bars, Zenith.Box({
+            width = 2,
+            height = bar_h,
+            border_radius = 1,
+            background = Zenith.hex(theme.primary),
+        }))
     end
 
     return Zenith.Box({
@@ -54,6 +66,12 @@ local function MediaWidget()
                 text = label,
                 font_size = 11,
                 color = Zenith.hex(theme.on_surface),
+            }),
+            Zenith.Box({
+                direction = "row",
+                gap = 2,
+                height = 12,
+                children = spectrum_bars,
             })
         }
     })

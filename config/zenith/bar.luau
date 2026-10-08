@@ -11,6 +11,7 @@ local Clock = Zenith.import("widgets/clock")
 local Hardware = Zenith.import("widgets/hardware")
 local QuickStatus = Zenith.import("widgets/quick_status")
 local Media = Zenith.import("widgets/media")
+local Tray = Zenith.import("widgets/tray")
 
 local active_win = Zenith.Services.ActiveWindow()
 local win_text = "󰘔 Zenith Shell"
@@ -93,12 +94,46 @@ return Zenith.Box({
                 -- Spacer
                 Zenith.Box({ flex_grow = 1 }),
 
-                -- 3. RIGHT CLUSTER: Hardware Monitors (CPU/RAM) + Quick Status (Net/Audio/Bat/Power)
+                -- 3. RIGHT CLUSTER: Snipping + Recording + Hardware Monitors (CPU/RAM) + Tray + Quick Status
                 Zenith.Box({
                     direction = "row",
                     gap = 6,
                     children = {
+                        Zenith.Box({
+                            padding = { x = 8, y = 3 },
+                            border_radius = 12,
+                            background = Zenith.rgba(255, 255, 255, 10),
+                            border_color = Zenith.rgba(255, 255, 255, 18),
+                            border_width = 1,
+                            on_click = "screenshot:area",
+                            children = {
+                                Zenith.Text({
+                                    text = "󰄀",
+                                    font_size = 11,
+                                    color = Zenith.hex(theme.on_surface),
+                                }),
+                            }
+                        }),
+                        if Zenith.Services.IsRecording() then
+                            Zenith.Box({
+                                padding = { x = 8, y = 3 },
+                                border_radius = 12,
+                                background = Zenith.rgba(224, 108, 117, 60),
+                                border_color = Zenith.hex("#e06c75"),
+                                border_width = 1,
+                                on_click = "record:toggle",
+                                children = {
+                                    Zenith.Text({
+                                        text = "● REC",
+                                        font_size = 11,
+                                        color = Zenith.hex("#ffffff"),
+                                    }),
+                                }
+                            })
+                        else
+                            nil :: any,
                         Hardware(),
+                        Tray(),
                         QuickStatus(),
                     }
                 }),

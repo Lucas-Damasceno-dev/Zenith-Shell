@@ -5,6 +5,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -31,6 +32,7 @@ struct NotificationState {
 
 static STATE: OnceLock<Arc<RwLock<NotificationState>>> = OnceLock::new();
 static CHANGE_LISTENER: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
+static DND_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Service provider for desktop notifications.
 pub struct NotificationService;
@@ -43,6 +45,32 @@ impl NotificationService {
         r.active.clone()
     }
 
+    /// Retrieve all historical notifications.
+    pub fn list_history() -> Vec<NotificationItem> {
+        let state = Self::get_state();
+        let r = state.read().unwrap();
+        r.history.clone()
+    }
+
+    /// Whether Do Not Disturb (DND) mode is active.
+    pub fn is_dnd() -> bool {
+        DND_ENABLED.load(Ordering::SeqCst)
+    }
+
+    /// Toggle Do Not Disturb (DND) mode.
+    pub fn toggle_dnd() -> bool {
+        let old = DND_ENABLED.fetch_xor(true, Ordering::SeqCst);
+        let new_state = !old;
+        Self::notify_change();
+        new_state
+    }
+
+    /// Set Do Not Disturb (DND) mode.
+    pub fn set_dnd(enabled: bool) {
+        DND_ENABLED.store(enabled, Ordering::SeqCst);
+        Self::notify_change();
+    }
+
     /// Retrieve count of active notifications.
     pub fn count() -> usize {
         let state = Self::get_state();
@@ -51,6 +79,7 @@ impl NotificationService {
     }
 
     /// Create or insert a notification programmatically.
+    #[allow(clippy::too_many_arguments)]
     pub fn notify(
         app_name: String,
         replaces_id: u32,
@@ -88,6 +117,18 @@ impl NotificationService {
             timestamp_secs: now,
             expire_timeout_ms,
         };
+
+        let is_dnd = Self::is_dnd();
+        if is_dnd && urgency < 2 {
+            // Under DND, silence non-critical notifications into history only
+            w.history.insert(0, item);
+            if w.history.len() > 50 {
+                w.history.truncate(50);
+            }
+            drop(w);
+            Self::notify_change();
+            return id;
+        }
 
         // If replacing an existing item, update it in place
         if let Some(pos) = w.active.iter().position(|n| n.id == id) {
@@ -129,6 +170,15 @@ impl NotificationService {
         let mut w = state.write().unwrap();
         let mut drained = w.active.drain(..).collect::<Vec<_>>();
         w.history.append(&mut drained);
+        drop(w);
+        Self::notify_change();
+    }
+
+    /// Clear all historical notifications.
+    pub fn clear_history() {
+        let state = Self::get_state();
+        let mut w = state.write().unwrap();
+        w.history.clear();
         drop(w);
         Self::notify_change();
     }

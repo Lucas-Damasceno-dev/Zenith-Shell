@@ -33,9 +33,22 @@ local function Workspaces(props: { active: number?, count: number? }?)
         [9] = "",  -- Settings
     }
 
+    local cur_output = (Zenith.current_output and Zenith.current_output()) or "default"
+    local has_monitor_binding = false
+    for _, ws in ipairs(ws_list) do
+        if ws.monitor and ws.monitor ~= "" then
+            has_monitor_binding = true
+            break
+        end
+    end
+
     local children = {}
 
     for _, ws in ipairs(ws_list) do
+        if has_monitor_binding and cur_output ~= "default" and ws.monitor and ws.monitor ~= "" and ws.monitor ~= cur_output then
+            continue
+        end
+
         local is_active = (ws.id == active_id) or ws.active
         local is_urgent = ws.urgent
         local has_windows = (ws.windows and ws.windows > 0)

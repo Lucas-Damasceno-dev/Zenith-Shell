@@ -1822,6 +1822,7 @@ dependencies = [
  "zenith-core",
  "zenith-layout",
  "zenith-runtime",
+ "zenith-services",
 ]
 
 [[package]]

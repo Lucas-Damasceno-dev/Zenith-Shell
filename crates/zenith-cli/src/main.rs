@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             send_socket_command(&format!("open {}", target))
         }
         "close" => send_socket_command("close"),
+        "lock" => send_socket_command("lock"),
         "inspect" => send_socket_command("inspect"),
         "help" | "--help" | "-h" => {
             print_help();
@@ -69,6 +70,7 @@ fn print_help() {
     println!("    toggle <popup_id>    Toggle an overlay popup (e.g. Launcher, AudioPopup)");
     println!("    open <popup_id>      Open specified overlay popup");
     println!("    close                Close currently open overlay popup");
+    println!("    lock                 Activate screen locker overlay");
     println!("    inspect              Display live shell telemetry (RSS, heap, popups)");
     println!("    help                 Show this help message");
 }
@@ -231,17 +233,20 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
             if trimmed == "reload" {
                 let _ = socket_cmd_sender.send(ShellCommand::Reload);
                 let _ = stream.write_all(b"OK: reload scheduled\n");
-            } else if trimmed.starts_with("toggle ") {
-                let id = trimmed[7..].trim().to_string();
+            } else if let Some(stripped) = trimmed.strip_prefix("toggle ") {
+                let id = stripped.trim().to_string();
                 let _ = socket_cmd_sender.send(ShellCommand::Toggle(id));
                 let _ = stream.write_all(b"OK: toggle dispatched\n");
-            } else if trimmed.starts_with("open ") {
-                let id = trimmed[5..].trim().to_string();
+            } else if let Some(stripped) = trimmed.strip_prefix("open ") {
+                let id = stripped.trim().to_string();
                 let _ = socket_cmd_sender.send(ShellCommand::Open(id));
                 let _ = stream.write_all(b"OK: open dispatched\n");
             } else if trimmed == "close" {
                 let _ = socket_cmd_sender.send(ShellCommand::Close);
                 let _ = stream.write_all(b"OK: close dispatched\n");
+            } else if trimmed == "lock" {
+                let _ = socket_cmd_sender.send(ShellCommand::Open("LockScreen".to_string()));
+                let _ = stream.write_all(b"OK: screen locked\n");
             } else if trimmed == "inspect" {
                 let (vmrss_mb, heap_mb) = read_self_memory();
                 let resp = format!(

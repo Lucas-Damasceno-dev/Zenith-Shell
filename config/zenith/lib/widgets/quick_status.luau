@@ -84,6 +84,25 @@ local function QuickStatus()
                 }
             }),
 
+            -- Bluetooth Pill
+            Zenith.Box({
+                direction = "row",
+                gap = 5,
+                padding = { x = 9, y = 3 },
+                border_radius = 12,
+                background = Zenith.rgba(255, 255, 255, 10),
+                border_color = Zenith.rgba(255, 255, 255, 18),
+                border_width = 1,
+                on_click = "popup:toggle:BluetoothPopup",
+                children = {
+                    Zenith.Text({
+                        text = "󰂯",
+                        font_size = 11,
+                        color = Zenith.hex(theme.primary),
+                    }),
+                }
+            }),
+
             -- Battery Pill
             Zenith.Box({
                 direction = "row",

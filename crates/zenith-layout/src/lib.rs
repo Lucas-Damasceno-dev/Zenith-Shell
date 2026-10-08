@@ -101,7 +101,7 @@ pub enum UiNode {
 }
 
 /// Computed geometry ready for rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ComputedBox {
     pub x: f32,
     pub y: f32,
@@ -120,6 +120,12 @@ pub struct ComputedBox {
 /// Engine to calculate layout positions for an entire UI tree.
 pub struct LayoutEngine {
     taffy: TaffyTree<()>,
+}
+
+impl Default for LayoutEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LayoutEngine {

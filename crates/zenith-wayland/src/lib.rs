@@ -2,15 +2,16 @@
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
         Capability, SeatHandler, SeatState,
     },
-    delegate_seat, delegate_pointer,
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -22,12 +23,11 @@ use smithay_client_toolkit::{
         slot::SlotPool,
         Shm, ShmHandler,
     },
-
 };
 use tracing::{error, info};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 use zenith_layout::{LayoutEngine, UiNode};
@@ -85,6 +85,17 @@ pub struct PopupWindow {
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
 }
 
+/// Individual Layer Shell bar window instance attached to a Wayland output.
+pub struct BarInstance {
+    pub output: Option<wl_output::WlOutput>,
+    pub output_name: String,
+    pub surface: LayerSurface,
+    pub width: u32,
+    pub height: u32,
+    pub configured: bool,
+    pub computed_boxes: Vec<zenith_layout::ComputedBox>,
+}
+
 /// Main application state for Wayland event handling.
 pub struct WaylandApp {
     pub registry_state: RegistryState,
@@ -94,9 +105,11 @@ pub struct WaylandApp {
     pub shm: Shm,
     pub pool: SlotPool,
     pub layer_shell: LayerShell,
+    pub bars: Vec<BarInstance>,
     pub bar_surface: Option<LayerSurface>,
     pub popup: Option<PopupWindow>,
     pub pointer: Option<wayland_client::protocol::wl_pointer::WlPointer>,
+    pub keyboard: Option<wayland_client::protocol::wl_keyboard::WlKeyboard>,
     pub pointer_pos: (f64, f64),
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
     pub width: u32,
@@ -106,6 +119,7 @@ pub struct WaylandApp {
     pub layout_engine: LayoutEngine,
     pub runtime: LuauRuntime,
     pub root_ui: UiNode,
+    pub bar_script: String,
     pub font_system: cosmic_text::FontSystem,
     pub swash_cache: cosmic_text::SwashCache,
     pub qh: QueueHandle<Self>,
@@ -136,9 +150,11 @@ impl WaylandApp {
             shm,
             pool,
             layer_shell,
+            bars: Vec::new(),
             bar_surface: None,
             popup: None,
             pointer: None,
+            keyboard: None,
             pointer_pos: (0.0, 0.0),
             computed_boxes: Vec::new(),
             width: 1920,
@@ -148,6 +164,7 @@ impl WaylandApp {
             layout_engine,
             runtime,
             root_ui,
+            bar_script: DEFAULT_LUAU_SCRIPT.to_string(),
             font_system: cosmic_text::FontSystem::new(),
             swash_cache: cosmic_text::SwashCache::new(),
             qh: qh.clone(),
@@ -158,16 +175,19 @@ impl WaylandApp {
         Ok((app, conn, event_queue))
     }
 
-    /// Creates the top status bar layer surface.
-    pub fn create_bar(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn std::error::Error>> {
-        let wl_surface = self.compositor_state.create_surface(qh);
-
+    /// Creates a layer surface bar for a specific Wayland output (or default if None).
+    pub fn create_bar_for_output(
+        &mut self,
+        output: Option<&wl_output::WlOutput>,
+        output_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let wl_surface = self.compositor_state.create_surface(&self.qh);
         let layer_surface = self.layer_shell.create_layer_surface(
-            qh,
+            &self.qh,
             wl_surface,
             Layer::Top,
             Some("zenith-bar"),
-            None,
+            output,
         );
 
         layer_surface.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
@@ -175,15 +195,48 @@ impl WaylandApp {
         layer_surface.set_exclusive_zone(self.height as i32);
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-        layer_surface.commit();
-        info!("Layer surface created for zenith-bar (height={})", self.height);
+        let gaps_out = zenith_services::HyprlandService::gaps_out();
+        if gaps_out > 0 {
+            layer_surface.set_margin(gaps_out as i32, gaps_out as i32, 0, gaps_out as i32);
+        }
 
-        self.bar_surface = Some(layer_surface);
+        layer_surface.commit();
+        info!("Layer surface created for zenith-bar on output '{}' (height={}, gaps_out={})", output_name, self.height, gaps_out);
+
+        self.bars.push(BarInstance {
+            output: output.cloned(),
+            output_name: output_name.to_string(),
+            surface: layer_surface,
+            width: self.width,
+            height: self.height,
+            configured: false,
+            computed_boxes: Vec::new(),
+        });
+
         Ok(())
+    }
+
+    /// Creates the top status bar layer surface.
+    pub fn create_bar(&mut self, _qh: &QueueHandle<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        self.create_bar_for_output(None, "default")
+    }
+
+    /// Dynamically syncs margins with current Hyprland gaps_out setting across all active bars.
+    pub fn sync_gaps(&mut self) {
+        let gaps_out = zenith_services::HyprlandService::gaps_out();
+        for bar in &self.bars {
+            bar.surface.set_margin(gaps_out as i32, gaps_out as i32, 0, gaps_out as i32);
+            bar.surface.commit();
+        }
+        if let Some(ref bar) = self.bar_surface {
+            bar.set_margin(gaps_out as i32, gaps_out as i32, 0, gaps_out as i32);
+            bar.commit();
+        }
     }
 
     /// Re-evaluates Luau script and updates the UI tree.
     pub fn reload_script(&mut self, script: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.bar_script = script.to_string();
         self.root_ui = self.runtime.eval_ui(script)?;
         self.draw()?;
         if self.popup.is_some() {
@@ -201,13 +254,15 @@ impl WaylandApp {
             "island" | "dynamicisland" => ("DynamicIsland", Anchor::TOP, 380, 52, 10, 0, 0, 0),
             "launcher" => ("Launcher", Anchor::TOP, 520, 440, 80, 0, 0, 0),
             "media" | "mediapopup" => ("MediaPopup", Anchor::TOP, 340, 380, 44, 0, 0, 0),
-            "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 360, 520, 44, 14, 0, 0),
+            "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 390, 520, 44, 14, 0, 0),
             "audio" | "audiopopup" => ("AudioPopup", Anchor::TOP | Anchor::RIGHT, 320, 240, 44, 14, 0, 0),
-            "network" | "networkpopup" => ("NetworkPopup", Anchor::TOP | Anchor::RIGHT, 320, 280, 44, 60, 0, 0),
+            "network" | "networkpopup" => ("NetworkPopup", Anchor::TOP | Anchor::RIGHT, 360, 460, 44, 14, 0, 0),
+            "bluetooth" | "bluetoothpopup" => ("BluetoothPopup", Anchor::TOP | Anchor::RIGHT, 360, 420, 44, 14, 0, 0),
             "calendar" | "calendarpopup" => ("CalendarPopup", Anchor::TOP, 340, 380, 44, 0, 0, 0),
             "power" | "powermenu" => ("PowerMenu", Anchor::TOP | Anchor::RIGHT, 260, 200, 44, 14, 0, 0),
-            "osd" => ("OSD", Anchor::TOP, 280, 48, 60, 0, 0, 0),
+            "osd" => ("OSD", Anchor::TOP, 280, 110, 60, 0, 0, 0),
             "canvas" | "desktopcanvas" => ("DesktopCanvas", Anchor::TOP | Anchor::LEFT, 380, 320, 60, 0, 0, 24),
+            "lock" | "lockscreen" => ("LockScreen", Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT, 0, 0, 0, 0, 0, 0),
             _ => (id, Anchor::TOP | Anchor::RIGHT, 300, 250, 44, 14, 0, 0),
         };
 
@@ -249,13 +304,22 @@ impl WaylandApp {
             format!("Cannot find overlay script for popup '{}'", id)
         })?;
 
+        self.runtime.set_search_query("");
+        self.runtime.set_selected_index(1);
+
         let root_ui = self.runtime.eval_ui(&content)?;
+
+        let (layer_level, kb_mode) = if id.eq_ignore_ascii_case("lock") || id.eq_ignore_ascii_case("lockscreen") {
+            (Layer::Overlay, KeyboardInteractivity::Exclusive)
+        } else {
+            (Layer::Top, KeyboardInteractivity::OnDemand)
+        };
 
         let wl_surface = self.compositor_state.create_surface(&self.qh);
         let layer_surface = self.layer_shell.create_layer_surface(
             &self.qh,
             wl_surface,
-            Layer::Top,
+            layer_level,
             Some(&format!("zenith-popup-{}", id)),
             None,
         );
@@ -264,7 +328,7 @@ impl WaylandApp {
         layer_surface.set_margin(margin_top, margin_right, margin_bottom, margin_left);
         layer_surface.set_size(width, height);
         layer_surface.set_exclusive_zone(0);
-        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer_surface.set_keyboard_interactivity(kb_mode);
         layer_surface.commit();
 
         info!("Created popup layer surface for '{}' ({}x{})", id, width, height);
@@ -278,6 +342,69 @@ impl WaylandApp {
             root_ui,
             computed_boxes: Vec::new(),
         });
+
+        Ok(())
+    }
+
+    /// Re-evaluates open popup Luau script with current reactive state and redraws.
+    pub fn reload_popup(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let script_name = match id.to_lowercase().as_str() {
+            "dock" => "Dock",
+            "island" | "dynamicisland" => "DynamicIsland",
+            "launcher" => "Launcher",
+            "media" | "mediapopup" => "MediaPopup",
+            "notifications" | "notificationcenter" => "NotificationCenter",
+            "audio" | "audiopopup" => "AudioPopup",
+            "network" | "networkpopup" => "NetworkPopup",
+            "bluetooth" | "bluetoothpopup" => "BluetoothPopup",
+            "calendar" | "calendarpopup" => "CalendarPopup",
+            "power" | "powermenu" => "PowerMenu",
+            "osd" => "OSD",
+            "canvas" | "desktopcanvas" => "DesktopCanvas",
+            _ => id,
+        };
+
+        let candidates = [
+            format!("config/zenith/overlays/{}.luau", script_name),
+            format!("config/zenith/overlays/{}.lua", script_name),
+            format!("config/zenith/overlays/{}Popup.luau", script_name),
+            format!("config/zenith/overlays/{}.luau", id),
+            format!("config/zenith/{}.luau", script_name.to_lowercase()),
+            format!("../../config/zenith/overlays/{}.luau", script_name),
+            format!("../../config/zenith/overlays/{}.luau", id),
+        ];
+
+        let mut script_content = None;
+        for c in &candidates {
+            if let Ok(content) = std::fs::read_to_string(c) {
+                script_content = Some(content);
+                break;
+            }
+        }
+
+        if script_content.is_none() {
+            if let Ok(home) = std::env::var("HOME") {
+                let home_candidates = [
+                    format!("{}/.config/zenith/overlays/{}.luau", home, script_name),
+                    format!("{}/.config/zenith/overlays/{}.luau", home, id),
+                    format!("{}/.config/zenith/{}.luau", home, script_name.to_lowercase()),
+                ];
+                for c in &home_candidates {
+                    if let Ok(content) = std::fs::read_to_string(c) {
+                        script_content = Some(content);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(content) = script_content {
+            let root_ui = self.runtime.eval_ui(&content)?;
+            if let Some(ref mut popup) = self.popup {
+                popup.root_ui = root_ui;
+                let _ = self.draw_popup();
+            }
+        }
 
         Ok(())
     }
@@ -305,20 +432,28 @@ impl WaylandApp {
     /// Execute an action string (e.g. popup:toggle:audio, dispatch:workspace:1, cmd:...)
     pub fn execute_action(&mut self, action: &str) {
         info!("Executing click action: {}", action);
-        if action.starts_with("popup:toggle:") {
-            let id = &action[13..];
+        if let Some(id) = action.strip_prefix("popup:toggle:") {
             self.toggle_popup(id);
-        } else if action == "popup:close" {
+        } else if action == "popup:close" || action == "lock:unlock" {
             self.close_popup();
-        } else if action.starts_with("popup:open:") {
-            let id = &action[11..];
+        } else if let Some(id) = action.strip_prefix("popup:open:") {
             let _ = self.open_popup(id);
+        } else if action == "search:clear" {
+            self.runtime.set_search_query("");
+            self.runtime.set_selected_index(1);
+            if let Some(ref p) = self.popup {
+                let id = p.id.clone();
+                let _ = self.reload_popup(&id);
+                let _ = self.draw_popup();
+            }
         } else {
             // Dismiss popup on outside actions, except audio tweaks, media controls, and notification actions
             if self.popup.is_some()
+                && self.popup.as_ref().map(|p| p.id != "LockScreen" && p.id != "lock").unwrap_or(true)
                 && !action.starts_with("cmd:wpctl")
                 && !action.starts_with("media:")
                 && !action.starts_with("notification:")
+                && !action.starts_with("audio:set_sink:")
             {
                 self.close_popup();
             }
@@ -328,42 +463,52 @@ impl WaylandApp {
         }
     }
 
-    /// Draw the computed Luau layout into the SHM buffer.
+    /// Draw the computed Luau layout into the SHM buffer for all active bar outputs.
     pub fn draw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.configured {
-            return Ok(());
-        }
+        for bar in &mut self.bars {
+            if !bar.configured {
+                continue;
+            }
 
-        let width = self.width.max(1);
-        let height = self.height.max(1);
-        let stride = width * 4;
+            let width = bar.width.max(1);
+            let height = bar.height.max(1);
+            let stride = width * 4;
 
-        let (buffer, canvas) = self.pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride as i32,
-            wl_shm::Format::Argb8888,
-        )?;
+            let (buffer, canvas) = self.pool.create_buffer(
+                width as i32,
+                height as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+            )?;
 
-        // Clear canvas
-        canvas.fill(0);
+            // Clear canvas
+            canvas.fill(0);
 
-        // Compute Taffy layout on the Luau tree
-        self.computed_boxes = self.layout_engine.compute(&self.root_ui, width as f32, height as f32);
+            // Contextualize output for per-output widget filtering
+            self.runtime.set_current_output(&bar.output_name);
+            let bar_ui = self.runtime.eval_ui(&self.bar_script).unwrap_or_else(|_| self.root_ui.clone());
 
-        Self::render_boxes_to_canvas(
-            canvas,
-            &self.computed_boxes,
-            width,
-            height,
-            &mut self.font_system,
-            &mut self.swash_cache,
-        )?;
+            // Compute Taffy layout on the Luau tree
+            let new_boxes = self.layout_engine.compute(&bar_ui, width as f32, height as f32);
+            let damage = Self::compute_damage_rect(&bar.computed_boxes, &new_boxes, width, height);
+            bar.computed_boxes = new_boxes;
 
-        if let Some(ref surface) = self.bar_surface {
-            buffer.attach_to(surface.wl_surface())?;
-            surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-            surface.commit();
+            Self::render_boxes_to_canvas(
+                canvas,
+                &bar.computed_boxes,
+                width,
+                height,
+                &mut self.font_system,
+                &mut self.swash_cache,
+            )?;
+
+            buffer.attach_to(bar.surface.wl_surface())?;
+            if let Some((dx, dy, dw, dh)) = damage {
+                bar.surface.wl_surface().damage_buffer(dx, dy, dw, dh);
+            } else {
+                bar.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+            }
+            bar.surface.commit();
         }
 
         Ok(())
@@ -389,7 +534,9 @@ impl WaylandApp {
 
         canvas.fill(0);
 
-        popup.computed_boxes = self.layout_engine.compute(&popup.root_ui, width as f32, height as f32);
+        let new_boxes = self.layout_engine.compute(&popup.root_ui, width as f32, height as f32);
+        let damage = Self::compute_damage_rect(&popup.computed_boxes, &new_boxes, width, height);
+        popup.computed_boxes = new_boxes;
 
         Self::render_boxes_to_canvas(
             canvas,
@@ -401,10 +548,52 @@ impl WaylandApp {
         )?;
 
         buffer.attach_to(popup.surface.wl_surface())?;
-        popup.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+        if let Some((dx, dy, dw, dh)) = damage {
+            popup.surface.wl_surface().damage_buffer(dx, dy, dw, dh);
+        } else {
+            popup.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+        }
         popup.surface.commit();
 
         Ok(())
+    }
+
+    fn compute_damage_rect(
+        old_boxes: &[zenith_layout::ComputedBox],
+        new_boxes: &[zenith_layout::ComputedBox],
+        width: u32,
+        height: u32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if old_boxes.is_empty() || old_boxes.len() != new_boxes.len() {
+            return Some((0, 0, width as i32, height as i32));
+        }
+
+        let mut min_x = width as f32;
+        let mut min_y = height as f32;
+        let mut max_x = 0.0f32;
+        let mut max_y = 0.0f32;
+        let mut any_diff = false;
+
+        for (old, new) in old_boxes.iter().zip(new_boxes.iter()) {
+            if old != new {
+                any_diff = true;
+                let pad = 24.0f32;
+                min_x = min_x.min(old.x - pad).min(new.x - pad);
+                min_y = min_y.min(old.y - pad).min(new.y - pad);
+                max_x = max_x.max(old.x + old.width + pad).max(new.x + new.width + pad);
+                max_y = max_y.max(old.y + old.height + pad).max(new.y + new.height + pad);
+            }
+        }
+
+        if any_diff {
+            let x = (min_x.max(0.0).floor()) as i32;
+            let y = (min_y.max(0.0).floor()) as i32;
+            let w = ((max_x - min_x).ceil() as i32).min(width as i32 - x).max(1);
+            let h = ((max_y - min_y).ceil() as i32).min(height as i32 - y).max(1);
+            Some((x, y, w, h))
+        } else {
+            None
+        }
     }
 
     fn build_rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
@@ -461,8 +650,10 @@ impl WaylandApp {
                             let sh = b.height + spread;
                             let sr = (b.border_radius + spread * 0.5).max(0.0);
                             if let Some(spath) = Self::build_rounded_rect_path(sx, sy, sw, sh, sr) {
-                                let mut spaint = tiny_skia::Paint::default();
-                                spaint.anti_alias = true;
+                                let mut spaint = tiny_skia::Paint {
+                                    anti_alias: true,
+                                    ..Default::default()
+                                };
                                 let step_alpha = (base_alpha * (1.0 - (i as f32 - 1.0) / steps as f32)).clamp(1.0, 255.0) as u8;
                                 spaint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, step_alpha);
                                 pixmap.fill_path(
@@ -484,8 +675,10 @@ impl WaylandApp {
 
                     // Fill background with anti-aliasing
                     if b.background_color.a > 0 {
-                        let mut fill_paint = tiny_skia::Paint::default();
-                        fill_paint.anti_alias = true;
+                        let mut fill_paint = tiny_skia::Paint {
+                            anti_alias: true,
+                            ..Default::default()
+                        };
                         fill_paint.set_color_rgba8(
                             b.background_color.r,
                             b.background_color.g,
@@ -503,8 +696,10 @@ impl WaylandApp {
 
                     // Stroke border with anti-aliasing
                     if b.border_width > 0.0 && b.border_color.a > 0 {
-                        let mut stroke_paint = tiny_skia::Paint::default();
-                        stroke_paint.anti_alias = true;
+                        let mut stroke_paint = tiny_skia::Paint {
+                            anti_alias: true,
+                            ..Default::default()
+                        };
                         stroke_paint.set_color_rgba8(
                             b.border_color.r,
                             b.border_color.g,
@@ -597,6 +792,7 @@ delegate_shm!(WaylandApp);
 delegate_layer!(WaylandApp);
 delegate_seat!(WaylandApp);
 delegate_pointer!(WaylandApp);
+delegate_keyboard!(WaylandApp);
 delegate_registry!(WaylandApp);
 
 impl ProvidesRegistryState for WaylandApp {
@@ -618,6 +814,12 @@ impl SeatHandler for WaylandApp {
                 self.pointer = Some(ptr);
             }
         }
+        if self.keyboard.is_none() {
+            if let Ok(kbd) = self.seat_state.get_keyboard(qh, &seat, None) {
+                info!("Acquired Wayland keyboard from seat");
+                self.keyboard = Some(kbd);
+            }
+        }
     }
 
     fn new_capability(
@@ -633,6 +835,12 @@ impl SeatHandler for WaylandApp {
                 self.pointer = Some(ptr);
             }
         }
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            if let Ok(kbd) = self.seat_state.get_keyboard(qh, &seat, None) {
+                info!("Acquired Wayland keyboard on capability");
+                self.keyboard = Some(kbd);
+            }
+        }
     }
 
     fn remove_capability(
@@ -645,6 +853,9 @@ impl SeatHandler for WaylandApp {
         if capability == Capability::Pointer {
             self.pointer = None;
         }
+        if capability == Capability::Keyboard {
+            self.keyboard = None;
+        }
     }
 
     fn remove_seat(
@@ -654,6 +865,7 @@ impl SeatHandler for WaylandApp {
         _seat: wayland_client::protocol::wl_seat::WlSeat,
     ) {
         self.pointer = None;
+        self.keyboard = None;
     }
 }
 
@@ -670,57 +882,56 @@ impl PointerHandler for WaylandApp {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     self.pointer_pos = event.position;
                 }
-                PointerEventKind::Press { button, .. } => {
-                    if button == BTN_LEFT {
-                        let (px, py) = self.pointer_pos;
-                        let mut target_action: Option<String> = None;
+                PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
+                    let (px, py) = self.pointer_pos;
+                    let mut target_action: Option<String> = None;
 
-                        // Check if click was on popup window
-                        if let Some(ref popup) = self.popup {
-                            if event.surface == *popup.surface.wl_surface() {
-                                for b in popup.computed_boxes.iter().rev() {
-                                    if px >= b.x as f64
-                                        && px <= (b.x + b.width) as f64
-                                        && py >= b.y as f64
-                                        && py <= (b.y + b.height) as f64
-                                    {
-                                        if let Some(ref action) = b.on_click {
-                                            target_action = Some(action.clone());
-                                            break;
-                                        }
+                    // Check if click was on popup window
+                    if let Some(ref popup) = self.popup {
+                        if event.surface == *popup.surface.wl_surface() {
+                            for b in popup.computed_boxes.iter().rev() {
+                                if px >= b.x as f64
+                                    && px <= (b.x + b.width) as f64
+                                    && py >= b.y as f64
+                                    && py <= (b.y + b.height) as f64
+                                {
+                                    if let Some(ref action) = b.on_click {
+                                        target_action = Some(action.clone());
+                                        break;
                                     }
                                 }
-
-                                if let Some(action) = target_action {
-                                    self.execute_action(&action);
-                                }
-                                return;
                             }
+
+                            if let Some(action) = target_action {
+                                self.execute_action(&action);
+                            }
+                            return;
                         }
+                    }
 
-                        // Check if click was on status bar
-                        if let Some(ref bar) = self.bar_surface {
-                            if event.surface == *bar.wl_surface() {
-                                for b in self.computed_boxes.iter().rev() {
-                                    if px >= b.x as f64
-                                        && px <= (b.x + b.width) as f64
-                                        && py >= b.y as f64
-                                        && py <= (b.y + b.height) as f64
-                                    {
-                                        if let Some(ref action) = b.on_click {
-                                            target_action = Some(action.clone());
-                                            break;
-                                        }
+                    // Check if click was on any status bar
+                    for bar in &self.bars {
+                        if event.surface == *bar.surface.wl_surface() {
+                            for b in bar.computed_boxes.iter().rev() {
+                                if px >= b.x as f64
+                                    && px <= (b.x + b.width) as f64
+                                    && py >= b.y as f64
+                                    && py <= (b.y + b.height) as f64
+                                {
+                                    if let Some(ref action) = b.on_click {
+                                        target_action = Some(action.clone());
+                                        break;
                                     }
                                 }
-
-                                if let Some(action) = target_action {
-                                    self.execute_action(&action);
-                                } else if self.popup.is_some() {
-                                    // Clicked outside on bar empty space: close popup
-                                    self.close_popup();
-                                }
                             }
+
+                            if let Some(action) = target_action {
+                                self.execute_action(&action);
+                            } else if self.popup.is_some() {
+                                // Clicked outside on bar empty space: close popup
+                                self.close_popup();
+                            }
+                            return;
                         }
                     }
                 }
@@ -730,6 +941,128 @@ impl PointerHandler for WaylandApp {
     }
 }
 
+
+impl KeyboardHandler for WaylandApp {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[Keysym],
+    ) {}
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {}
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        if self.popup.is_none() {
+            return;
+        }
+
+        let popup_id = self.popup.as_ref().unwrap().id.clone();
+
+        match event.keysym {
+            Keysym::Escape => {
+                self.close_popup();
+            }
+            Keysym::Return => {
+                let selected_idx = self.runtime.get_selected_index();
+                if let Some(ref popup) = self.popup {
+                    let mut actionables: Vec<String> = Vec::new();
+                    for b in &popup.computed_boxes {
+                        if let Some(ref act) = b.on_click {
+                            if act.starts_with("launch:") {
+                                actionables.push(act.clone());
+                            }
+                        }
+                    }
+                    if !actionables.is_empty() {
+                        let target = if selected_idx > 0 && selected_idx <= actionables.len() {
+                            Some(actionables[selected_idx - 1].clone())
+                        } else {
+                            actionables.first().cloned()
+                        };
+                        if let Some(act) = target {
+                            self.execute_action(&act);
+                        }
+                    }
+                }
+            }
+            Keysym::Up => {
+                let current = self.runtime.get_selected_index();
+                if current > 1 {
+                    self.runtime.set_selected_index(current - 1);
+                    let _ = self.reload_popup(&popup_id);
+                    let _ = self.draw_popup();
+                }
+            }
+            Keysym::Down => {
+                let current = self.runtime.get_selected_index();
+                self.runtime.set_selected_index(current + 1);
+                let _ = self.reload_popup(&popup_id);
+                let _ = self.draw_popup();
+            }
+            Keysym::BackSpace => {
+                let mut q = self.runtime.get_search_query();
+                if !q.is_empty() {
+                    q.pop();
+                    self.runtime.set_search_query(&q);
+                    self.runtime.set_selected_index(1);
+                    let _ = self.reload_popup(&popup_id);
+                    let _ = self.draw_popup();
+                }
+            }
+            _ => {
+                if let Some(text) = event.utf8 {
+                    let text = text.trim_matches(|c: char| c.is_control());
+                    if !text.is_empty() {
+                        let mut q = self.runtime.get_search_query();
+                        q.push_str(text);
+                        self.runtime.set_search_query(&q);
+                        self.runtime.set_selected_index(1);
+                        let _ = self.reload_popup(&popup_id);
+                        let _ = self.draw_popup();
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {}
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _modifiers: Modifiers,
+        _layout: u32,
+    ) {}
+}
 
 impl CompositorHandler for WaylandApp {
     fn scale_factor_changed(
@@ -782,22 +1115,49 @@ impl OutputHandler for WaylandApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {}
+        output: wl_output::WlOutput,
+    ) {
+        let name = self.output_state.info(&output)
+            .and_then(|i| i.name)
+            .unwrap_or_else(|| format!("output-{}", self.bars.len()));
+        info!("Wayland output added: name={:?}", name);
+
+        // If we only had the unassigned default bar, assign this output to it
+        if self.bars.len() == 1 && self.bars[0].output.is_none() {
+            self.bars[0].output = Some(output.clone());
+            self.bars[0].output_name = name.clone();
+            return;
+        }
+
+        // Spawn a cloned bar for this new output if it doesn't already have one
+        let exists = self.bars.iter().any(|b| b.output.as_ref() == Some(&output) || b.output_name == name);
+        if !exists {
+            if let Err(e) = self.create_bar_for_output(Some(&output), &name) {
+                error!("Failed to create bar for output '{}': {}", name, e);
+            }
+        }
+    }
 
     fn update_output(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {}
+        output: wl_output::WlOutput,
+    ) {
+        if let Some(info) = self.output_state.info(&output) {
+            info!("Wayland output updated: name={:?}, size={:?}", info.name, info.logical_size);
+        }
+    }
 
     fn output_destroyed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {}
+        output: wl_output::WlOutput,
+    ) {
+        info!("Wayland output destroyed");
+        self.bars.retain(|b| b.output.as_ref() != Some(&output));
+    }
 }
 
 impl ShmHandler for WaylandApp {
@@ -808,12 +1168,13 @@ impl ShmHandler for WaylandApp {
 
 impl LayerShellHandler for WaylandApp {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        if let Some(ref bar) = self.bar_surface {
-            if bar.wl_surface() == layer.wl_surface() {
-                info!("Layer surface closed by compositor: bar");
+        if let Some(pos) = self.bars.iter().position(|b| b.surface.wl_surface() == layer.wl_surface()) {
+            info!("Layer surface closed by compositor on output '{}'", self.bars[pos].output_name);
+            self.bars.remove(pos);
+            if self.bars.is_empty() {
                 self.running = false;
-                return;
             }
+            return;
         }
 
         if let Some(ref popup) = self.popup {
@@ -834,16 +1195,16 @@ impl LayerShellHandler for WaylandApp {
     ) {
         let (new_width, new_height) = configure.new_size;
 
-        if let Some(ref bar) = self.bar_surface {
-            if bar.wl_surface() == layer.wl_surface() {
+        for bar in &mut self.bars {
+            if bar.surface.wl_surface() == layer.wl_surface() {
                 if new_width > 0 {
-                    self.width = new_width;
+                    bar.width = new_width;
                 }
                 if new_height > 0 {
-                    self.height = new_height;
+                    bar.height = new_height;
                 }
-                self.configured = true;
-                info!("Bar surface configured: {}x{}", self.width, self.height);
+                bar.configured = true;
+                info!("Bar surface configured on '{}': {}x{}", bar.output_name, bar.width, bar.height);
                 if let Err(e) = self.draw() {
                     error!("Failed to render bar buffer on configure: {}", e);
                 }

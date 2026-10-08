@@ -2,7 +2,9 @@
 -- Zenith-Shell (Engine v2) - Universal Application Launcher Overlay
 
 local theme = Zenith.Theme()
-local apps = Zenith.Services.Launcher("", 8)
+local query = Zenith.get_search_query()
+local selected_idx = Zenith.get_selected_index()
+local apps = Zenith.Services.Launcher(query, 8)
 
 -- Icon heuristic based on categories, name, or keywords
 local function resolve_app_icon(name: string, comment: string): string
@@ -28,6 +30,7 @@ end
 
 local app_boxes = {}
 for idx, app in ipairs(apps) do
+    local is_selected = (idx == selected_idx)
     local icon = resolve_app_icon(app.name, app.comment)
     local subtext = (#app.comment > 0) and app.comment or app.id
     if #subtext > 40 then
@@ -39,8 +42,8 @@ for idx, app in ipairs(apps) do
         padding = { x = 12, y = 8 },
         gap = 12,
         border_radius = 8,
-        background = Zenith.hex(theme.surface_container),
-        border_color = Zenith.hex("#2a2e3d"),
+        background = Zenith.hex(is_selected and theme.primary_container or theme.surface_container),
+        border_color = Zenith.hex(is_selected and theme.primary or "#2a2e3d"),
         border_width = 1,
         on_click = "launch:" .. app.exec,
         children = {
@@ -108,19 +111,32 @@ return Zenith.Window({
             border_color = Zenith.hex(theme.primary),
             border_width = 1,
             gap = 10,
-            children = {
-                Zenith.Text({
-                    text = "",
-                    font_size = 14,
-                    color = Zenith.hex(theme.primary),
-                }),
-                Zenith.Text({
-                    text = "Type to search applications...",
-                    font_size = 13,
-                    color = Zenith.hex(theme.outline),
-                }),
-                Zenith.Box({ flex_grow = 1 }),
-                Zenith.Box({
+            children = (function()
+                local sc = {
+                    Zenith.Text({
+                        text = "",
+                        font_size = 14,
+                        color = Zenith.hex(theme.primary),
+                    }),
+                    Zenith.Text({
+                        text = (#query > 0) and (query .. "▎") or "Type to search applications...",
+                        font_size = 13,
+                        color = Zenith.hex((#query > 0) and theme.on_surface or theme.outline),
+                    }),
+                    Zenith.Box({ flex_grow = 1 }),
+                }
+                if #query > 0 then
+                    table.insert(sc, Zenith.Box({
+                        padding = { x = 6, y = 2 },
+                        border_radius = 6,
+                        background = Zenith.rgba(255, 255, 255, 12),
+                        on_click = "search:clear",
+                        children = {
+                            Zenith.Text({ text = "󰅖", font_size = 11, color = Zenith.hex(theme.outline) }),
+                        }
+                    }))
+                end
+                table.insert(sc, Zenith.Box({
                     padding = { x = 6, y = 2 },
                     border_radius = 6,
                     background = Zenith.hex(theme.surface_container),
@@ -128,8 +144,9 @@ return Zenith.Window({
                     children = {
                         Zenith.Text({ text = "ESC", font_size = 9, color = Zenith.hex(theme.on_surface) }),
                     }
-                }),
-            }
+                }))
+                return sc
+            end)(),
         }),
 
         -- Applications List

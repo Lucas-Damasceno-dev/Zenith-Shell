@@ -9,6 +9,7 @@ license.workspace = true
 zenith-core = { path = "../zenith-core" }
 zenith-layout = { path = "../zenith-layout" }
 zenith-runtime = { path = "../zenith-runtime" }
+zenith-services = { path = "../zenith-services" }
 smithay-client-toolkit = { version = "0.19", default-features = true }
 cosmic-text = "0.19"
 tiny-skia = "0.12"

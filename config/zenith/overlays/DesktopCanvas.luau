@@ -4,6 +4,7 @@
 local theme = Zenith.Theme()
 local time_str, date_str = Zenith.Services.time()
 local mem = Zenith.Services.memory()
+local weather = Zenith.Services.Weather()
 
 return Zenith.Box({
     direction = "column",
@@ -19,7 +20,7 @@ return Zenith.Box({
         offset_y = 8,
     },
     children = {
-        -- 1. Large Clock & Date
+        -- 1. Large Clock & Date & Weather
         Zenith.Box({
             direction = "column",
             gap = 4,
@@ -31,10 +32,26 @@ return Zenith.Box({
                     font_family = "JetBrainsMono Nerd Font",
                     color = theme.primary,
                 }),
-                Zenith.Text({
-                    text = date_str,
-                    font_size = 14,
-                    color = theme.on_surface,
+                Zenith.Box({
+                    direction = "row",
+                    gap = 8,
+                    children = {
+                        Zenith.Text({
+                            text = date_str,
+                            font_size = 14,
+                            color = theme.on_surface,
+                        }),
+                        Zenith.Text({
+                            text = "•",
+                            font_size = 12,
+                            color = theme.outline,
+                        }),
+                        Zenith.Text({
+                            text = string.format("%s %.0f°C %s", weather.icon, weather.temp, weather.condition),
+                            font_size = 13,
+                            color = theme.primary,
+                        }),
+                    }
                 }),
             }
         }),
@@ -100,11 +117,13 @@ return Zenith.Box({
                                     text = "⚡",
                                     font_size = 14,
                                     color = theme.primary,
+                                    children = {},
                                 }),
                                 Zenith.Text({
                                     text = "Zenith Engine v2",
                                     font_size = 12,
                                     color = theme.on_surface,
+                                    children = {},
                                 }),
                             }
                         }),
@@ -112,9 +131,50 @@ return Zenith.Box({
                             text = "sub-10ms | <15MB",
                             font_size = 11,
                             color = Zenith.hex("#a6accd"),
+                            children = {},
                         }),
                     }
                 }),
+            }
+        }),
+
+        -- 4. Audio Visualizer Spectrum (CAVA)
+        Zenith.Box({
+            direction = "column",
+            gap = 6,
+            children = {
+                Zenith.Box({
+                    direction = "row",
+                    justify_content = "space-between",
+                    children = {
+                        Zenith.Text({
+                            text = "󰎈 Spectrum Visualizer",
+                            font_size = 11,
+                            color = theme.on_surface,
+                            children = {},
+                        }),
+                    }
+                }),
+                Zenith.Box({
+                    direction = "row",
+                    gap = 4,
+                    height = 24,
+                    children = (function()
+                        local bars = {}
+                        local spec = Zenith.Services.Spectrum(16)
+                        for _, val in ipairs(spec) do
+                            local h = math.clamp(math.floor(val * 22) + 2, 2, 24)
+                            table.insert(bars, Zenith.Box({
+                                width = 14,
+                                height = h,
+                                border_radius = 2,
+                                background = Zenith.hex(theme.primary),
+                                children = {},
+                            }))
+                        end
+                        return bars
+                    end)(),
+                })
             }
         }),
     }

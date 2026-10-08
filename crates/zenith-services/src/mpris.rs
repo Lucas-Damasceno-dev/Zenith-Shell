@@ -194,6 +194,7 @@ impl MprisService {
             return (MediaSnapshot::default(), None);
         }
 
+        let mut first_match = None;
         for player_bus in players {
             let status = Self::get_player_property(&player_bus, "PlaybackStatus")
                 .unwrap_or_else(|| "Stopped".to_string());
@@ -211,7 +212,7 @@ impl MprisService {
             let snapshot = MediaSnapshot {
                 is_available: true,
                 player_name: short_name,
-                status,
+                status: status.clone(),
                 title: if title.is_empty() { "Unknown Title".to_string() } else { title },
                 artist,
                 album,
@@ -219,7 +220,16 @@ impl MprisService {
                 length_seconds: length,
             };
 
-            return (snapshot, Some(player_bus));
+            if status == "Playing" {
+                return (snapshot, Some(player_bus));
+            }
+            if first_match.is_none() {
+                first_match = Some((snapshot, Some(player_bus)));
+            }
+        }
+
+        if let Some(m) = first_match {
+            return m;
         }
 
         (MediaSnapshot::default(), None)
