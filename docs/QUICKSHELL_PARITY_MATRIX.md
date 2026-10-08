@@ -32,6 +32,12 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Interactive Dock** | `modules/dock/Dock.qml` | ✅ **Implemented** (`config/zenith/dock.luau` + `overlays/Dock.luau`) | **Milestone 10** |
 | **Dynamic Island HUD** | `modules/island/DynamicIsland.qml` | ✅ **Implemented** (`config/zenith/island.luau` + `overlays/DynamicIsland.luau`) | **Milestone 10** |
 | **Desktop Canvas** | `modules/canvas/DesktopCanvas.qml` | ✅ **Implemented** (`config/zenith/canvas.luau` + `overlays/DesktopCanvas.luau`) | **Milestone 10** |
+| **Bluetooth Popup** | `overlays/BluetoothPopup.qml` | ✅ **Implemented** (`overlays/BluetoothPopup.luau` + `bluetooth.rs`) | **Milestone 11** |
+| **Audio Sink Switcher** | Device switcher in AudioPopup | ✅ **Implemented** (`audio.rs` + `overlays/AudioPopup.luau`) | **Milestone 11** |
+| **Weather Telemetry** | Weather in DesktopCanvas | ✅ **Implemented** (`weather.rs` + `DesktopCanvas.luau`) | **Milestone 11** |
+| **Screen Recorder & Snipping** | External scripts (wf-recorder) | ✅ **Implemented** (`recorder.rs` + `bar.luau`) | **Milestone 11** |
+| **Lock Screen Overlay** | `hyprlock` / lock session | ✅ **Implemented** (`LockScreen.luau` + `zenith lock`) | **Milestone 11** |
+| **Multi-Output Cloning** | Quickshell Multi-Screen Bar | ✅ **Implemented** (`current_output` + `workspaces.luau`) | **Milestone 11** |
 
 ---
 

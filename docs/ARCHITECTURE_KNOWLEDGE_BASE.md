@@ -27,12 +27,12 @@ The repository is structured as a modular Cargo workspace in [`crates/`](file://
 
 ```
 crates/
-├── zenith-core/        # Shared types, error definitions, logging, geometry, colors
-├── zenith-services/    # Hardware telemetry, Pipewire, NetworkManager, Matugen theme
+├── zenith-core/        # Shared types, error definitions, logging, spring physics
+├── zenith-services/    # Hardware telemetry, PipeWire sinks, NetworkManager, Bluetooth, Weather, Recorder, Tray, Cava, Matugen theme
 ├── zenith-layout/      # Taffy 0.14 flexbox tree, measure funcs, cosmic-text sizing
 ├── zenith-runtime/     # Luau VM (mlua 0.12), declarative AST, Zenith.* bindings
-├── zenith-wayland/     # SCTK 0.19, wlr-layer-shell, tiny-skia 2-pass renderer, input
-└── zenith-cli/         # Entrypoint binary, calloop event loop, notify file watcher
+├── zenith-wayland/     # SCTK 0.19, multi-output wlr-layer-shell, tiny-skia 2-pass renderer, lock screen, input
+└── zenith-cli/         # Entrypoint binary, calloop event loop, notify file watcher, IPC control socket
 ```
 
 ### Dependency Graph
@@ -58,13 +58,12 @@ graph TD
 ## 3. Wayland Pipeline & Event Loop
 
 ### Wayland Protocols Used
-1. **`wl_compositor` & `wl_shm`:** Surface allocation and shared-memory double buffering via SCTK `SlotPool`.
-2. **`zwlr_layer_shell_v1` (wlr-layer-shell):** Anchored desktop overlays.
-   - Default bar layer: `Layer::Top`.
-   - Anchors: `Top | Left | Right`.
-   - Exclusive zone: matches bar height (`38px` default).
-   - Margin: configurable.
-3. **`wl_seat` & `wl_pointer`:** Mouse motion, button press/release, and scroll events for interactive widgets.
+1. **`wl_compositor` & `wl_shm`:** Surface allocation and shared-memory double buffering via SCTK `SlotPool` with damage rect tracking (`damage_buffer`).
+2. **`zwlr_layer_shell_v1` (wlr-layer-shell):** Anchored desktop overlays and multi-output bars.
+   - **Multi-Output Bar Cloning:** Separate layer surface instantiated per connected `wl_output` (`bars: Vec<BarInstance>`). Evaluates Luau script per output setting `Zenith.current_output()`.
+   - **Context Overlays:** Popups (`AudioPopup`, `Launcher`, `Dock`, etc.) anchored with `Layer::Top` and `KeyboardInteractivity::OnDemand`.
+   - **Screen Locker (`LockScreen.luau`):** Fullscreen layer surface anchored to all 4 edges at `Layer::Overlay` with `KeyboardInteractivity::Exclusive`.
+3. **`wl_seat`, `wl_pointer` & `wl_keyboard`:** Mouse motion, button press/release, scroll events, and keyboard typing/navigation for overlays.
 
 ### Event Loop Architecture (`calloop` + SCTK 0.19)
 - Located in [`crates/zenith-cli/src/main.rs`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/zenith-cli/src/main.rs).
@@ -184,13 +183,36 @@ local Hardware = Zenith.import("widgets/hardware")
 - `Zenith.Services.Battery()`: `{ percent: number, is_charging: boolean, icon: string }`
 - `Zenith.Services.Clock()`: `{ time: string, date: string }`
 - `Zenith.Services.Audio()`: `{ volume: number, is_muted: boolean, icon: string }` (via `wpctl`)
+- `Zenith.Services.AudioSinks()`: `Array<{ id: number, name: string, is_default: boolean }>`
 - `Zenith.Services.Network()`: `{ is_connected: boolean, ssid: string, icon: string }` (via `nmcli`)
+- `Zenith.Services.Bluetooth()`: `{ is_powered: boolean, devices: Array<{ name: string, mac: string, connected: boolean }> }`
+- `Zenith.Services.Weather()`: `{ temp: number, condition: string, icon: string, location: string }` (cached async wttr.in)
+- `Zenith.Services.IsRecording()`: `boolean` (detects running `wf-recorder`)
+- `Zenith.Services.Workspaces()`: `{ active: number, workspaces: Array<{ id: number, name: string, monitor: string, active: boolean, urgent: boolean, windows: number }> }`
+- `Zenith.Services.ActiveWindow()`: `{ title: string, class: string }`
+- `Zenith.Services.Clients()`: `Array<{ address: string, title: string, class: string, workspace_id: number }>`
+- `Zenith.Services.Media()`: `{ is_available: boolean, player_name: string, status: string, title: string, artist: string, album: string }`
+- `Zenith.Services.Notifications()`: `Array<{ id: number, app_name: string, summary: string, body: string, urgency: string }>`
+
+### Standard Built-In Actions
+- `audio:set_sink:<id>`: Select default PipeWire audio output sink.
+- `record:toggle`: Toggle screen recording via `wf-recorder`.
+- `screenshot:area` / `screenshot:full`: Capture screenshot via `grim` + `slurp`.
+- `search:clear`: Reset launcher search query and selected index.
+- `popup:toggle:<id>` / `popup:open:<id>` / `popup:close`: Control layer overlays.
+- `lock:unlock`: Dismiss screen locker overlay.
+- `dispatch:<dispatcher>:<args>`: Hyprland IPC dispatch command.
+- `focus:<address>`: Focus specific window client.
+
+### Per-Output & User Context
+- `Zenith.current_output()` / `Zenith.get_current_output()`: Returns current output name (e.g. `"DP-1"`), enabling per-monitor workspace filtering.
+- `Zenith.user()`: Returns current session user name.
 
 ### Theming (`Zenith.Theme()`)
 Reads `~/.cache/quickshell/matugen/colors.json` generated by Matugen / Stylix. Exposes:
 ```luau
 local theme = Zenith.Theme()
--- theme.background, theme.surface, theme.primary, theme.on_surface, etc.
+-- theme.background, theme.surface, theme.surface_container, theme.primary, theme.primary_container, theme.on_surface, theme.on_primary, theme.outline
 ```
 
 ---
@@ -219,6 +241,11 @@ nix develop . --command cargo run
 # Run single crate tests:
 nix develop . --command cargo test -p zenith-layout
 nix develop . --command cargo test -p zenith-services
+nix develop . --command cargo test -p zenith-runtime
+
+# Full workspace test suite (33 unit tests, 0 warnings):
+nix develop . --command cargo test
+nix develop . --command cargo clippy --all-targets --all-features
 ```
 
 ### Git & Branch Policy

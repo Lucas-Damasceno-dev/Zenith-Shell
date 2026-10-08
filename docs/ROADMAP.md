@@ -140,10 +140,39 @@ Zenith-Shell is an ultra-lightweight, high-performance Wayland desktop shell eng
   - Window focus / raise on click (`focus:<address>`).
 - [x] **Dynamic Island HUD (`config/zenith/island.luau` & `overlays/DynamicIsland.luau`):**
   - Floating top center pill expanding with spring physics on notifications, media track changes, and volume adjustments.
-- [x] **Desktop Canvas Widget (`config/zenith/canvas.luau` & `overlays/DesktopCanvas.luau`):**
-  - Ambient glassmorphic card for large clock and hardware utilization.
 - [x] **Multi-Surface Engine Architecture (`zenith-wayland`):**
   - Native support for concurrent top bar, bottom dock, and transient overlays with adaptive 4-axis margins and anchor definitions.
+
+---
+
+### Milestone 11: Multi-Output Independence, Audio Routing & Security ✅
+**Goal:** Implement independent multi-monitor bar rendering, PipeWire sink routing, telemetry services, screen recording, and secure screen locking.
+
+- [x] **Per-Output Workspace Filtering (`zenith-services::hyprland`, `zenith-runtime`):**
+  - Hyprland workspace JSON parser extracts `monitor` metadata.
+  - Runtime tracks active output context via `Zenith.current_output()` / `Zenith.get_current_output()`.
+  - Layer shell draw engine contextualizes each monitor independently before evaluating UI tree.
+  - `config/zenith/lib/widgets/workspaces.luau` filters workspaces by active display.
+- [x] **Double-Buffering Damage Ring per Output (`zenith-wayland`):**
+  - Independent SHM damage tracking across multiple connected displays.
+- [x] **PipeWire Audio Sink Switcher (`zenith-services::audio`, `zenith-runtime`):**
+  - `wpctl status` parser enumerating all audio sinks and active default sink.
+  - Native Luau bindings: `Zenith.Services.AudioSinks()` and `Zenith.Services.SetAudioSink(id)`.
+  - Interactive radio sink selector in `config/zenith/overlays/AudioPopup.luau` via `audio:set_sink:<id>`.
+- [x] **Weather Telemetry Service (`zenith-services::weather`):**
+  - Non-blocking async background fetcher querying `wttr.in/?format=j1` with 10-minute TTL cache.
+  - Glyph resolver mapping WMO weather codes to Nerd Font icons.
+  - Exposed via `Zenith.Services.Weather()` into `DesktopCanvas.luau` and `LockScreen.luau`.
+- [x] **Screen Recorder & Snipping Tool (`zenith-services::recorder`):**
+  - Detects active `wf-recorder` process with toggle dispatch `record:toggle`.
+  - Integrates `grim` + `slurp` for area and fullscreen screenshot captures (`screenshot:area`, `screenshot:full`).
+  - Active `● REC` pill and snipping tool icon `󰄀` in `config/zenith/bar.luau`.
+- [x] **Lock Screen Protocol & Locker Overlay (`zenith-wayland`, `zenith-cli`):**
+  - Fullscreen overlay `config/zenith/overlays/LockScreen.luau` rendered at `Layer::Overlay` with `KeyboardInteractivity::Exclusive`.
+  - Ambient clock, date, weather, user profile avatar, masked password input, and power management actions.
+  - IPC and CLI command `zenith lock` to instantly lock screen.
+- [x] **Interactive Launcher Cursor & Clear Action:**
+  - Fast search clear button `󰅖` (`search:clear`), keyboard up/down selection, Backspace editing, and Enter launch.
 
 ---
 
