@@ -1,5 +1,5 @@
 [package]
-name = "zenith-runtime"
+name = "zenith-services"
 version.workspace = true
 edition = "2021"
 authors.workspace = true
@@ -7,8 +7,6 @@ license.workspace = true
 
 [dependencies]
 zenith-core = { path = "../zenith-core" }
-zenith-layout = { path = "../zenith-layout" }
-zenith-services = { path = "../zenith-services" }
-mlua = { version = "0.12", features = ["luau", "vendored", "async"] }
+libc = "0.2"
 tracing = "0.1"
 thiserror = "1.0"

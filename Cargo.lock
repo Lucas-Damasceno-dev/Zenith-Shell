@@ -1424,6 +1424,17 @@ dependencies = [
  "tracing",
  "zenith-core",
  "zenith-layout",
+ "zenith-services",
+]
+
+[[package]]
+name = "zenith-services"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tracing",
+ "zenith-core",
 ]
 
 [[package]]

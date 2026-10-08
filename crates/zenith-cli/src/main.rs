@@ -98,6 +98,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Spawn 1-second ticker thread for clock & hardware telemetry updates
+    let ticker_sender = reload_sender.clone();
+    let ticker_path = script_path.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Some(ref path) = ticker_path {
+                if let Ok(code) = fs::read_to_string(path) {
+                    let _ = ticker_sender.send(code);
+                }
+            }
+        }
+    });
+
     info!("Wayland connection established. Entering unified event loop...");
 
     while app.running {

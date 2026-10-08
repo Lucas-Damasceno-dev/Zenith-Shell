@@ -4,6 +4,7 @@ members = [
     "crates/zenith-core",
     "crates/zenith-wayland",
     "crates/zenith-layout",
+    "crates/zenith-services",
     "crates/zenith-runtime",
     "crates/zenith-cli",
 ]

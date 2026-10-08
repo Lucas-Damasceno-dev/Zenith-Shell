@@ -70,6 +70,46 @@ impl LuauRuntime {
         })?;
         zenith_table.set("Text", text_fn)?;
 
+        // Zenith.Services
+        let services_table = lua.create_table()?;
+
+        let time_fn = lua.create_function(|_, ()| {
+            let (time_str, date_str) = zenith_services::SystemService::current_time();
+            Ok((time_str, date_str))
+        })?;
+        services_table.set("time", time_fn)?;
+
+        let memory_fn = lua.create_function(|lua, ()| {
+            let snap = zenith_services::SystemService::memory_snapshot();
+            let tbl = lua.create_table()?;
+            tbl.set("total_mb", snap.total_mb)?;
+            tbl.set("used_mb", snap.used_mb)?;
+            tbl.set("available_mb", snap.available_mb)?;
+            tbl.set("percent", snap.percent)?;
+            Ok(tbl)
+        })?;
+        services_table.set("memory", memory_fn)?;
+
+        let battery_fn = lua.create_function(|lua, ()| {
+            if let Some(bat) = zenith_services::SystemService::battery_snapshot() {
+                let tbl = lua.create_table()?;
+                tbl.set("percentage", bat.percentage)?;
+                tbl.set("status", bat.status)?;
+                tbl.set("is_charging", bat.is_charging)?;
+                Ok(Some(tbl))
+            } else {
+                Ok(None)
+            }
+        })?;
+        services_table.set("battery", battery_fn)?;
+
+        let compositor_fn = lua.create_function(|_, ()| {
+            Ok(zenith_services::SystemService::compositor_info())
+        })?;
+        services_table.set("compositor", compositor_fn)?;
+
+        zenith_table.set("Services", services_table)?;
+
         lua.globals().set("Zenith", zenith_table)?;
 
         info!("Luau Runtime initialized successfully");
