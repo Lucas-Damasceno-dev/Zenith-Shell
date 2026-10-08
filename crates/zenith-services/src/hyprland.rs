@@ -306,7 +306,7 @@ impl HyprlandService {
                 }));
 
                 // Spawn background event listener thread for .socket2.sock
-                spawn_event_listener(event_sock, cmd_sock, state.clone());
+                spawn_event_listener(event_sock, cmd_sock.clone(), state.clone());
 
                 // Auto-configure hardware blur and ignorezero rules in Hyprland
                 let rules = [
