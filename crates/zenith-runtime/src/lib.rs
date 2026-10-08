@@ -179,7 +179,37 @@ impl LuauRuntime {
         })?;
         zenith_table.set("exec", exec_fn)?;
 
+        // Zenith.import(module_path)
+        let import_fn = lua.create_function(|lua, path: String| {
+            let candidates = [
+                format!("{}.luau", path),
+                format!("{}.lua", path),
+                format!("config/zenith/{}.luau", path),
+                format!("config/zenith/{}.lua", path),
+                format!("config/zenith/lib/{}.luau", path),
+                format!("config/zenith/lib/{}.lua", path),
+            ];
+
+            let mut resolved_content = None;
+            for candidate in &candidates {
+                if let Ok(content) = std::fs::read_to_string(candidate) {
+                    resolved_content = Some(content);
+                    break;
+                }
+            }
+
+            if let Some(content) = resolved_content {
+                let chunk = lua.load(&content);
+                let val: LuaValue = chunk.eval()?;
+                Ok(val)
+            } else {
+                Err(LuaError::runtime(format!("Cannot resolve Zenith module '{}'", path)))
+            }
+        })?;
+        zenith_table.set("import", import_fn)?;
+
         lua.globals().set("Zenith", zenith_table)?;
+
 
         info!("Luau Runtime initialized successfully");
         Ok(Self { lua })
