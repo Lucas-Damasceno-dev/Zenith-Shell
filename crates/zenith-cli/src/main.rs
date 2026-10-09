@@ -9,7 +9,7 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tracing::{error, info};
+use tracing::{debug, error, info, trace};
 use zenith_core::init_logging;
 use zenith_wayland::WaylandApp;
 
@@ -161,13 +161,13 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
 
     loop_handle.insert_source(reload_channel, |event, _, app: &mut WaylandApp| {
         if let calloop::channel::Event::Msg(code) = event {
-            info!("Hot-reload event received! Recomputing Luau UI tree...");
+            debug!("Hot-reload event received! Recomputing Luau UI tree...");
             let start = std::time::Instant::now();
             if let Err(e) = app.reload_script(&code) {
                 error!("Luau script error on hot-reload: {}", e);
             } else {
                 let elapsed = start.elapsed();
-                info!("Hot-reload applied in {:?}!", elapsed);
+                trace!("Hot-reload applied in {:?}!", elapsed);
             }
         }
     })?;
@@ -245,8 +245,8 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
                 let _ = socket_cmd_sender.send(ShellCommand::Close);
                 let _ = stream.write_all(b"OK: close dispatched\n");
             } else if trimmed == "lock" {
-                let _ = socket_cmd_sender.send(ShellCommand::Open("LockScreen".to_string()));
-                let _ = stream.write_all(b"OK: screen locked\n");
+                let _ = std::process::Command::new("hyprlock").spawn();
+                let _ = stream.write_all(b"OK: screen locked with hyprlock\n");
             } else if trimmed == "inspect" {
                 let (vmrss_mb, heap_mb) = read_self_memory();
                 let resp = format!(

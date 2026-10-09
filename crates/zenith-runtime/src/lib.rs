@@ -160,6 +160,17 @@ impl LuauRuntime {
         })?;
         services_table.set("time", time_fn)?;
 
+        let date_fn = lua.create_function(|lua, ()| {
+            let (year, month, day, weekday) = zenith_services::SystemService::date_components();
+            let tbl = lua.create_table()?;
+            tbl.set("year", year)?;
+            tbl.set("month", month)?;
+            tbl.set("day", day)?;
+            tbl.set("weekday", weekday)?;
+            Ok(tbl)
+        })?;
+        services_table.set("date", date_fn)?;
+
         let memory_fn = lua.create_function(|lua, ()| {
             let snap = zenith_services::SystemService::memory_snapshot();
             let tbl = lua.create_table()?;

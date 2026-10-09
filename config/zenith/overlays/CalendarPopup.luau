@@ -4,6 +4,8 @@
 local theme = Zenith.Theme()
 local time_str, date_str = Zenith.Services.time()
 
+local current_date = (Zenith.Services.date and Zenith.Services.date()) or { year = 2026, month = 10, day = 8, weekday = 4 }
+
 -- Days of week header
 local days_header = { "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" }
 local header_boxes = {}
@@ -17,28 +19,57 @@ for _, day in ipairs(days_header) do
     }))
 end
 
--- Generate calendar day cells (1 to 31)
+-- Calculate days in current month
+local function get_days_in_month(m: number, y: number): number
+    if m == 2 then
+        local is_leap = (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0)
+        return if is_leap then 29 else 28
+    elseif m == 4 or m == 6 or m == 9 or m == 11 then
+        return 30
+    else
+        return 31
+    end
+end
+
+local total_days = get_days_in_month(current_date.month, current_date.year)
+
+-- Calculate 1st day of month day of week (1=Mo..7=Su)
+local today_wday = if current_date.weekday == 0 then 7 else current_date.weekday
+local first_day_wday = ((today_wday - 1 - ((current_date.day - 1) % 7)) % 7)
+if first_day_wday < 0 then
+    first_day_wday = first_day_wday + 7
+end
+first_day_wday = first_day_wday + 1
+
 local grid_rows = {}
 local current_row = {}
-local active_day = 8
 
-for d = 1, 31 do
-    local is_today = (d == active_day)
+-- Padding empty cells before day 1
+for _ = 1, (first_day_wday - 1) do
+    table.insert(current_row, Zenith.Box({
+        width = 38,
+        height = 24,
+    }))
+end
+
+-- Fill days
+for d = 1, total_days do
+    local is_today = (d == current_date.day)
     local bg = is_today and Zenith.hex(theme.primary) or Zenith.hex("#00000000")
     local fg = is_today and Zenith.hex(theme.on_primary) or Zenith.hex(theme.on_surface)
 
     table.insert(current_row, Zenith.Box({
         width = 38,
-        height = 26,
+        height = 24,
         border_radius = 6,
         background = bg,
-        padding = { x = 6, y = 4 },
+        padding = { x = 6, y = 3 },
         children = {
             Zenith.Text({ text = tostring(d), font_size = 11, color = fg })
         }
     }))
 
-    if #current_row == 7 or d == 31 then
+    if #current_row == 7 then
         table.insert(grid_rows, Zenith.Box({
             direction = "row",
             gap = 4,
@@ -48,16 +79,27 @@ for d = 1, 31 do
     end
 end
 
+if #current_row > 0 then
+    while #current_row < 7 do
+        table.insert(current_row, Zenith.Box({ width = 38, height = 24 }))
+    end
+    table.insert(grid_rows, Zenith.Box({
+        direction = "row",
+        gap = 4,
+        children = current_row,
+    }))
+end
+
 return Zenith.Window({
     direction = "column",
     width = 340,
-    height = 360,
+    height = 330,
     padding = { x = 16, y = 14 },
-    gap = 10,
-    background = Zenith.rgba(18, 20, 26, 220),
-    border_color = Zenith.hex(theme.primary),
+    gap = 8,
+    background = Zenith.rgba(18, 20, 26, 235),
+    border_color = Zenith.rgba(255, 255, 255, 28),
     border_width = 1,
-    border_radius = 12,
+    border_radius = 16,
     shadow = {
         color = Zenith.rgba(0, 0, 0, 160),
         blur = 16,

@@ -251,19 +251,19 @@ impl WaylandApp {
 
         let (script_name, anchor, width, height, margin_top, margin_right, margin_bottom, margin_left) = match id.to_lowercase().as_str() {
             "dock" => ("Dock", Anchor::BOTTOM, 640, 68, 0, 0, 12, 0),
-            "island" | "dynamicisland" => ("DynamicIsland", Anchor::TOP, 380, 52, 10, 0, 0, 0),
-            "launcher" => ("Launcher", Anchor::TOP, 520, 440, 80, 0, 0, 0),
-            "media" | "mediapopup" => ("MediaPopup", Anchor::TOP, 340, 380, 44, 0, 0, 0),
-            "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 390, 520, 44, 14, 0, 0),
-            "audio" | "audiopopup" => ("AudioPopup", Anchor::TOP | Anchor::RIGHT, 320, 240, 44, 14, 0, 0),
-            "network" | "networkpopup" => ("NetworkPopup", Anchor::TOP | Anchor::RIGHT, 360, 460, 44, 14, 0, 0),
-            "bluetooth" | "bluetoothpopup" => ("BluetoothPopup", Anchor::TOP | Anchor::RIGHT, 360, 420, 44, 14, 0, 0),
-            "calendar" | "calendarpopup" => ("CalendarPopup", Anchor::TOP, 340, 380, 44, 0, 0, 0),
-            "power" | "powermenu" => ("PowerMenu", Anchor::TOP | Anchor::RIGHT, 260, 200, 44, 14, 0, 0),
+            "island" | "dynamicisland" => ("DynamicIsland", Anchor::TOP, 380, 52, 8, 0, 0, 0),
+            "launcher" => ("Launcher", Anchor::TOP, 520, 440, 16, 0, 0, 0),
+            "media" | "mediapopup" => ("MediaPopup", Anchor::TOP, 340, 360, 8, 0, 0, 0),
+            "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 390, 520, 8, 14, 0, 0),
+            "audio" | "audiopopup" => ("AudioPopup", Anchor::TOP | Anchor::RIGHT, 320, 240, 8, 14, 0, 0),
+            "network" | "networkpopup" => ("NetworkPopup", Anchor::TOP | Anchor::RIGHT, 360, 460, 8, 14, 0, 0),
+            "bluetooth" | "bluetoothpopup" => ("BluetoothPopup", Anchor::TOP | Anchor::RIGHT, 360, 420, 8, 14, 0, 0),
+            "calendar" | "calendarpopup" => ("CalendarPopup", Anchor::TOP, 340, 330, 8, 0, 0, 0),
+            "power" | "powermenu" => ("PowerMenu", Anchor::TOP | Anchor::RIGHT, 260, 200, 8, 14, 0, 0),
             "osd" => ("OSD", Anchor::TOP, 280, 110, 60, 0, 0, 0),
-            "canvas" | "desktopcanvas" => ("DesktopCanvas", Anchor::TOP | Anchor::LEFT, 380, 320, 60, 0, 0, 24),
+            "canvas" | "desktopcanvas" => ("DesktopCanvas", Anchor::TOP | Anchor::LEFT, 380, 320, 16, 0, 0, 24),
             "lock" | "lockscreen" => ("LockScreen", Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT, 0, 0, 0, 0, 0, 0),
-            _ => (id, Anchor::TOP | Anchor::RIGHT, 300, 250, 44, 14, 0, 0),
+            _ => (id, Anchor::TOP | Anchor::RIGHT, 300, 250, 8, 14, 0, 0),
         };
 
         let candidates = [

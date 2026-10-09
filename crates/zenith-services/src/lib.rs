@@ -133,6 +133,22 @@ impl SystemService {
         }
     }
 
+    /// Get current calendar components: (year, month 1-12, day 1-31, weekday 0-6 where 0=Sun).
+    pub fn date_components() -> (i32, i32, i32, i32) {
+        unsafe {
+            let mut raw_time: libc::time_t = 0;
+            libc::time(&mut raw_time);
+            let mut tm_buf: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&raw_time, &mut tm_buf);
+            (
+                tm_buf.tm_year + 1900,
+                tm_buf.tm_mon + 1,
+                tm_buf.tm_mday,
+                tm_buf.tm_wday,
+            )
+        }
+    }
+
     /// Read memory metrics from `/proc/meminfo`.
     pub fn memory_snapshot() -> MemorySnapshot {
         let content = fs::read_to_string("/proc/meminfo").unwrap_or_default();
