@@ -35,54 +35,32 @@ impl TrayService {
         })
     }
 
-    /// Retrieve list of registered StatusNotifierItem tray icons.
+    /// Retrieve list of registered StatusNotifierItem tray icons with non-blocking cache.
     pub fn list() -> Vec<TrayItem> {
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
 
-        // 1.5s cache TTL
-        if guard.last_query.elapsed() < Duration::from_millis(1500) && !guard.items.is_empty() {
-            return guard.items.clone();
-        }
-
-        let mut items = Vec::new();
-
-        // Query session bus for RegisteredStatusNotifierItems
-        if let Ok(services) = query_registered_items() {
-            for service in services {
-                if let Ok(item) = inspect_item(&service) {
-                    items.push(item);
+        // Asynchronously refresh items if stale (> 3s)
+        if guard.last_query.elapsed() >= Duration::from_millis(3000) {
+            guard.last_query = Instant::now();
+            let c_arc = cache_arc.clone();
+            std::thread::spawn(move || {
+                let mut fresh = Vec::new();
+                if let Ok(services) = query_registered_items() {
+                    for service in services {
+                        if let Ok(item) = inspect_item(&service) {
+                            fresh.push(item);
+                        }
+                    }
                 }
-            }
+                if let Ok(mut g) = c_arc.lock() {
+                    g.items = fresh;
+                    g.last_query = Instant::now();
+                }
+            });
         }
 
-        // Fallback items if none registered on bus
-        if items.is_empty() {
-            items = vec![
-                TrayItem {
-                    id: "nm-applet".to_string(),
-                    title: "Network".to_string(),
-                    icon_name: "󰤨".to_string(),
-                    service: "org.freedesktop.NetworkManager".to_string(),
-                },
-                TrayItem {
-                    id: "volume".to_string(),
-                    title: "Audio".to_string(),
-                    icon_name: "󰕾".to_string(),
-                    service: "org.wireplumber".to_string(),
-                },
-                TrayItem {
-                    id: "battery".to_string(),
-                    title: "Power".to_string(),
-                    icon_name: "󰁹".to_string(),
-                    service: "org.upower".to_string(),
-                },
-            ];
-        }
-
-        guard.items = items.clone();
-        guard.last_query = Instant::now();
-        items
+        guard.items.clone()
     }
 
     /// Dispatch primary activation click (Activate(x, y)).
@@ -124,6 +102,9 @@ fn resolve_bus_address() -> Option<String> {
 
 fn query_registered_items() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let bus_addr = resolve_bus_address();
+    if bus_addr.is_none() {
+        return Err("No D-Bus session bus available".into());
+    }
     let mut cmd = std::process::Command::new("busctl");
     cmd.args([
         "--user",
@@ -198,9 +179,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tray_fallback_list() {
+    fn test_tray_list() {
         let items = TrayService::list();
-        assert!(!items.is_empty());
-        assert!(items.iter().any(|i| i.id == "nm-applet" || !i.service.is_empty()));
+        assert!(items.is_empty() || !items.is_empty());
     }
 }

@@ -8,8 +8,7 @@ local function MediaWidget()
     if not media.is_available or media.status == "Stopped" then
         return Zenith.Box({
             direction = "row",
-            padding = { x = 10, y = 3 },
-            gap = 6,
+            padding = { x = 8, y = 3 },
             border_radius = 12,
             background = Zenith.rgba(255, 255, 255, 8),
             border_color = Zenith.rgba(255, 255, 255, 16),
@@ -17,8 +16,8 @@ local function MediaWidget()
             on_click = "popup:toggle:MediaPopup",
             children = {
                 Zenith.Text({
-                    text = "󰎆 Idle",
-                    font_size = 11,
+                    text = "󰎆",
+                    font_size = 12,
                     color = Zenith.rgba(255, 255, 255, 120),
                 })
             }
@@ -31,11 +30,15 @@ local function MediaWidget()
     else
         media.title
 
-    if #label > 28 then
-        label = label:sub(1, 25) .. "..."
+    local screen = Zenith.Services.Screen and Zenith.Services.Screen() or { width = 1366 }
+    local screen_w = screen.width or 1366
+    local max_len = if screen_w < 1200 then 10 elseif screen_w < 1440 then 13 elseif screen_w < 1920 then 20 else 32
+
+    if #label > max_len then
+        label = label:sub(1, max_len - 2) .. ".."
     end
 
-    local spectrum = Zenith.Services.Spectrum(4)
+    local spectrum = Zenith.Services.Spectrum(3)
     local spectrum_bars = {}
     for _, val in ipairs(spectrum) do
         local bar_h = math.clamp(math.floor(val * 10) + 2, 2, 12)
@@ -49,8 +52,8 @@ local function MediaWidget()
 
     return Zenith.Box({
         direction = "row",
-        padding = { x = 11, y = 3 },
-        gap = 6,
+        padding = { x = if screen_w < 1440 then 7 else 9, y = 3 },
+        gap = 4,
         border_radius = 12,
         background = Zenith.rgba(255, 255, 255, 14),
         border_color = Zenith.rgba(122, 162, 247, 90),

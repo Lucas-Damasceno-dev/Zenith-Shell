@@ -4,12 +4,14 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tracing::{debug, error, info, trace};
+use tracing::{error, info};
 use zenith_core::init_logging;
 use zenith_wayland::WaylandApp;
 
@@ -18,6 +20,12 @@ enum ShellCommand {
     Toggle(String),
     Open(String),
     Close,
+}
+
+enum AppEvent {
+    Reload(String),
+    Redraw,
+    DismissPopup,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -149,6 +157,31 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
         }
     }
 
+    // Auto-launch Dock if enabled in configuration
+    let home_cfg = std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/zenith/config.json"));
+    let mut config_paths = vec![
+        PathBuf::from("config/zenith/config.json"),
+        PathBuf::from("../../config/zenith/config.json"),
+    ];
+    if let Some(p) = home_cfg {
+        config_paths.push(p);
+    }
+
+    let dock_enabled = config_paths
+        .iter()
+        .find_map(|p| {
+            fs::read_to_string(p)
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .and_then(|v| v.get("dock")?.get("enable")?.as_bool())
+        })
+        .unwrap_or(false);
+
+    if dock_enabled {
+        info!("Dock enabled in configuration, launching dock overlay...");
+        let _ = app.open_dock();
+    }
+
     // Set up calloop event loop
     let mut event_loop: EventLoop<WaylandApp> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
@@ -156,18 +189,34 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
     // Attach Wayland event source to calloop
     WaylandSource::new(conn, event_queue).insert(loop_handle.clone())?;
 
-    // Create channel for reload notifications
-    let (reload_sender, reload_channel) = calloop::channel::channel::<String>();
+    // Create channel for UI lifecycle notifications (reload vs redraw)
+    let (event_sender, event_channel) = calloop::channel::channel::<AppEvent>();
+    let needs_redraw = Arc::new(AtomicBool::new(false));
+    let needs_redraw_cb = needs_redraw.clone();
 
-    loop_handle.insert_source(reload_channel, |event, _, app: &mut WaylandApp| {
-        if let calloop::channel::Event::Msg(code) = event {
-            debug!("Hot-reload event received! Recomputing Luau UI tree...");
-            let start = std::time::Instant::now();
-            if let Err(e) = app.reload_script(&code) {
-                error!("Luau script error on hot-reload: {}", e);
-            } else {
-                let elapsed = start.elapsed();
-                trace!("Hot-reload applied in {:?}!", elapsed);
+    loop_handle.insert_source(event_channel, move |event, _, app: &mut WaylandApp| {
+        if let calloop::channel::Event::Msg(app_evt) = event {
+            match app_evt {
+                AppEvent::Reload(code) => {
+                    info!("Hot-reload triggered, recomputing Luau UI tree...");
+                    let start = std::time::Instant::now();
+                    if let Err(e) = app.reload_script(&code) {
+                        error!("Luau script error on hot-reload: {}", e);
+                    } else {
+                        let elapsed = start.elapsed();
+                        info!("Hot-reload successfully applied in {:?}!", elapsed);
+                    }
+                }
+                AppEvent::Redraw => {
+                    needs_redraw_cb.store(true, Ordering::Release);
+                }
+                AppEvent::DismissPopup => {
+                    if let Some(ref popup) = app.popup {
+                        if popup.id != "lock" && popup.id != "lockscreen" {
+                            app.close_popup();
+                        }
+                    }
+                }
             }
         }
     })?;
@@ -175,7 +224,7 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
     // Create channel for IPC socket commands (toggle, open, close)
     let (cmd_sender, cmd_channel) = calloop::channel::channel::<ShellCommand>();
 
-    let cmd_reload_sender = reload_sender.clone();
+    let cmd_event_sender = event_sender.clone();
     let cmd_script_path = script_path.clone();
 
     loop_handle.insert_source(cmd_channel, move |event, _, app: &mut WaylandApp| {
@@ -184,7 +233,7 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
                 ShellCommand::Reload => {
                     if let Some(ref path) = cmd_script_path {
                         if let Ok(code) = fs::read_to_string(path) {
-                            let _ = cmd_reload_sender.send(code);
+                            let _ = cmd_event_sender.send(AppEvent::Reload(code));
                         }
                     }
                 }
@@ -245,8 +294,8 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
                 let _ = socket_cmd_sender.send(ShellCommand::Close);
                 let _ = stream.write_all(b"OK: close dispatched\n");
             } else if trimmed == "lock" {
-                let _ = std::process::Command::new("hyprlock").spawn();
-                let _ = stream.write_all(b"OK: screen locked with hyprlock\n");
+                let _ = socket_cmd_sender.send(ShellCommand::Open("lock".to_string()));
+                let _ = stream.write_all(b"OK: native lock screen activated\n");
             } else if trimmed == "inspect" {
                 let (vmrss_mb, heap_mb) = read_self_memory();
                 let resp = format!(
@@ -260,39 +309,40 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
         }
     });
 
-    // Hook Hyprland compositor IPC change listener for sub-10ms UI updates
-    let hypr_sender = reload_sender.clone();
-    let hypr_path = script_path.clone();
+    // Hook Hyprland compositor IPC change listener for sub-10ms UI updates (zero disk I/O)
+    let hypr_sender = event_sender.clone();
     zenith_services::HyprlandService::set_change_listener(move || {
-        if let Some(ref path) = hypr_path {
-            if let Ok(code) = fs::read_to_string(path) {
-                let _ = hypr_sender.send(code);
-            }
-        }
+        let _ = hypr_sender.send(AppEvent::Redraw);
     });
 
-    // Hook Notification Daemon change listener for instant UI updates
-    let notif_sender = reload_sender.clone();
-    let notif_path = script_path.clone();
+    let dismiss_sender = event_sender.clone();
+    zenith_services::HyprlandService::set_focus_change_listener(move || {
+        let _ = dismiss_sender.send(AppEvent::DismissPopup);
+    });
+
+    // Hook Notification Daemon change listener for instant UI updates (zero disk I/O)
+    let notif_sender = event_sender.clone();
     zenith_services::NotificationService::set_change_listener(move || {
-        if let Some(ref path) = notif_path {
-            if let Ok(code) = fs::read_to_string(path) {
-                let _ = notif_sender.send(code);
-            }
-        }
+        let _ = notif_sender.send(AppEvent::Redraw);
+    });
+
+    // Hook Audio change listener for instant volume/mute UI updates (zero polling)
+    let audio_sender = event_sender.clone();
+    zenith_services::AudioService::set_change_listener(move || {
+        let _ = audio_sender.send(AppEvent::Redraw);
     });
 
     // Start background file watcher if config exists
     let _watcher = if let Some(ref path) = script_path {
         let watch_path = path.clone();
-        let sender = reload_sender.clone();
+        let watcher_sender = event_sender.clone();
 
         let mut watcher = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                         if let Ok(code) = fs::read_to_string(&watch_path) {
-                            let _ = sender.send(code);
+                            let _ = watcher_sender.send(AppEvent::Reload(code));
                         }
                     }
                 }
@@ -314,24 +364,57 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
         None
     };
 
-    // Spawn 1-second ticker thread for clock & hardware telemetry updates
-    let ticker_sender = reload_sender.clone();
-    let ticker_path = script_path.clone();
+    // Spawn 1-second ticker thread for clock & hardware telemetry updates (zero disk I/O)
+    let ticker_sender = event_sender.clone();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            if let Some(ref path) = ticker_path {
-                if let Ok(code) = fs::read_to_string(path) {
-                    let _ = ticker_sender.send(code);
-                }
-            }
+            let _ = ticker_sender.send(AppEvent::Redraw);
         }
     });
 
     info!("Wayland connection established. Entering unified event loop...");
 
+    let mut last_draw = std::time::Instant::now() - Duration::from_millis(100);
+
     while app.running {
-        event_loop.dispatch(None, &mut app)?;
+        let timeout = if needs_redraw.load(Ordering::Acquire) {
+            Some(Duration::from_millis(8))
+        } else if app.dock_last_leave.is_some() || app.bar_last_leave.is_some() {
+            Some(Duration::from_millis(40))
+        } else {
+            None
+        };
+
+        event_loop.dispatch(timeout, &mut app)?;
+
+        // Handle dock auto-hide debounce timer when cursor leaves dock
+        if let Some(leave_time) = app.dock_last_leave {
+            if leave_time.elapsed() >= Duration::from_millis(300) {
+                app.dock_last_leave = None;
+                if let Err(e) = app.update_dock_visibility() {
+                    error!("Failed to update dock auto-hide visibility: {}", e);
+                }
+            }
+        }
+
+        // Handle bar auto-hide debounce timer when cursor leaves bar
+        if let Some(leave_time) = app.bar_last_leave {
+            if leave_time.elapsed() >= Duration::from_millis(300) {
+                app.bar_last_leave = None;
+                if let Err(e) = app.update_bar_visibility() {
+                    error!("Failed to update bar auto-hide visibility: {}", e);
+                }
+            }
+        }
+
+        if needs_redraw.load(Ordering::Acquire) && last_draw.elapsed() >= Duration::from_millis(8) {
+            needs_redraw.store(false, Ordering::Release);
+            last_draw = std::time::Instant::now();
+            if let Err(e) = app.request_redraw() {
+                error!("Failed to redraw surfaces: {}", e);
+            }
+        }
     }
 
     if sock_path.exists() {

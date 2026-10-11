@@ -17,6 +17,7 @@ import "modules/launcher"
 import "modules/dashboard"
 import "modules/dock"
 import "modules/hotcorners"
+import "modules/settings"
 import "overlays"
 
 import Quickshell.Services.Mpris
@@ -76,6 +77,7 @@ Scope {
     property alias usbLoader: usbLoader
     property alias volumeMixerLoader: volumeMixerLoader
     property alias clipboardLoader: clipboardLoader
+    property alias settingsLoader: settingsLoader
 
     property bool healthChecked: false
     property var binaryHealth: HealthService.defaultStatus()
@@ -155,6 +157,7 @@ Scope {
         ShellIpcActions.triggerOsd(shellRoot, osdLoader, PopupUtils, "power-profile");
     }
     function toggleCheatSheet() { shellRoot.toggleLazyWindow(cheatSheetLoader); }
+    function toggleSettings() { shellRoot.toggleLazyWindow(settingsLoader); }
     function toggleProductivity() {
         if (shellRoot.calendarLoader.active && shellRoot.calendarLoader.item && shellRoot.calendarLoader.item.activeTab !== undefined && shellRoot.calendarLoader.item.activeTab !== 0) {
             shellRoot.calendarLoader.item.activeTab = 0;
@@ -557,6 +560,16 @@ Scope {
             shellRoot.toggleProductivity();
         }
 
+        // Toggle Settings menu
+        function toggleSettings() {
+            shellRoot.toggleSettings();
+        }
+
+        // Open Settings menu
+        function openSettings() {
+            shellRoot.openLazyItem(settingsLoader, "SettingsOverlay");
+        }
+
         // Reload daily briefing
         function reloadDailyBriefing() {
             ShellIpcActions.reloadDailyBriefing(shellRoot.dailyBriefingNotifyProc, RuntimePaths);
@@ -880,6 +893,12 @@ Scope {
         onActiveChanged: if (active) shellRoot.markPopupLoadStart(objectName)
         onLoaded: { shellRoot.markPopupLoadReady(objectName); shellRoot.openLazyItem(item, objectName); shellRoot._wireLoaderTeardown(item, shellRoot.clipboardLoader) }
     }
+    Loader {
+        id: settingsLoader; objectName: "SettingsOverlay"; active: false; asynchronous: true
+        sourceComponent: SettingsOverlay { }
+        onActiveChanged: if (active) shellRoot.markPopupLoadStart(objectName)
+        onLoaded: { shellRoot.markPopupLoadReady(objectName); shellRoot.openLazyItem(item, objectName); shellRoot._wireLoaderTeardown(item, shellRoot.settingsLoader) }
+    }
 
     // --- Per-Screen Components (Bar) ---
     // Variants creates an instance of the delegate for every item in the model (screens)
@@ -902,6 +921,7 @@ Scope {
                 networkPopup: shellRoot.networkLoader
                 batteryPopup: shellRoot.batteryLoader
                 sessionPopup: shellRoot.sessionLoader
+                settingsPopup: shellRoot.settingsLoader
                 systemMonitorPopup: shellRoot.systemMonitorLoader
                 errorPopup: shellRoot.errorLogLoader
                 contextPopup: shellRoot.contextPopupLoader

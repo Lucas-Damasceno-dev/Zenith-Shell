@@ -1,44 +1,67 @@
 --!strict
 -- Zenith-Shell (Engine v2) - Universal Application Launcher Overlay
 
-local theme = Zenith.Theme()
-local query = Zenith.get_search_query()
-local selected_idx = Zenith.get_selected_index()
-local apps = Zenith.Services.Launcher(query, 8)
-
--- Icon heuristic based on categories, name, or keywords
-local function resolve_app_icon(name: string, comment: string): string
-    local s = (name .. " " .. comment):lower()
-    if s:find("browser") or s:find("firefox") or s:find("chrome") or s:find("web") then
-        return "󰈹"
-    elseif s:find("code") or s:find("develop") or s:find("editor") or s:find("rust") then
-        return "󰨞"
-    elseif s:find("terminal") or s:find("console") or s:find("kitty") or s:find("alacritty") then
+local function resolve_app_icon(name: string, comment: string?): string
+    local n = (name .. " " .. (comment or "")):lower()
+    if n:find("terminal") or n:find("foot") or n:find("kitty") or n:find("alacritty") then
         return ""
-    elseif s:find("audio") or s:find("music") or s:find("spotify") or s:find("sound") or s:find("volume") then
-        return "󰓃"
-    elseif s:find("video") or s:find("stream") or s:find("moonlight") or s:find("sunshine") then
+    elseif n:find("browser") or n:find("brave") or n:find("firefox") or n:find("chrome") then
+        return "󰈹"
+    elseif n:find("code") or n:find("nvim") or n:find("editor") then
+        return "󰨞"
+    elseif n:find("file") or n:find("thunar") or n:find("nautilus") then
+        return "󰝰"
+    elseif n:find("audio") or n:find("music") or n:find("spotify") or n:find("pavucontrol") then
+        return "󰝚"
+    elseif n:find("video") or n:find("media") or n:find("vlc") or n:find("mpv") then
         return "󰕼"
-    elseif s:find("file") or s:find("thunar") or s:find("nautilus") or s:find("manager") then
-        return "󰉋"
-    elseif s:find("setting") or s:find("config") or s:find("control") then
+    elseif n:find("settings") or n:find("config") then
         return "󰒓"
     else
-        return ""
+        return "󰵆"
     end
 end
 
+local function clamp(v: number, min: number, max: number): number
+    if v < min then return min end
+    if v > max then return max end
+    return v
+end
+
+local theme = Zenith.Theme()
+local query = Zenith.get_search_query()
+local selected_idx = Zenith.get_selected_index()
+local apps = Zenith.Services.Launcher(query, 50)
+local total = #apps
+local cur_sel = selected_idx or 1
+if total > 0 then
+    if cur_sel > total then cur_sel = total end
+    if cur_sel < 1 then cur_sel = 1 end
+else
+    cur_sel = 1
+end
+
+local max_visible = 8
+local start_idx = 1
+if total > max_visible then
+    start_idx = clamp(cur_sel - math.floor(max_visible / 2), 1, total - max_visible + 1)
+end
+local end_idx = math.min(start_idx + max_visible - 1, total)
+
 local app_boxes = {}
-for idx, app in ipairs(apps) do
-    local is_selected = (idx == selected_idx)
+for idx = start_idx, end_idx do
+    local app = apps[idx]
+    if not app then break end
+    local is_selected = (idx == cur_sel)
     local icon = resolve_app_icon(app.name, app.comment)
     local subtext = (#app.comment > 0) and app.comment or app.id
-    if #subtext > 40 then
-        subtext = subtext:sub(1, 37) .. "..."
+    if #subtext > 46 then
+        subtext = subtext:sub(1, 43) .. "..."
     end
 
     table.insert(app_boxes, Zenith.Box({
         direction = "row",
+        width = 468,
         padding = { x = 12, y = 8 },
         gap = 12,
         border_radius = 8,
@@ -72,12 +95,12 @@ for idx, app in ipairs(apps) do
             Zenith.Box({
                 padding = { x = 6, y = 2 },
                 border_radius = 4,
-                background = Zenith.rgba(255, 255, 255, 12),
+                background = is_selected and Zenith.hex(theme.primary) or Zenith.rgba(255, 255, 255, 12),
                 children = {
                     Zenith.Text({
-                        text = "RUN 󰁔",
+                        text = is_selected and "ENTER 󰁔" or "RUN 󰁔",
                         font_size = 9,
-                        color = Zenith.hex(theme.primary),
+                        color = is_selected and Zenith.hex(theme.on_primary) or Zenith.hex(theme.primary),
                     })
                 }
             })
@@ -87,8 +110,8 @@ end
 
 return Zenith.Window({
     direction = "column",
-    width = 460,
-    height = 540,
+    width = 500,
+    height = 580,
     padding = { x = 16, y = 14 },
     gap = 10,
     background = Zenith.rgba(18, 20, 26, 225),
@@ -105,6 +128,7 @@ return Zenith.Window({
         -- Search Bar Header
         Zenith.Box({
             direction = "row",
+            width = 468,
             padding = { x = 12, y = 10 },
             border_radius = 10,
             background = Zenith.hex(theme.surface),
@@ -163,7 +187,7 @@ return Zenith.Window({
             padding = { x = 6, y = 4 },
             children = {
                 Zenith.Text({
-                    text = string.format("󰌌 %d applications indexed • Click outside to dismiss", #apps),
+                    text = string.format("󰌌 %d applications • %d of %d selected", total, total > 0 and cur_sel or 0, total),
                     font_size = 10,
                     color = Zenith.hex(theme.outline),
                 }),

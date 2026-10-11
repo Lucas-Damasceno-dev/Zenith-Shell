@@ -24,7 +24,7 @@ PanelWindow {
     readonly property int dockHeight: 60
     readonly property int dockItemSize: 46
     readonly property int dockPadH: DesignTokens.spacingLG
-    readonly property int dockHiddenThickness: 1
+    readonly property int dockHiddenThickness: 8
     property int dockMarginBottom: _hyprGapsOut > 0 ? _hyprGapsOut : DesignTokens.spacingSM
 
     // ── Dynamic gap sync with Hyprland ───────────────────────
@@ -37,7 +37,13 @@ PanelWindow {
             onStreamFinished: {
                 try {
                     var obj = JSON.parse(text || "{}");
-                    var val = (obj && obj.int !== undefined) ? parseInt(obj.int) : NaN;
+                    var val = NaN;
+                    if (obj && obj.int !== undefined) {
+                        val = parseInt(obj.int);
+                    } else if (obj && obj.custom) {
+                        var parts = String(obj.custom).trim().split(/\s+/);
+                        if (parts.length > 0) val = parseInt(parts[parts.length - 1]);
+                    }
                     if (!isNaN(val) && val >= 0) dock._hyprGapsOut = val;
                 } catch (e) {}
             }
@@ -57,7 +63,7 @@ PanelWindow {
     WlrLayershell.layer: WlrLayer.Top
     WlrLayershell.namespace: "quickshell-dock"
     WlrLayershell.keyboardFocus: _keyboardNavActive ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
-    WlrLayershell.exclusiveZone: dock.shouldAutoHide ? 0 : (dockHeight + dockMarginBottom)
+    WlrLayershell.exclusiveZone: dock.autoHideEnabled ? 0 : (dockHeight + dockMarginBottom)
 
     // ── Keyboard Navigation ─────────────────────────────────
     property bool _keyboardNavActive: false
@@ -79,7 +85,7 @@ PanelWindow {
     property var dockItems: DockService.mergedItems
 
     // ── Auto-hide Logic (mirrors Bar) ────────────────────────
-    readonly property bool autoHideEnabled: FeatureFlags.barAutoHide
+    readonly property bool autoHideEnabled: FeatureFlags.dockAutoHide
     property int hyprEventTick: 0
     property bool _refreshWorkspacesPending: false
     readonly property int hyprRefreshIntervalMs: FeatureFlags.lowPowerUiMode ? 150 : 96

@@ -58,6 +58,7 @@ PanelWindow {
     required property var networkPopup
     required property var batteryPopup
     required property var sessionPopup
+    property var settingsPopup: null
     required property var systemMonitorPopup
     required property var errorPopup
     required property var contextPopup
@@ -608,6 +609,7 @@ PanelWindow {
                 audioPopup: bar.audioPopup
                 batteryPopup: bar.batteryPopup
                 sessionPopup: bar.sessionPopup
+                settingsPopup: bar.settingsPopup
                 errorPopup: bar.errorPopup
                 contextPopup: bar.contextPopup
                 clipboardPopup: bar.clipboardPopup

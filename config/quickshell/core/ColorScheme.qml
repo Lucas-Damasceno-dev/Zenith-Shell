@@ -137,6 +137,8 @@ QtObject {
     }
     Behavior on outlineVariant { enabled: !FeatureFlags.reducedMotion; ColorAnimation { duration: 350; easing.type: Easing.OutCubic } }
 
+    readonly property color surfaceVariant: surfaceContainer
+
     readonly property color red:    base08
     readonly property color peach:  base09
     readonly property color yellow: base0A

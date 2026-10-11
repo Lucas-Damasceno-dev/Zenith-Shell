@@ -4,14 +4,14 @@
 local theme = Zenith.Theme()
 local clients = Zenith.Services.Clients()
 
--- Pinned applications configuration
+-- Pinned applications configuration (user installed tools)
 local pinned_apps = {
-    { icon = "", name = "Terminal", class = "kitty", exec = "kitty" },
-    { icon = "󰈹", name = "Firefox", class = "firefox", exec = "firefox" },
-    { icon = "󰨞", name = "VS Code", class = "code", exec = "code" },
-    { icon = "󰉋", name = "Files", class = "nautilus", exec = "nautilus" },
-    { icon = "󰭹", name = "Discord", class = "discord", exec = "discord" },
-    { icon = "󰎆", name = "Spotify", class = "spotify", exec = "spotify" },
+    { icon = "", name = "Terminal", class = "foot", exec = "foot" },
+    { icon = "󰈹", name = "Brave Browser", class = "brave", exec = "brave" },
+    { icon = "󰉋", name = "Files", class = "thunar", exec = "thunar" },
+    { icon = "", name = "Neovim", class = "nvim", exec = "foot -e nvim" },
+    { icon = "󰓃", name = "EasyEffects", class = "easyeffects", exec = "easyeffects" },
+    { icon = "󰢮", name = "System Monitor", class = "btop", exec = "foot -e btop" },
 }
 
 local function find_client(class_pattern)
@@ -40,7 +40,7 @@ end
 local function DockItem(icon, name, is_running, client, exec)
     local click_action = ""
     if is_running and client and client.address then
-        click_action = "focus:" .. client.address
+        click_action = "window:toggle_minimize:" .. client.address
     else
         click_action = "cmd:" .. (exec or name) .. " &"
     end
@@ -85,7 +85,7 @@ table.insert(dock_children, Zenith.Box({
     padding = { x = 10, y = 4 },
     border_radius = 12,
     background = Zenith.hex("#ffffff0c"),
-    on_click = "cmd:zenith toggle Launcher &",
+    on_click = "popup:toggle:launcher",
     children = {
         Zenith.Text({
             text = "󰀻",
@@ -162,7 +162,7 @@ table.insert(dock_children, Zenith.Box({
     padding = { x = 10, y = 4 },
     border_radius = 12,
     background = Zenith.hex("#ffffff08"),
-    on_click = "cmd:zenith toggle NotificationCenter &",
+    on_click = "popup:toggle:notifications",
     children = {
         Zenith.Text({
             text = "󰂚",
@@ -185,7 +185,7 @@ table.insert(dock_children, Zenith.Box({
     padding = { x = 10, y = 4 },
     border_radius = 12,
     background = Zenith.hex("#ffffff08"),
-    on_click = "cmd:zenith toggle PowerMenu &",
+    on_click = "popup:toggle:power",
     children = {
         Zenith.Text({
             text = "󰐥",
@@ -201,21 +201,29 @@ table.insert(dock_children, Zenith.Box({
     }
 }))
 
--- Root Dock Container with Soft Drop Shadow & Glass Background
+-- Root Dock Container: Outer transparent centering wrapper + inner glass pill
 return Zenith.Box({
     direction = "row",
-    align_items = "center",
+    align_items = "flex-start",
     justify_content = "center",
-    padding = { x = 14, y = 5 },
-    gap = 4,
-    border_radius = 20,
-    background = Zenith.hex("#181b22e8"),
-    border_color = theme.outline,
-    border_width = 1,
-    shadow = {
-        blur = 24,
-        color = Zenith.hex("#00000099"),
-        offset_y = 6,
+    padding = { x = 0, top = 0, bottom = 8 },
+    children = {
+        Zenith.Box({
+            direction = "row",
+            align_items = "center",
+            height = 52,
+            padding = { x = 14, y = 5 },
+            gap = 4,
+            border_radius = 20,
+            background = Zenith.hex("#181b22e8"),
+            border_color = theme.outline,
+            border_width = 1,
+            shadow = {
+                blur = 16,
+                color = Zenith.hex("#00000088"),
+                offset_y = 4,
+            },
+            children = dock_children,
+        }),
     },
-    children = dock_children,
 })

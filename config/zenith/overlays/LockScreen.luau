@@ -9,12 +9,19 @@ local bat = Zenith.Services.battery()
 local mpris = (Zenith.Services.Media and Zenith.Services.Media()) or { title = "", artist = "", status = "" }
 
 local user_name = (Zenith.user and Zenith.user()) or "Zenith User"
+local query = Zenith.get_search_query()
+local pass_display = if #query > 0 then (string.rep("● ", #query) .. "▎") else "Enter password to unlock...▎"
+local pass_color = if #query > 0 then Zenith.hex(theme.primary) else Zenith.rgba(255, 255, 255, 120)
+
+local scr = (Zenith.Services.Screen and Zenith.Services.Screen()) or { width = 1366, height = 768 }
+local screen_w = (scr.width and scr.width > 0) and scr.width or 1366
+local screen_h = (scr.height and scr.height > 0) and scr.height or 768
 
 return Zenith.Window({
     direction = "column",
-    width = 1920,
-    height = 1080,
-    background = Zenith.rgba(12, 14, 20, 240),
+    width = screen_w,
+    height = screen_h,
+    background = Zenith.rgba(12, 14, 20, 245),
     padding = { x = 60, y = 50 },
     children = {
         -- Top bar: status indicators
@@ -130,7 +137,7 @@ return Zenith.Window({
                             gap = 12,
                             padding = { x = 16, y = 10 },
                             border_radius = 12,
-                            background = Zenith.rgba(0, 0, 0, 120),
+                            background = Zenith.rgba(0, 0, 0, 140),
                             border_color = Zenith.hex(theme.primary),
                             border_width = 1,
                             children = {
@@ -140,15 +147,15 @@ return Zenith.Window({
                                     color = Zenith.hex(theme.primary),
                                 }),
                                 Zenith.Text({
-                                    text = "••••••••••••▎",
+                                    text = pass_display,
                                     font_size = 14,
-                                    color = Zenith.rgba(255, 255, 255, 200),
+                                    color = pass_color,
                                 }),
                                 Zenith.Box({
                                     padding = { x = 10, y = 4 },
                                     border_radius = 8,
                                     background = Zenith.hex(theme.primary),
-                                    on_click = "popup:close",
+                                    on_click = "lock:unlock",
                                     children = {
                                         Zenith.Text({
                                             text = "Unlock 󰁔",
@@ -195,9 +202,9 @@ return Zenith.Window({
             align_items = "center",
             children = {
                 Zenith.Text({
-                    text = "Press ESC or click Unlock to return to desktop session",
+                    text = "󰌌 Type password and press Enter or click Unlock to return to desktop session",
                     font_size = 11,
-                    color = Zenith.rgba(255, 255, 255, 100),
+                    color = Zenith.rgba(255, 255, 255, 140),
                 }),
                 Zenith.Box({ flex_grow = 1 }),
                 -- Power management actions

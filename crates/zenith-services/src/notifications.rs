@@ -3,12 +3,10 @@
 //! Captures and manages system toast notifications streamed from the user
 //! D-Bus session bus, supporting `notify-send` and desktop applications.
 
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::warn;
 
 /// Structured representation of a desktop notification toast.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -212,6 +210,7 @@ impl NotificationService {
         })
     }
 
+    #[allow(dead_code)]
     fn resolve_dbus_address_arg() -> Option<String> {
         if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
             if !addr.is_empty() && addr != "disabled" {
@@ -234,79 +233,146 @@ impl NotificationService {
 
         None
     }
+}
 
-    fn spawn_bus_monitor(state: Arc<RwLock<NotificationState>>) {
-        std::thread::spawn(move || {
-            loop {
-                let mut cmd = std::process::Command::new("busctl");
-                if let Some(addr) = Self::resolve_dbus_address_arg() {
-                    cmd.arg(addr);
-                } else {
-                    cmd.arg("--user");
-                }
+struct NotificationServer {
+    state: Arc<RwLock<NotificationState>>,
+}
 
-                cmd.args([
-                    "monitor",
-                    "--json=short",
-                    "--match=interface='org.freedesktop.Notifications',member='Notify'",
-                ]);
+#[zbus::interface(name = "org.freedesktop.Notifications")]
+impl NotificationServer {
+    fn notify(
+        &mut self,
+        app_name: String,
+        replaces_id: u32,
+        app_icon: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        _hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+        expire_timeout: i32,
+    ) -> u32 {
+        let mut w = self.state.write().unwrap();
+        let id = if replaces_id > 0 {
+            replaces_id
+        } else {
+            let next = w.next_id;
+            w.next_id += 1;
+            next
+        };
 
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::null());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
-                let mut child = match cmd.spawn() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("Failed to spawn busctl notification monitor: {}. Retrying in 5s.", e);
-                        std::thread::sleep(Duration::from_secs(5));
-                        continue;
-                    }
-                };
+        let urgency = if let Some(u) = _hints.get("urgency") {
+            u.downcast_ref::<u8>().unwrap_or(1)
+        } else {
+            1
+        };
 
-                if let Some(stdout) = child.stdout.take() {
-                    let reader = BufReader::new(stdout);
-                    for line_res in reader.lines() {
-                        let line = match line_res {
-                            Ok(l) => l,
-                            Err(_) => break,
-                        };
+        let item = NotificationItem {
+            id,
+            app_name,
+            app_icon,
+            summary,
+            body,
+            actions,
+            urgency,
+            timestamp_secs: now,
+            expire_timeout_ms: expire_timeout,
+        };
 
-                        if line.trim().is_empty() {
-                            continue;
-                        }
+        if replaces_id > 0 {
+            w.active.retain(|n| n.id != replaces_id);
+            w.history.retain(|n| n.id != replaces_id);
+        }
 
-                        if let Some(item) = Self::parse_notification_json(&line) {
-                            let mut w = state.write().unwrap();
-                            let id = if item.id > 0 {
-                                item.id
-                            } else {
-                                let next = w.next_id;
-                                w.next_id += 1;
-                                next
-                            };
-
-                            let mut final_item = item;
-                            final_item.id = id;
-
-                            w.active.insert(0, final_item.clone());
-                            if w.active.len() > 15 {
-                                w.active.pop();
-                            }
-                            w.history.insert(0, final_item);
-                            if w.history.len() > 50 {
-                                w.history.truncate(50);
-                            }
-                            drop(w);
-
-                            Self::notify_change();
-                        }
-                    }
-                }
-
-                let _ = child.wait();
-                std::thread::sleep(Duration::from_secs(2));
+        let is_dnd = NotificationService::is_dnd();
+        if !is_dnd || urgency >= 2 {
+            w.active.insert(0, item.clone());
+            if w.active.len() > 25 {
+                w.active.pop();
             }
-        });
+        }
+        w.history.insert(0, item);
+        if w.history.len() > 50 {
+            w.history.truncate(50);
+        }
+        drop(w);
+
+        NotificationService::notify_change();
+        id
+    }
+
+    fn close_notification(&mut self, id: u32) {
+        NotificationService::close(id);
+    }
+
+    fn get_capabilities(&self) -> Vec<String> {
+        vec![
+            "actions".to_string(),
+            "body".to_string(),
+            "body-hyperlinks".to_string(),
+            "body-markup".to_string(),
+            "icon-static".to_string(),
+        ]
+    }
+
+    fn get_server_information(&self) -> (&str, &str, &str, &str) {
+        ("Zenith Shell", "Zenith", "2.0", "1.2")
+    }
+}
+
+impl NotificationService {
+    fn spawn_bus_monitor(state: Arc<RwLock<NotificationState>>) {
+        let state_clone = state.clone();
+        let _ = std::thread::Builder::new()
+            .name("zenith-notifications-dbus".to_string())
+            .spawn(move || {
+                loop {
+                    let uid = unsafe { libc::getuid() };
+                    let direct = format!("unix:path=/run/user/{}/bus", uid);
+
+                    let b = if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+                        if !addr.is_empty() && addr != "disabled" {
+                            zbus::blocking::connection::Builder::address(addr.as_str())
+                        } else {
+                            zbus::blocking::connection::Builder::address(direct.as_str())
+                        }
+                    } else {
+                        zbus::blocking::connection::Builder::session().or_else(|_| {
+                            zbus::blocking::connection::Builder::address(direct.as_str())
+                        })
+                    };
+
+                    match b {
+                        Ok(builder) => {
+                            let server = NotificationServer { state: state_clone.clone() };
+                            match builder
+                                .name("org.freedesktop.Notifications")
+                                .and_then(|b| b.serve_at("/org/freedesktop/Notifications", server))
+                                .and_then(|b| b.build())
+                            {
+                                Ok(_conn) => {
+                                    tracing::info!("Registered native D-Bus service 'org.freedesktop.Notifications' successfully!");
+                                    loop {
+                                        std::thread::sleep(Duration::from_secs(3600));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to bind org.freedesktop.Notifications: {}. Retrying in 3s...", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to create D-Bus connection builder: {}. Retrying in 3s...", e);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+            });
     }
 
     /// Parse a single JSON line emitted by `busctl monitor --json=short`.

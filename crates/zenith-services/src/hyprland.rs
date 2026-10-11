@@ -15,6 +15,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+/// Individual monitor/output item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorItem {
+    pub id: i64,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_rate: f32,
+    pub scale: f32,
+    pub focused: bool,
+}
+
 /// Individual workspace status item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceItem {
@@ -38,6 +50,7 @@ pub struct WorkspacesSnapshot {
 pub struct ActiveWindowSnapshot {
     pub title: String,
     pub class: String,
+    pub address: String,
 }
 
 /// Individual client window status item.
@@ -52,6 +65,8 @@ pub struct ClientItem {
     pub floating: bool,
     pub fullscreen: bool,
     pub pid: i32,
+    pub at: (i32, i32),
+    pub size: (i32, i32),
 }
 
 /// Internal shared state.
@@ -67,6 +82,7 @@ struct HyprlandState {
 
 static STATE: OnceLock<Arc<RwLock<HyprlandState>>> = OnceLock::new();
 static CHANGE_LISTENER: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
+static FOCUS_CHANGE_LISTENER: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 /// Hyprland IPC service provider.
 pub struct HyprlandService;
@@ -103,6 +119,50 @@ impl HyprlandService {
         r.gaps_out
     }
 
+    /// Retrieve current monitors snapshot from Hyprland IPC.
+    pub fn monitors() -> Vec<MonitorItem> {
+        let state_arc = Self::get_state();
+        let (is_hypr, socket_dir) = {
+            let r = state_arc.read().unwrap();
+            (r.is_hyprland, r.socket_dir.clone())
+        };
+
+        if is_hypr {
+            if let Some(ref dir) = socket_dir {
+                let cmd_sock = dir.join(".socket.sock");
+                if let Ok(resp) = send_socket_command(&cmd_sock, "j/monitors") {
+                    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&resp) {
+                        let mut list = Vec::new();
+                        for item in items {
+                            list.push(MonitorItem {
+                                id: item["id"].as_i64().unwrap_or(0),
+                                name: item["name"].as_str().unwrap_or("").to_string(),
+                                width: item["width"].as_u64().unwrap_or(1920) as u32,
+                                height: item["height"].as_u64().unwrap_or(1080) as u32,
+                                refresh_rate: item["refreshRate"].as_f64().unwrap_or(60.0) as f32,
+                                scale: item["scale"].as_f64().unwrap_or(1.0) as f32,
+                                focused: item["focused"].as_bool().unwrap_or(false),
+                            });
+                        }
+                        if !list.is_empty() {
+                            return list;
+                        }
+                    }
+                }
+            }
+        }
+
+        vec![MonitorItem {
+            id: 0,
+            name: "DP-1".to_string(),
+            width: 1366,
+            height: 768,
+            refresh_rate: 60.0,
+            scale: 1.0,
+            focused: true,
+        }]
+    }
+
     /// Focus a window by address (e.g. `0x1234abcd`).
     pub fn focus_window(address: &str) -> Result<(), String> {
         let arg = if address.starts_with("address:") {
@@ -111,6 +171,63 @@ impl HyprlandService {
             format!("address:{}", address)
         };
         Self::dispatch("focuswindow", &arg)
+    }
+
+    /// Toggle window minimize (via special:minimized) or focus window if on another workspace.
+    pub fn toggle_minimize_or_focus(address: &str) -> Result<(), String> {
+        let clean_addr = if let Some(stripped) = address.strip_prefix("address:") {
+            stripped
+        } else {
+            address
+        };
+
+        let state_arc = Self::get_state();
+        let (active_ws, client_ws, is_focused) = {
+            let r = state_arc.read().unwrap();
+            let active_ws = r.active_workspace;
+            let client = r.clients.iter().find(|c| {
+                let a1 = c.address.trim_start_matches("0x");
+                let a2 = clean_addr.trim_start_matches("0x");
+                !a1.is_empty() && a1.eq_ignore_ascii_case(a2)
+            });
+            let client_ws = client.map(|c| (c.workspace_id, c.workspace_name.clone()));
+            let is_focused = {
+                let a1 = clean_addr.trim_start_matches("0x");
+                let a2 = r.active_window.address.trim_start_matches("0x");
+                !a1.is_empty() && a1.eq_ignore_ascii_case(a2)
+            };
+            (active_ws, client_ws, is_focused)
+        };
+
+        let target_arg = if clean_addr.starts_with("0x") {
+            format!("address:{}", clean_addr)
+        } else {
+            format!("address:0x{}", clean_addr)
+        };
+
+        let res = if let Some((ws_id, ws_name)) = client_ws {
+            if ws_name.starts_with("special") || ws_id < 0 {
+                // Restore from minimized special workspace back to original workspace
+                let target_restore_ws = if let Some(stripped) = ws_name.strip_prefix("special:minimized_") {
+                    stripped.parse::<i32>().unwrap_or(active_ws)
+                } else {
+                    active_ws
+                };
+                let _ = Self::dispatch("movetoworkspace", &format!("{},{}", target_restore_ws, target_arg));
+                Self::dispatch("focuswindow", &target_arg)
+            } else if is_focused {
+                // Currently focused on active workspace -> minimize to special:minimized_{active_ws}
+                Self::dispatch("movetoworkspacesilent", &format!("special:minimized_{},{}", active_ws, target_arg))
+            } else {
+                // Not focused or in another workspace -> focus window
+                Self::dispatch("focuswindow", &target_arg)
+            }
+        } else {
+            Self::dispatch("focuswindow", &target_arg)
+        };
+
+        notify_change();
+        res
     }
 
     /// Dispatch a compositor command (e.g. `workspace`, `movetoworkspace`, `focuswindow`).
@@ -125,7 +242,7 @@ impl HyprlandService {
             let mut sent = false;
             if let Some(ref dir) = socket_dir {
                 let cmd_sock = dir.join(".socket.sock");
-                let cmd = format!("dispatch {} {}\n", dispatcher, arg);
+                let cmd = format!("dispatch {} {}", dispatcher, arg);
                 if let Ok(resp) = send_socket_command(&cmd_sock, &cmd) {
                     debug!("Hyprland dispatch socket response: {}", resp.trim());
                     sent = true;
@@ -139,6 +256,13 @@ impl HyprlandService {
                     .spawn();
             }
         } else {
+            // Forward command to Sway IPC if active
+            if let Ok(sway_sock) = std::env::var("SWAYSOCK") {
+                if dispatcher == "workspace" {
+                    let _ = send_sway_ipc(Path::new(&sway_sock), 0, &format!("workspace {}", arg));
+                }
+            }
+
             // Fallback / mock mode: update internal state so UI responds reactively
             if dispatcher == "workspace" {
                 if let Ok(id) = arg.parse::<i32>() {
@@ -155,6 +279,7 @@ impl HyprlandService {
                     w.active_window = ActiveWindowSnapshot {
                         title: target.title,
                         class: target.class,
+                        address: target.address,
                     };
                     w.active_workspace = target.workspace_id;
                     let target_ws = target.workspace_id;
@@ -181,7 +306,7 @@ impl HyprlandService {
             let mut sent = false;
             if let Some(ref dir) = socket_dir {
                 let cmd_sock = dir.join(".socket.sock");
-                let cmd = format!("keyword {} {}\n", key, value);
+                let cmd = format!("keyword {} {}", key, value);
                 if let Ok(resp) = send_socket_command(&cmd_sock, &cmd) {
                     debug!("Hyprland keyword socket response: {}", resp.trim());
                     sent = true;
@@ -221,6 +346,14 @@ impl HyprlandService {
         let _ = CHANGE_LISTENER.set(Arc::new(callback));
     }
 
+    /// Register a callback invoked whenever window or workspace focus changes in Hyprland.
+    pub fn set_focus_change_listener<F>(callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let _ = FOCUS_CHANGE_LISTENER.set(Arc::new(callback));
+    }
+
     /// Returns whether the service is actively connected to a real Hyprland instance.
     pub fn is_hyprland() -> bool {
         let state = Self::get_state();
@@ -252,6 +385,9 @@ impl HyprlandService {
                         for item in items {
                             let id = item["id"].as_i64().unwrap_or(0) as i32;
                             let name = item["name"].as_str().unwrap_or("").to_string();
+                            if id < 0 || name.starts_with("special") {
+                                continue;
+                            }
                             let monitor = item["monitor"].as_str().unwrap_or("").to_string();
                             let windows = item["windows"].as_u64().unwrap_or(0) as u32;
                             let urgent = item["urgent"].as_bool().unwrap_or(false);
@@ -274,7 +410,8 @@ impl HyprlandService {
                     if let Ok(val) = serde_json::from_str::<Value>(&resp) {
                         let title = val["title"].as_str().unwrap_or("").to_string();
                         let class = val["class"].as_str().unwrap_or("").to_string();
-                        active_window = ActiveWindowSnapshot { title, class };
+                        let address = val["address"].as_str().unwrap_or("").to_string();
+                        active_window = ActiveWindowSnapshot { title, class, address };
                     }
                 }
 
@@ -322,21 +459,62 @@ impl HyprlandService {
 
                 state
             } else {
-                info!("Hyprland socket not detected. Running HyprlandService in fallback mode.");
+                let mut active_workspace = 1;
                 let mut workspaces = Vec::new();
-                ensure_minimum_workspaces(&mut workspaces, 1, 4);
+                let active_window = ActiveWindowSnapshot {
+                    title: "Zenith Shell".to_string(),
+                    class: "zenith".to_string(),
+                    address: String::new(),
+                };
+
+                // Check for Sway / i3-ipc compositor socket
+                if let Ok(sway_sock_str) = std::env::var("SWAYSOCK") {
+                    let sock_path = PathBuf::from(sway_sock_str);
+                    if sock_path.exists() {
+                        info!("Sway IPC detected at {}. Initializing Sway compositor backend.", sock_path.display());
+                        if let Ok(resp) = send_sway_ipc(&sock_path, 1, "") {
+                            if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&resp) {
+                                for item in items {
+                                    let id = item["num"].as_i64().unwrap_or(item["id"].as_i64().unwrap_or(1)) as i32;
+                                    let name = item["name"].as_str().unwrap_or("").to_string();
+                                    let monitor = item["output"].as_str().unwrap_or("").to_string();
+                                    let active = item["focused"].as_bool().unwrap_or(false);
+                                    let urgent = item["urgent"].as_bool().unwrap_or(false);
+                                    if active {
+                                        active_workspace = id;
+                                    }
+                                    workspaces.push(WorkspaceItem {
+                                        id,
+                                        name,
+                                        monitor,
+                                        active,
+                                        urgent,
+                                        windows: 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if workspaces.is_empty() {
+                    info!("Running Compositor/HyprlandService in fallback mode.");
+                    ensure_minimum_workspaces(&mut workspaces, 1, 4);
+                }
 
                 let fallback_clients = vec![
                     ClientItem {
                         address: "0x1a2b3c".to_string(),
-                        title: "kitty - zsh".to_string(),
-                        class: "kitty".to_string(),
-                        initial_class: "kitty".to_string(),
+                        title: "foot".to_string(),
+                        class: "foot".to_string(),
+                        initial_class: "foot".to_string(),
                         workspace_id: 1,
                         workspace_name: "1".to_string(),
                         floating: false,
                         fullscreen: false,
                         pid: 1024,
+                        at: (0, 0),
+                        size: (800, 600),
                     },
                     ClientItem {
                         address: "0x4d5e6f".to_string(),
@@ -348,6 +526,8 @@ impl HyprlandService {
                         floating: false,
                         fullscreen: false,
                         pid: 2048,
+                        at: (0, 0),
+                        size: (1920, 1080),
                     },
                     ClientItem {
                         address: "0x7a8b9c".to_string(),
@@ -359,17 +539,16 @@ impl HyprlandService {
                         floating: false,
                         fullscreen: false,
                         pid: 3072,
+                        at: (0, 0),
+                        size: (1920, 1080),
                     },
                 ];
 
                 Arc::new(RwLock::new(HyprlandState {
                     is_hyprland: false,
-                    active_workspace: 1,
+                    active_workspace,
                     workspaces,
-                    active_window: ActiveWindowSnapshot {
-                        title: "Zenith Shell".to_string(),
-                        class: "zenith".to_string(),
-                    },
+                    active_window,
                     clients: fallback_clients,
                     gaps_out: 10,
                     socket_dir: None,
@@ -414,14 +593,40 @@ fn resolve_hypr_dir() -> Option<PathBuf> {
 /// Send request to Hyprland command socket (`.socket.sock`) and read full response.
 fn send_socket_command(cmd_sock: &Path, cmd: &str) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(cmd_sock)?;
-    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(300)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(60)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(60)))?;
     stream.write_all(cmd.as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
 
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+/// Send request to Sway i3-ipc UNIX socket and read full response.
+fn send_sway_ipc(sock_path: &Path, msg_type: u32, payload: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stream = UnixStream::connect(sock_path)?;
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(300)))?;
+
+    let magic = b"i3-ipc";
+    let len = payload.len() as u32;
+    stream.write_all(magic)?;
+    stream.write_all(&len.to_ne_bytes())?;
+    stream.write_all(&msg_type.to_ne_bytes())?;
+    if !payload.is_empty() {
+        stream.write_all(payload.as_bytes())?;
+    }
+
+    let mut header = [0u8; 14];
+    stream.read_exact(&mut header)?;
+    if &header[0..6] != b"i3-ipc" {
+        return Err("Invalid i3-ipc magic header".into());
+    }
+    let resp_len = u32::from_ne_bytes(header[6..10].try_into()?) as usize;
+    let mut resp_buf = vec![0u8; resp_len];
+    stream.read_exact(&mut resp_buf)?;
+    Ok(String::from_utf8(resp_buf)?)
 }
 
 /// Spawn the background thread streaming events from `.socket2.sock`.
@@ -470,13 +675,18 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
         let mut changed = false;
 
         match event {
-            "workspace" => {
-                let ws_name = data.trim();
-                let ws_id = ws_name.parse::<i32>().unwrap_or_else(|_| {
+            "workspace" | "workspacev2" => {
+                notify_focus_change();
+                let ws_str = if let Some((id_str, _)) = data.split_once(',') {
+                    id_str.trim()
+                } else {
+                    data.trim()
+                };
+                let ws_id = ws_str.parse::<i32>().unwrap_or_else(|_| {
                     let r = state.read().unwrap();
                     r.workspaces
                         .iter()
-                        .find(|w| w.name == ws_name)
+                        .find(|w| w.name == ws_str)
                         .map(|w| w.id)
                         .unwrap_or(1)
                 });
@@ -484,14 +694,10 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 let mut w = state.write().unwrap();
                 w.active_workspace = ws_id;
                 for item in &mut w.workspaces {
-                    item.active = item.id == ws_id || item.name == ws_name;
+                    item.active = item.id == ws_id || item.name == ws_str;
                 }
-                let known = w.workspaces.iter().any(|item| item.id == ws_id);
+                ensure_minimum_workspaces(&mut w.workspaces, ws_id, 4);
                 drop(w);
-
-                if !known {
-                    resync_workspaces(cmd_sock, state);
-                }
                 changed = true;
             }
             "focusedmon" => {
@@ -507,32 +713,83 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     changed = true;
                 }
             }
+            "activewindowv2" => {
+                let addr = data.split(',').next().unwrap_or("").trim().to_string();
+                let mut w = state.write().unwrap();
+                w.active_window.address = addr.clone();
+                let client_info = w.clients.iter().find(|c| {
+                    let a1 = c.address.trim_start_matches("0x");
+                    let a2 = addr.trim_start_matches("0x");
+                    !a1.is_empty() && a1.eq_ignore_ascii_case(a2)
+                }).map(|c| (c.class.clone(), c.title.clone()));
+                if let Some((cls, ttl)) = client_info {
+                    w.active_window.class = cls;
+                    w.active_window.title = ttl;
+                }
+                changed = true;
+            }
             "activewindow" => {
                 // Format: WINDOWCLASS,WINDOWTITLE
                 let (class, title) = if let Some((c, t)) = data.split_once(',') {
                     (c.trim().to_string(), t.trim().to_string())
                 } else {
-                    (String::new(), String::new())
+                    (data.trim().to_string(), String::new())
                 };
 
                 let mut w = state.write().unwrap();
-                w.active_window = ActiveWindowSnapshot { title, class };
+                w.active_window.class = class.clone();
+                w.active_window.title = title.clone();
+                if let Some(c) = w.clients.iter().find(|c| c.class == class && c.title == title) {
+                    w.active_window.address = c.address.clone();
+                }
                 changed = true;
             }
-            "createworkspace" | "destroyworkspace" => {
-                resync_workspaces(cmd_sock, state);
+            "createworkspace" | "createworkspacev2" => {
+                let ws_str = if let Some((id_str, _)) = data.split_once(',') {
+                    id_str.trim()
+                } else {
+                    data.trim()
+                };
+                if let Ok(id) = ws_str.parse::<i32>() {
+                    let mut w = state.write().unwrap();
+                    if !w.workspaces.iter().any(|item| item.id == id) {
+                        let active_id = w.active_workspace;
+                        w.workspaces.push(WorkspaceItem {
+                            id,
+                            name: ws_str.to_string(),
+                            monitor: String::new(),
+                            active: id == active_id,
+                            urgent: false,
+                            windows: 0,
+                        });
+                        w.workspaces.sort_by_key(|item| item.id);
+                    }
+                }
                 changed = true;
             }
-            "openwindow" | "closewindow" | "movewindow" => {
-                resync_workspaces(cmd_sock, state);
-                resync_clients(cmd_sock, state);
+            "destroyworkspace" | "destroyworkspacev2" => {
+                let ws_str = if let Some((id_str, _)) = data.split_once(',') {
+                    id_str.trim()
+                } else {
+                    data.trim()
+                };
+                if let Ok(id) = ws_str.parse::<i32>() {
+                    let mut w = state.write().unwrap();
+                    let active_id = w.active_workspace;
+                    if id != active_id && w.workspaces.len() > 4 {
+                        w.workspaces.retain(|item| item.id != id);
+                    }
+                }
                 changed = true;
             }
-            "urgent" => {
-                // Re-sync on urgent window flag
-                resync_workspaces(cmd_sock, state);
-                resync_clients(cmd_sock, state);
-                changed = true;
+            "openwindow" | "closewindow" | "movewindowv2" | "urgent" => {
+                let cmd_sock_clone = cmd_sock.to_path_buf();
+                let state_clone = state.clone();
+                std::thread::spawn(move || {
+                    resync_workspaces(&cmd_sock_clone, &state_clone);
+                    resync_clients(&cmd_sock_clone, &state_clone);
+                    notify_change();
+                });
             }
             "configreloaded" => {
                 let gaps = query_gaps_out(cmd_sock);
@@ -540,9 +797,13 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     let mut w = state.write().unwrap();
                     w.gaps_out = gaps;
                 }
-                resync_workspaces(cmd_sock, state);
-                resync_clients(cmd_sock, state);
-                changed = true;
+                let cmd_sock_clone = cmd_sock.to_path_buf();
+                let state_clone = state.clone();
+                std::thread::spawn(move || {
+                    resync_workspaces(&cmd_sock_clone, &state_clone);
+                    resync_clients(&cmd_sock_clone, &state_clone);
+                    notify_change();
+                });
             }
             _ => {}
         }
@@ -562,7 +823,7 @@ pub fn query_gaps_out(cmd_sock: &Path) -> u32 {
                     return i as u32;
                 }
             }
-            if let Some(s) = val["str"].as_str() {
+            if let Some(s) = val["custom"].as_str().or_else(|| val["str"].as_str()) {
                 if let Some(first) = s.split_whitespace().next() {
                     if let Ok(parsed) = first.parse::<u32>() {
                         return parsed;
@@ -571,7 +832,7 @@ pub fn query_gaps_out(cmd_sock: &Path) -> u32 {
             }
         }
     }
-    10
+    8
 }
 
 /// Parse JSON output from `j/clients` into structured `ClientItem` vec.
@@ -593,6 +854,14 @@ pub fn parse_clients_json(json_str: &str) -> Vec<ClientItem> {
             let floating = item["floating"].as_bool().unwrap_or(false);
             let fullscreen = item["fullscreen"].as_bool().unwrap_or(false);
             let pid = item["pid"].as_i64().unwrap_or(0) as i32;
+            let at = (
+                item["at"][0].as_i64().unwrap_or(0) as i32,
+                item["at"][1].as_i64().unwrap_or(0) as i32,
+            );
+            let size = (
+                item["size"][0].as_i64().unwrap_or(0) as i32,
+                item["size"][1].as_i64().unwrap_or(0) as i32,
+            );
 
             result.push(ClientItem {
                 address,
@@ -604,6 +873,8 @@ pub fn parse_clients_json(json_str: &str) -> Vec<ClientItem> {
                 floating,
                 fullscreen,
                 pid,
+                at,
+                size,
             });
         }
     }
@@ -628,6 +899,9 @@ fn resync_workspaces(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
             for item in items {
                 let id = item["id"].as_i64().unwrap_or(0) as i32;
                 let name = item["name"].as_str().unwrap_or("").to_string();
+                if id < 0 || name.starts_with("special") {
+                    continue;
+                }
                 let monitor = item["monitor"].as_str().unwrap_or("").to_string();
                 let windows = item["windows"].as_u64().unwrap_or(0) as u32;
                 let urgent = item["urgent"].as_bool().unwrap_or(false);
@@ -682,12 +956,21 @@ fn notify_change() {
     }
 }
 
+fn notify_focus_change() {
+    if let Some(cb) = FOCUS_CHANGE_LISTENER.get() {
+        cb();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_fallback_snapshots() {
+        if HyprlandService::get_state().read().unwrap().is_hyprland {
+            return;
+        }
         let snap = HyprlandService::workspaces_snapshot();
         assert!(snap.workspaces.len() >= 4);
         assert_eq!(snap.active, 1);
@@ -698,6 +981,9 @@ mod tests {
 
     #[test]
     fn test_fallback_dispatch() {
+        if HyprlandService::get_state().read().unwrap().is_hyprland {
+            return;
+        }
         let _ = HyprlandService::dispatch("workspace", "3");
         let snap = HyprlandService::workspaces_snapshot();
         assert_eq!(snap.active, 3);
@@ -781,6 +1067,9 @@ mod tests {
 
     #[test]
     fn test_fallback_clients_and_focus() {
+        if HyprlandService::get_state().read().unwrap().is_hyprland {
+            return;
+        }
         let clients = HyprlandService::clients_snapshot();
         assert!(!clients.is_empty());
         assert!(clients.iter().any(|c| c.class == "kitty"));

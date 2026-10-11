@@ -20,6 +20,7 @@ QtObject {
 
     // ── Dock behaviour & modules ──────────────────────────────
     property bool dockEnabled: true
+    property bool dockAutoHide: true
     property bool dockInBar: false
     property bool dockShowMpris: true
     property bool dockShowScratchpad: true

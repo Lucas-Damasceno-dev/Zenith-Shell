@@ -2,6 +2,8 @@
 
 This document maps all features from the existing Quickshell configuration (`/etc/nixos/home/lucas/modules/desktop/quickshell`) to Zenith-Shell components, tracking porting progress and implementation plans.
 
+> 📖 **Guia Operacional para IA:** Para instruções passo a passo de desenvolvimento e SOP de migração entre sessões, consulte o [QUICKSHELL_MIGRATION_PLAYBOOK.md](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/docs/QUICKSHELL_MIGRATION_PLAYBOOK.md).
+
 ---
 
 ## 📊 Overview Matrix
@@ -38,6 +40,13 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Screen Recorder & Snipping** | External scripts (wf-recorder) | ✅ **Implemented** (`recorder.rs` + `bar.luau`) | **Milestone 11** |
 | **Lock Screen Overlay** | `hyprlock` / lock session | ✅ **Implemented** (`LockScreen.luau` + `zenith lock`) | **Milestone 11** |
 | **Multi-Output Cloning** | Quickshell Multi-Screen Bar | ✅ **Implemented** (`current_output` + `workspaces.luau`) | **Milestone 11** |
+| **Generic Text Input** | QML `TextField` / `TextInput` | ✅ **Implemented** (`Zenith.TextInput`, Wayland seat focus, utf8) | **Milestone 12** |
+| **Raster & SVG Blitting** | QML `Image` (raster & SVG) | ✅ **Implemented** (`Zenith.Image`, tiny-skia blit, resvg + png) | **Milestone 12** |
+| **Scrollable Viewports** | QML `ScrollView` / `Flickable` | ✅ **Implemented** (`overflow = "scroll"`, pointer axis offset) | **Milestone 12** |
+| **Dynamic Layer-Shell** | QML Window anchor/margins | ✅ **Implemented** (`Zenith.Window`, dynamic Anchor/Margins/Layer) | **Milestone 12** |
+| **Brightness Telemetry** | `services/BrightnessService.qml` | ✅ **Implemented** (`brightness.rs`, `/sys/class/backlight`) | **Milestone 12** |
+| **Disk Storage Service** | `services/DiskAnalyzerService.qml` | ✅ **Implemented** (`disk.rs`, libc `statvfs`) | **Milestone 12** |
+| **Power Profile Switching** | Power profiles daemon in QML | ✅ **Implemented** (`power.rs`, `powerprofilesctl`) | **Milestone 12** |
 
 ---
 

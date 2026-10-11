@@ -92,6 +92,7 @@ Item {
     }
 
     signal clicked()
+    signal rightClicked()
     signal pressAndHold()
 
     readonly property bool _effectiveDisabled: disabled || busy
@@ -320,11 +321,16 @@ Item {
         id: ma
         anchors.fill: parent
         hoverEnabled: true
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
         cursorShape: pillRoot._effectiveDisabled ? Qt.ForbiddenCursor : Qt.PointingHandCursor
         onEntered: pillRoot._realHover = true
         onExited:  pillRoot._realHover = false
-        onClicked: {
+        onClicked: (mouse) => {
             if (pillRoot._effectiveDisabled) return;
+            if (mouse.button === Qt.RightButton) {
+                pillRoot.rightClicked();
+                return;
+            }
             pillRoot._realHover = false;
             rippleAnim.stop();
             ripple.width = 0; ripple.height = 0; ripple.opacity = 0;
@@ -335,7 +341,11 @@ Item {
         onPressAndHold: {
             if (!pillRoot._effectiveDisabled) pillRoot.pressAndHold();
         }
-        onPressed:  pillRoot.scale = (pillRoot._effectiveDisabled || pillRoot.reducedMotion) ? 1.0 : DesignTokens.pressedScale
+        onPressed: (mouse) => {
+            if (mouse.button === Qt.LeftButton) {
+                pillRoot.scale = (pillRoot._effectiveDisabled || pillRoot.reducedMotion) ? 1.0 : DesignTokens.pressedScale
+            }
+        }
         onReleased: pillRoot.scale = 1.0
     }
 

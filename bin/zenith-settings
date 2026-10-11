@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Zenith Settings Launcher Hub
+set -euo pipefail
+
+REPO_DIR="/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell"
+ZENITH_BIN="$REPO_DIR/target/release/zenith"
+SOCKET="${XDG_RUNTIME_DIR:-/run/user/1000}/zenith.sock"
+
+# Option to force quickshell mode: zenith-settings --quickshell
+if [[ "${1:-}" == "--quickshell" || "${1:-}" == "-q" ]]; then
+    # Toggle behavior: if already open, close it
+    if pgrep -f "quickshell.*settings.qml" >/dev/null 2>&1; then
+        pkill -f "quickshell.*settings.qml"
+        exit 0
+    fi
+    exec /home/lucas/.local/bin/quickshell -d -p "$REPO_DIR/config/quickshell/settings.qml"
+fi
+
+# If Zenith Engine v2 daemon is active, toggle native glassmorphic Settings overlay
+if [[ -S "$SOCKET" && -x "$ZENITH_BIN" ]]; then
+    exec "$ZENITH_BIN" toggle Settings
+fi
+
+# Fallback: toggle Quickshell Settings window
+if pgrep -f "quickshell.*settings.qml" >/dev/null 2>&1; then
+    pkill -f "quickshell.*settings.qml"
+    exit 0
+fi
+exec /home/lucas/.local/bin/quickshell -d -p "$REPO_DIR/config/quickshell/settings.qml"

@@ -20,6 +20,7 @@ for _, s in ipairs(sinks) do
 
     table.insert(sink_boxes, Zenith.Box({
         direction = "row",
+        align_items = "center",
         padding = { x = 10, y = 6 },
         border_radius = 6,
         background = s.is_default and Zenith.rgba(124, 77, 255, 40) or Zenith.rgba(255, 255, 255, 8),
@@ -50,8 +51,9 @@ end
 
 return Zenith.Window({
     direction = "column",
-    width = 330,
-    height = 340,
+    align_items = "stretch",
+    width = 340,
+    height = 440,
     padding = { x = 14, y = 12 },
     gap = 10,
     background = Zenith.rgba(18, 20, 26, 230),
@@ -107,7 +109,7 @@ return Zenith.Window({
                     padding = { x = 10, y = 4 },
                     border_radius = 6,
                     background = is_muted and Zenith.hex("#e06c75") or Zenith.hex(theme.surface_container),
-                    on_click = "cmd:wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+                    on_click = "audio:toggle_mute",
                     children = {
                         Zenith.Text({
                             text = is_muted and "UNMUTE" or "MUTE",
@@ -129,7 +131,7 @@ return Zenith.Window({
                     padding = { x = 4, y = 6 },
                     border_radius = 6,
                     background = Zenith.hex(theme.surface_container),
-                    on_click = "cmd:wpctl set-volume @DEFAULT_AUDIO_SINK@ 10%-",
+                    on_click = "audio:volume_step:-10",
                     children = {
                         Zenith.Text({ text = "-10%", font_size = 11, color = Zenith.hex(theme.on_surface) })
                     }
@@ -139,7 +141,7 @@ return Zenith.Window({
                     padding = { x = 4, y = 6 },
                     border_radius = 6,
                     background = Zenith.hex(theme.surface_container),
-                    on_click = "cmd:wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-",
+                    on_click = "audio:volume_step:-5",
                     children = {
                         Zenith.Text({ text = "-5%", font_size = 11, color = Zenith.hex(theme.on_surface) })
                     }
@@ -149,7 +151,7 @@ return Zenith.Window({
                     padding = { x = 4, y = 6 },
                     border_radius = 6,
                     background = Zenith.hex(theme.surface_container),
-                    on_click = "cmd:wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+",
+                    on_click = "audio:volume_step:5",
                     children = {
                         Zenith.Text({ text = "+5%", font_size = 11, color = Zenith.hex(theme.on_surface) })
                     }
@@ -159,7 +161,7 @@ return Zenith.Window({
                     padding = { x = 4, y = 6 },
                     border_radius = 6,
                     background = Zenith.hex(theme.surface_container),
-                    on_click = "cmd:wpctl set-volume @DEFAULT_AUDIO_SINK@ 10%+",
+                    on_click = "audio:volume_step:10",
                     children = {
                         Zenith.Text({ text = "+10%", font_size = 11, color = Zenith.hex(theme.on_surface) })
                     }
@@ -177,6 +179,7 @@ return Zenith.Window({
         -- Output Devices List
         Zenith.Box({
             direction = "column",
+            align_items = "stretch",
             gap = 5,
             children = sink_boxes,
         }),

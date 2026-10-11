@@ -31,23 +31,30 @@ resolve_socket() {
     printf '%s\n' "${base_dir}/${sig}/.socket2.sock"
 }
 
+declare -A COLOR_CACHE=()
+
 handle_focus() {
     local active_win class at_x at_y color rgb
     active_win="$(hyprctl activewindow -j 2>/dev/null || true)"
     class="$(printf '%s' "$active_win" | jq -r '.class // ""' 2>/dev/null || true)"
     [[ -n "$class" && "$class" != "null" ]] || return 0
 
-    at_x="$(printf '%s' "$active_win" | jq -r '.at[0] // empty' 2>/dev/null || true)"
-    at_y="$(printf '%s' "$active_win" | jq -r '.at[1] // empty' 2>/dev/null || true)"
-    [[ -n "$at_x" && -n "$at_y" ]] || return 0
+    if [[ -n "${COLOR_CACHE[$class]:-}" ]]; then
+        color="${COLOR_CACHE[$class]}"
+    else
+        at_x="$(printf '%s' "$active_win" | jq -r '.at[0] // empty' 2>/dev/null || true)"
+        at_y="$(printf '%s' "$active_win" | jq -r '.at[1] // empty' 2>/dev/null || true)"
+        [[ -n "$at_x" && -n "$at_y" ]] || return 0
 
-    color="$(
-        grim -g "${at_x},${at_y} 100x100" -t ppm - 2>/dev/null \
-            | convert - -resize 1x1 txt:- 2>/dev/null \
-            | grep -oE '#[0-9A-Fa-f]{6}' \
-            | head -1 || true
-    )"
-    [[ -n "$color" ]] || return 0
+        color="$(
+            grim -g "${at_x},${at_y} 100x100" -t ppm - 2>/dev/null \
+                | convert - -resize 1x1 txt:- 2>/dev/null \
+                | grep -oE '#[0-9A-Fa-f]{6}' \
+                | head -1 || true
+        )"
+        [[ -n "$color" ]] || return 0
+        COLOR_CACHE["$class"]="$color"
+    fi
 
     rgb="${color#\#}"
     hyprctl keyword general:col.active_border "#${rgb}FF #${rgb}88 45deg" >/dev/null 2>&1 || true

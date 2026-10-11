@@ -1,5 +1,6 @@
 pragma Singleton
 import QtQuick
+import "../modules/settings"
 
 QtObject {
     id: root
@@ -15,15 +16,24 @@ QtObject {
     }
 
     function get(key, fallbackValue) {
-        if (!hasStore())
-            return fallbackValue;
-        return settingsStore.get(key, fallbackValue);
+        if (hasStore()) {
+            var val = settingsStore.get(key, undefined);
+            if (val !== undefined && val !== null) return val;
+        }
+        if (typeof SettingsConfig !== "undefined" && SettingsConfig && SettingsConfig.ready) {
+            var sVal = SettingsConfig.get(key, undefined);
+            if (sVal !== undefined && sVal !== null) return sVal;
+        }
+        return fallbackValue;
     }
 
     function set(key, value) {
-        if (!hasStore())
-            return;
-        settingsStore.set(key, value);
+        if (hasStore()) {
+            settingsStore.set(key, value);
+        }
+        if (typeof SettingsConfig !== "undefined" && SettingsConfig) {
+            SettingsConfig.set(key, value);
+        }
     }
 
     function getBoolean(key, fallbackValue) {

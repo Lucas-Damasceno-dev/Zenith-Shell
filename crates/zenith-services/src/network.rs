@@ -59,14 +59,20 @@ impl NetworkService {
         })
     }
 
-    /// Retrieve current network connectivity status.
+    /// Retrieve current network connectivity status with non-blocking cache.
     pub fn status() -> NetworkStatus {
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
-        if guard.last_scan.elapsed() > Duration::from_millis(3000) {
-            guard.status = Self::query_system_status();
-            guard.wifi_list = Self::query_system_wifi();
+        if guard.last_scan.elapsed() > Duration::from_millis(4000) {
             guard.last_scan = Instant::now();
+            let c_arc = cache_arc.clone();
+            std::thread::spawn(move || {
+                let fresh = Self::query_system_status();
+                if let Ok(mut g) = c_arc.lock() {
+                    g.status = fresh;
+                    g.last_scan = Instant::now();
+                }
+            });
         }
         guard.status.clone()
     }
@@ -75,8 +81,7 @@ impl NetworkService {
     pub fn scan_wifi() -> Vec<WifiNetwork> {
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
-        if guard.last_scan.elapsed() > Duration::from_millis(3000) {
-            guard.status = Self::query_system_status();
+        if guard.last_scan.elapsed() > Duration::from_millis(5000) {
             guard.wifi_list = Self::query_system_wifi();
             guard.last_scan = Instant::now();
         }
@@ -103,6 +108,7 @@ impl NetworkService {
     fn query_system_status() -> NetworkStatus {
         // Try nmcli -t -f TYPE,STATE,CONNECTION dev
         if let Ok(output) = Command::new("nmcli")
+            .env("LC_ALL", "C")
             .args(["-t", "-f", "TYPE,STATE,CONNECTION", "dev"])
             .output()
         {
@@ -110,7 +116,7 @@ impl NetworkService {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
                     let parts: Vec<&str> = line.split(':').collect();
-                    if parts.len() >= 3 && parts[1] == "connected" {
+                    if parts.len() >= 3 && (parts[1].starts_with("connect") || parts[1].starts_with("conect")) {
                         let conn_type = parts[0];
                         let conn_name = parts[2].to_string();
                         let ip = Self::query_local_ip();
@@ -188,6 +194,19 @@ impl NetworkService {
     }
 
     fn query_local_ip() -> Option<String> {
+        // Zero-cost native in-process UDP socket lookup via kernel routing table (no packets sent)
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect("1.1.1.1:80").is_ok() {
+                if let Ok(local_addr) = socket.local_addr() {
+                    let ip = local_addr.ip().to_string();
+                    if ip != "0.0.0.0" && !ip.starts_with("127.") {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+
+        // Fallback to hostname -I if socket lookup unavailable
         if let Ok(output) = Command::new("hostname").arg("-I").output() {
             if output.status.success() {
                 let out = String::from_utf8_lossy(&output.stdout);

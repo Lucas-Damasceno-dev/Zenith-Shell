@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 static START: OnceLock<Instant> = OnceLock::new();
+static FIFO_HANDLE: OnceLock<std::sync::Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 pub struct CavaService;
 
@@ -18,16 +19,25 @@ impl CavaService {
     pub fn spectrum(bar_count: usize) -> Vec<f32> {
         let count = bar_count.clamp(4, 32);
 
-        // 1. Try reading real FIFO
-        if let Some(fifo_path) = find_fifo() {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo_path)
-            {
+        // 1. Try reading real FIFO using persistent file descriptor
+        let fifo_lock = FIFO_HANDLE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(mut guard) = fifo_lock.lock() {
+            if guard.is_none() {
+                if let Some(fifo_path) = find_fifo() {
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo_path)
+                    {
+                        *guard = Some(file);
+                    }
+                }
+            }
+
+            if let Some(ref mut file) = *guard {
                 let mut buf = [0u8; 256];
-                if let Ok(n) = file.read(&mut buf) {
-                    if n > 0 {
+                match file.read(&mut buf) {
+                    Ok(n) if n > 0 => {
                         let text = String::from_utf8_lossy(&buf[..n]);
                         if let Some(last_line) = text.lines().last() {
                             let mut parsed = Vec::new();
@@ -41,6 +51,13 @@ impl CavaService {
                                 return parsed;
                             }
                         }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Non-blocking read had no new data: continue gracefully
+                    }
+                    _ => {
+                        // Broken pipe or EOF from closed cava; reset descriptor to retry later
+                        *guard = None;
                     }
                 }
             }

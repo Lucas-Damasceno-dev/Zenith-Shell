@@ -33,6 +33,48 @@ impl Color {
     }
 }
 
+/// Viewport overflow behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Scroll,
+}
+
+/// Layer-shell window surface placement metadata.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WindowMeta {
+    pub anchor_top: bool,
+    pub anchor_bottom: bool,
+    pub anchor_left: bool,
+    pub anchor_right: bool,
+    pub margin_top: i32,
+    pub margin_right: i32,
+    pub margin_bottom: i32,
+    pub margin_left: i32,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub layer: Option<String>,
+    pub exclusive_zone: Option<i32>,
+    pub keyboard_mode: Option<String>,
+}
+
+/// Computed text input parameters for Wayland focus and text rendering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedTextInput {
+    pub id: Option<String>,
+    pub text: String,
+    pub placeholder: String,
+    pub font_size: f32,
+    pub color: Color,
+    pub placeholder_color: Color,
+    pub active: bool,
+    pub cursor_pos: usize,
+    pub on_change: Option<String>,
+    pub on_submit: Option<String>,
+}
+
 /// Shadow parameters for vector drop shadows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShadowStyle {
@@ -43,7 +85,7 @@ pub struct ShadowStyle {
 }
 
 /// Node style properties for Zenith UI elements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeStyle {
     pub width: Option<f32>,
     pub height: Option<f32>,
@@ -58,7 +100,11 @@ pub struct NodeStyle {
     pub border_width: f32,
     pub border_radius: f32,
     pub flex_grow: f32,
+    pub flex_shrink: f32,
+    pub max_width: Option<f32>,
     pub shadow: Option<ShadowStyle>,
+    pub overflow: Overflow,
+    pub scroll_offset_y: f32,
 }
 
 
@@ -78,19 +124,25 @@ impl Default for NodeStyle {
             border_width: 0.0,
             border_radius: 0.0,
             flex_grow: 0.0,
+            flex_shrink: 1.0,
+            max_width: None,
             shadow: None,
+            overflow: Overflow::Visible,
+            scroll_offset_y: 0.0,
         }
-
     }
 }
 
 /// Abstract representation of a UI element.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiNode {
     Box {
         style: NodeStyle,
         children: Vec<UiNode>,
         on_click: Option<String>,
+        on_right_click: Option<String>,
+        on_scroll_up: Option<String>,
+        on_scroll_down: Option<String>,
     },
     Text {
         text: String,
@@ -98,6 +150,37 @@ pub enum UiNode {
         color: Color,
         style: NodeStyle,
     },
+    TextInput {
+        id: Option<String>,
+        text: String,
+        placeholder: String,
+        font_size: f32,
+        color: Color,
+        placeholder_color: Color,
+        active: bool,
+        cursor_pos: usize,
+        style: NodeStyle,
+        on_change: Option<String>,
+        on_submit: Option<String>,
+    },
+    Image {
+        src: String,
+        style: NodeStyle,
+    },
+    Window {
+        meta: WindowMeta,
+        style: NodeStyle,
+        children: Vec<UiNode>,
+    },
+}
+
+impl UiNode {
+    pub fn window_meta(&self) -> Option<&WindowMeta> {
+        match self {
+            UiNode::Window { meta, .. } => Some(meta),
+            _ => None,
+        }
+    }
 }
 
 /// Computed geometry ready for rendering.
@@ -113,7 +196,14 @@ pub struct ComputedBox {
     pub border_radius: f32,
     pub shadow: Option<ShadowStyle>,
     pub text: Option<(String, Color, f32)>,
+    pub image: Option<String>,
+    pub text_input: Option<ComputedTextInput>,
+    pub overflow: Overflow,
+    pub scroll_offset_y: f32,
     pub on_click: Option<String>,
+    pub on_right_click: Option<String>,
+    pub on_scroll_up: Option<String>,
+    pub on_scroll_down: Option<String>,
 }
 
 
@@ -140,6 +230,17 @@ impl LayoutEngine {
         self.taffy.clear();
         let root_node = self.build_taffy_node(root);
 
+        // Ensure root container expands to viewport bounds if not explicitly sized
+        if let Ok(mut root_style) = self.taffy.style(root_node).cloned() {
+            if root_style.size.width == auto() {
+                root_style.size.width = length(viewport_width);
+            }
+            if root_style.size.height == auto() {
+                root_style.size.height = length(viewport_height);
+            }
+            let _ = self.taffy.set_style(root_node, root_style);
+        }
+
         let available_space = Size {
             width: AvailableSpace::Definite(viewport_width),
             height: AvailableSpace::Definite(viewport_height),
@@ -157,7 +258,7 @@ impl LayoutEngine {
 
     fn build_taffy_node(&mut self, node: &UiNode) -> NodeId {
         match node {
-            UiNode::Box { style, children, .. } => {
+            UiNode::Box { style, children, .. } | UiNode::Window { style, children, .. } => {
                 let child_nodes: Vec<NodeId> = children.iter().map(|c| self.build_taffy_node(c)).collect();
                 let taffy_style = Self::convert_style(style);
                 self.taffy.new_with_children(taffy_style, &child_nodes).unwrap()
@@ -166,11 +267,36 @@ impl LayoutEngine {
             UiNode::Text { style, text, font_size, .. } => {
                 let mut taffy_style = Self::convert_style(style);
                 if style.width.is_none() {
-                    let approx_width = text.len() as f32 * (font_size * 0.6);
+                    let char_count = text.chars().count();
+                    let approx_width = (char_count as f32 * (*font_size * 0.62)).max(*font_size * 0.7);
                     taffy_style.size.width = length(approx_width);
                 }
                 if style.height.is_none() {
                     taffy_style.size.height = length(*font_size * 1.2);
+                }
+                self.taffy.new_leaf(taffy_style).unwrap()
+            }
+
+            UiNode::TextInput { style, text, placeholder, font_size, .. } => {
+                let mut taffy_style = Self::convert_style(style);
+                if style.width.is_none() {
+                    let chars = text.chars().count().max(placeholder.chars().count()).max(10);
+                    let approx_width = (chars as f32 * (*font_size * 0.62)).max(120.0);
+                    taffy_style.size.width = length(approx_width);
+                }
+                if style.height.is_none() {
+                    taffy_style.size.height = length((*font_size * 1.8).max(34.0));
+                }
+                self.taffy.new_leaf(taffy_style).unwrap()
+            }
+
+            UiNode::Image { style, .. } => {
+                let mut taffy_style = Self::convert_style(style);
+                if style.width.is_none() {
+                    taffy_style.size.width = length(24.0);
+                }
+                if style.height.is_none() {
+                    taffy_style.size.height = length(24.0);
                 }
                 self.taffy.new_leaf(taffy_style).unwrap()
             }
@@ -182,6 +308,10 @@ impl LayoutEngine {
             size: Size {
                 width: style.width.map(length).unwrap_or(auto()),
                 height: style.height.map(length).unwrap_or(auto()),
+            },
+            max_size: Size {
+                width: style.max_width.map(length).unwrap_or(auto()),
+                height: auto(),
             },
             padding: Rect {
                 top: length(style.padding[0]),
@@ -199,8 +329,8 @@ impl LayoutEngine {
             justify_content: style.justify_content,
             align_items: style.align_items,
             flex_grow: style.flex_grow,
+            flex_shrink: style.flex_shrink,
             gap: Size {
-
                 width: length(style.gap),
                 height: length(style.gap),
             },
@@ -221,7 +351,18 @@ impl LayoutEngine {
         let abs_y = parent_y + layout.location.y;
 
         match node {
-            UiNode::Box { style, children, on_click } => {
+            UiNode::Box { style, children, .. }
+            | UiNode::Window { style, children, .. } => {
+                let (on_c, on_rc, on_su, on_sd) = match node {
+                    UiNode::Box { on_click, on_right_click, on_scroll_up, on_scroll_down, .. } => (
+                        on_click.clone(),
+                        on_right_click.clone(),
+                        on_scroll_up.clone(),
+                        on_scroll_down.clone(),
+                    ),
+                    _ => (None, None, None, None),
+                };
+
                 out.push(ComputedBox {
                     x: abs_x,
                     y: abs_y,
@@ -233,12 +374,25 @@ impl LayoutEngine {
                     border_radius: style.border_radius,
                     shadow: style.shadow,
                     text: None,
-                    on_click: on_click.clone(),
+                    image: None,
+                    text_input: None,
+                    overflow: style.overflow,
+                    scroll_offset_y: style.scroll_offset_y,
+                    on_click: on_c,
+                    on_right_click: on_rc,
+                    on_scroll_up: on_su,
+                    on_scroll_down: on_sd,
                 });
 
                 let child_ids = self.taffy.children(node_id).unwrap();
+                let scroll_y = if style.overflow == Overflow::Scroll {
+                    style.scroll_offset_y
+                } else {
+                    0.0
+                };
+
                 for (child_node, child_id) in children.iter().zip(child_ids.iter()) {
-                    self.collect_computed(child_node, *child_id, abs_x, abs_y, out);
+                    self.collect_computed(child_node, *child_id, abs_x, abs_y - scroll_y, out);
                 }
             }
             UiNode::Text { style, text, color, font_size } => {
@@ -253,10 +407,260 @@ impl LayoutEngine {
                     border_radius: style.border_radius,
                     shadow: style.shadow,
                     text: Some((text.clone(), *color, *font_size)),
+                    image: None,
+                    text_input: None,
+                    overflow: style.overflow,
+                    scroll_offset_y: 0.0,
                     on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                });
+            }
+            UiNode::TextInput {
+                style,
+                id,
+                text,
+                placeholder,
+                font_size,
+                color,
+                placeholder_color,
+                active,
+                cursor_pos,
+                on_change,
+                on_submit,
+            } => {
+                out.push(ComputedBox {
+                    x: abs_x,
+                    y: abs_y,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                    background_color: style.background_color,
+                    border_color: style.border_color,
+                    border_width: style.border_width,
+                    border_radius: style.border_radius,
+                    shadow: style.shadow,
+                    text: None,
+                    image: None,
+                    text_input: Some(ComputedTextInput {
+                        id: id.clone(),
+                        text: text.clone(),
+                        placeholder: placeholder.clone(),
+                        font_size: *font_size,
+                        color: *color,
+                        placeholder_color: *placeholder_color,
+                        active: *active,
+                        cursor_pos: *cursor_pos,
+                        on_change: on_change.clone(),
+                        on_submit: on_submit.clone(),
+                    }),
+                    overflow: style.overflow,
+                    scroll_offset_y: 0.0,
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                });
+            }
+            UiNode::Image { style, src } => {
+                out.push(ComputedBox {
+                    x: abs_x,
+                    y: abs_y,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                    background_color: style.background_color,
+                    border_color: style.border_color,
+                    border_width: style.border_width,
+                    border_radius: style.border_radius,
+                    shadow: style.shadow,
+                    text: None,
+                    image: Some(src.clone()),
+                    text_input: None,
+                    overflow: style.overflow,
+                    scroll_offset_y: 0.0,
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
                 });
             }
         }
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_layout_width() {
+        let mut engine = LayoutEngine::new();
+        let root = UiNode::Box {
+            style: NodeStyle {
+                height: Some(44.0),
+                ..Default::default()
+            },
+            children: vec![
+                UiNode::Box {
+                    style: NodeStyle {
+                        flex_grow: 1.0,
+                        height: Some(36.0),
+                        ..Default::default()
+                    },
+                    children: vec![],
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                }
+            ],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+        };
+        let computed = engine.compute(&root, 1346.0, 44.0);
+        println!("Computed boxes: {:?}", computed);
+        assert_eq!(computed[0].width, 1346.0);
+        assert_eq!(computed[1].width, 1346.0);
+    }
+
+    #[test]
+    fn test_bar_clusters_distribution() {
+        let mut engine = LayoutEngine::new();
+        let root = UiNode::Box {
+            style: NodeStyle {
+                height: Some(44.0),
+                padding: [4.0, 12.0, 4.0, 12.0],
+                ..Default::default()
+            },
+            children: vec![
+                UiNode::Box {
+                    style: NodeStyle {
+                        flex_grow: 1.0,
+                        height: Some(36.0),
+                        flex_direction: FlexDirection::Row,
+                        ..Default::default()
+                    },
+                    children: vec![
+                        UiNode::Box {
+                            style: NodeStyle { width: Some(100.0), height: Some(30.0), ..Default::default() },
+                            children: vec![],
+                            on_click: None,
+                            on_right_click: None,
+                            on_scroll_up: None,
+                            on_scroll_down: None,
+                        },
+                        UiNode::Box {
+                            style: NodeStyle { flex_grow: 1.0, ..Default::default() },
+                            children: vec![],
+                            on_click: None,
+                            on_right_click: None,
+                            on_scroll_up: None,
+                            on_scroll_down: None,
+                        },
+                        UiNode::Box {
+                            style: NodeStyle { width: Some(80.0), height: Some(30.0), ..Default::default() },
+                            children: vec![],
+                            on_click: None,
+                            on_right_click: None,
+                            on_scroll_up: None,
+                            on_scroll_down: None,
+                        },
+                        UiNode::Box {
+                            style: NodeStyle { flex_grow: 1.0, ..Default::default() },
+                            children: vec![],
+                            on_click: None,
+                            on_right_click: None,
+                            on_scroll_up: None,
+                            on_scroll_down: None,
+                        },
+                        UiNode::Box {
+                            style: NodeStyle { width: Some(120.0), height: Some(30.0), ..Default::default() },
+                            children: vec![],
+                            on_click: None,
+                            on_right_click: None,
+                            on_scroll_up: None,
+                            on_scroll_down: None,
+                        },
+                    ],
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                }
+            ],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+        };
+        let computed = engine.compute(&root, 1346.0, 44.0);
+        assert_eq!(computed[0].width, 1346.0);
+        // Container width = 1346 - 24 = 1322
+        assert_eq!(computed[1].width, 1322.0);
+        // Right cluster (last element in computed) should end near 1346 - 12 = 1334
+        let right_cluster = &computed[computed.len() - 1];
+        assert_eq!(right_cluster.x + right_cluster.width, 1334.0);
+    }
+
+    #[test]
+    fn test_text_input_image_and_scroll_layout() {
+        let mut engine = LayoutEngine::new();
+        let root = UiNode::Box {
+            style: NodeStyle {
+                width: Some(400.0),
+                height: Some(300.0),
+                overflow: Overflow::Scroll,
+                scroll_offset_y: 50.0,
+                flex_direction: FlexDirection::Column,
+                ..Default::default()
+            },
+            children: vec![
+                UiNode::TextInput {
+                    id: Some("search_input".to_string()),
+                    text: "hello".to_string(),
+                    placeholder: "Search...".to_string(),
+                    font_size: 14.0,
+                    color: Color::rgb(255, 255, 255),
+                    placeholder_color: Color::rgb(150, 150, 150),
+                    active: true,
+                    cursor_pos: 5,
+                    style: NodeStyle {
+                        width: Some(300.0),
+                        height: Some(36.0),
+                        ..Default::default()
+                    },
+                    on_change: Some("change_cb".to_string()),
+                    on_submit: Some("submit_cb".to_string()),
+                },
+                UiNode::Image {
+                    src: "/tmp/icon.png".to_string(),
+                    style: NodeStyle {
+                        width: Some(32.0),
+                        height: Some(32.0),
+                        ..Default::default()
+                    },
+                },
+            ],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+        };
+
+        let computed = engine.compute(&root, 400.0, 300.0);
+        assert_eq!(computed.len(), 3);
+        assert_eq!(computed[0].overflow, Overflow::Scroll);
+        assert_eq!(computed[0].scroll_offset_y, 50.0);
+
+        let input_box = &computed[1];
+        assert!(input_box.text_input.is_some());
+        assert_eq!(input_box.text_input.as_ref().unwrap().text, "hello");
+        // Due to scroll_offset_y: 50.0, children y should be offset by -50.0
+        assert_eq!(input_box.y, -50.0);
+
+        let img_box = &computed[2];
+        assert_eq!(img_box.image.as_deref(), Some("/tmp/icon.png"));
     }
 }

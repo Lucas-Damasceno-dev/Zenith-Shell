@@ -3,12 +3,12 @@
 
 local function Launcher(props: { text: string?, on_click: string? }?)
     local theme = Zenith.Theme()
-    local text = props and props.text or "󱄅 NixOS"
+    local text = props and props.text or "󱄅"
     local on_click = props and props.on_click or "popup:toggle:Launcher"
 
     return Zenith.Box({
         direction = "row",
-        padding = { x = 11, y = 3 },
+        padding = { x = 8, y = 3 },
         gap = 6,
         border_radius = 12,
         background = Zenith.rgba(122, 162, 247, 35),

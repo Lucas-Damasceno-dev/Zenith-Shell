@@ -51,20 +51,25 @@ impl LauncherService {
 
     /// Search indexed applications matching query, returning up to `limit` entries.
     pub fn search(query: &str, limit: usize) -> Vec<AppEntry> {
-        let apps = Self::get_apps();
+        let cache = APPS_CACHE.get_or_init(|| {
+            let apps = Self::scan_all_desktop_entries();
+            info!("LauncherService indexed {} desktop applications", apps.len());
+            Arc::new(RwLock::new(apps))
+        });
+        let apps_guard = cache.read().unwrap();
         let q = query.trim().to_lowercase();
 
         if q.is_empty() {
-            let mut res = apps;
+            let mut res: Vec<AppEntry> = apps_guard.clone();
             res.sort_by_key(|a| a.name.to_lowercase());
             res.truncate(limit);
             return res;
         }
 
-        let mut scored: Vec<(i32, AppEntry)> = apps
-            .into_iter()
+        let mut scored: Vec<(i32, &AppEntry)> = apps_guard
+            .iter()
             .filter_map(|app| {
-                let score = Self::calculate_score(&app, &q);
+                let score = Self::calculate_score(app, &q);
                 if score > 0 {
                     Some((score, app))
                 } else {
@@ -78,7 +83,7 @@ impl LauncherService {
             s2.cmp(s1).then_with(|| a1.name.to_lowercase().cmp(&a2.name.to_lowercase()))
         });
 
-        scored.into_iter().take(limit).map(|(_, app)| app).collect()
+        scored.into_iter().take(limit).map(|(_, app)| app.clone()).collect()
     }
 
     /// Launch application command asynchronously in a detached process.

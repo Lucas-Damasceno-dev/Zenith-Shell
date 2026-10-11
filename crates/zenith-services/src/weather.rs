@@ -64,18 +64,50 @@ impl WeatherService {
         guard.snapshot.clone()
     }
 
-    fn fetch_remote() -> Option<WeatherSnapshot> {
-        // Query wttr.in with short timeout
-        let out = std::process::Command::new("curl")
-            .args(["-s", "--max-time", "3", "wttr.in/?format=%t+%C"])
-            .output()
-            .ok()?;
+    fn fetch_wttr_native() -> Option<String> {
+        use std::io::{Read, Write};
+        use std::net::{TcpStream, ToSocketAddrs};
 
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // Format: "+23°C Clear"
-            let parts: Vec<&str> = text.split_whitespace().collect();
-            if !parts.is_empty() {
+        let addr = "wttr.in:80".to_socket_addrs().ok()?.next()?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+
+        let req = "GET /?format=%t+%C HTTP/1.1\r\nHost: wttr.in\r\nUser-Agent: Zenith-Shell\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).ok()?;
+
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).ok()?;
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        if let Some((_header, body)) = resp_str.split_once("\r\n\r\n") {
+            let body_trimmed = body.trim();
+            if !body_trimmed.is_empty() && (body_trimmed.starts_with('+') || body_trimmed.starts_with('-') || body_trimmed.contains("°C")) {
+                return Some(body_trimmed.to_string());
+            }
+        }
+        None
+    }
+
+    fn fetch_remote() -> Option<WeatherSnapshot> {
+        let text = if let Some(native_text) = Self::fetch_wttr_native() {
+            native_text
+        } else {
+            // Fallback to curl if native socket resolution fails
+            let out = std::process::Command::new("curl")
+                .args(["-s", "--max-time", "3", "wttr.in/?format=%t+%C"])
+                .output()
+                .ok()?;
+            if out.status.success() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                return None;
+            }
+        };
+
+        // Format: "+23°C Clear"
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if !parts.is_empty() {
                 let temp_str = parts[0].trim_end_matches("°C").trim_start_matches('+');
                 let temp = temp_str.parse::<f32>().unwrap_or(22.0);
                 let condition = if parts.len() > 1 { parts[1..].join(" ") } else { "Clear".to_string() };
@@ -87,7 +119,6 @@ impl WeatherService {
                     city: "Current".to_string(),
                 });
             }
-        }
 
         None
     }

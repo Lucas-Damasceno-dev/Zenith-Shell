@@ -21,6 +21,7 @@ Item {
     required property var batteryPopup
     required property var sessionPopup
     property var contextPopup: null
+    property var settingsPopup: null
     required property var clipboardPopup
     required property var nixMonitorPopup
     required property var usbPopup
@@ -165,11 +166,27 @@ Item {
             }
         }
 
-        // ── Action Cluster (Session) ────────────────────────────────
+        // ── Action Cluster (Settings & Session) ────────────────────
         RowLayout {
             id: actionCluster
             Layout.alignment: Qt.AlignVCenter
             spacing: DesignTokens.spacingXS
+
+            PillWidget {
+                id: settingsTile
+                Layout.alignment: Qt.AlignVCenter
+
+                readonly property bool isOpen: ShellController.isPopupOpen(root.settingsPopup)
+
+                iconText: "\u{f013}"
+                iconColor: isOpen ? ColorScheme.accent : ColorScheme.text
+                checked: isOpen
+                popupOpen: checked
+                anyPopupOpen: root.anyPopupOpen
+                tooltipText: isOpen ? "Settings open" : "Configurações (Esquerdo: Shell | Direito: iNiR)"
+
+                onClicked: root.togglePopup(root.settingsPopup)
+            }
 
             PillWidget {
                 id: sessionTile

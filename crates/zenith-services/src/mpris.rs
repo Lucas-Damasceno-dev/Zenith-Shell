@@ -48,7 +48,7 @@ static CACHE: OnceLock<Arc<RwLock<CachedState>>> = OnceLock::new();
 pub struct MprisService;
 
 impl MprisService {
-    /// Retrieve current media player snapshot, cached for 1 second.
+    /// Retrieve current media player snapshot, cached non-blockingly.
     pub fn snapshot() -> MediaSnapshot {
         let cache_arc = CACHE.get_or_init(|| {
             Arc::new(RwLock::new(CachedState {
@@ -58,21 +58,26 @@ impl MprisService {
             }))
         });
 
-        {
+        let (snap, need_refresh) = {
             let r = cache_arc.read().unwrap();
-            if r.last_query.elapsed() < Duration::from_millis(800) {
-                return r.snapshot.clone();
-            }
+            (r.snapshot.clone(), r.last_query.elapsed() >= Duration::from_millis(1500))
+        };
+
+        if need_refresh {
+            let mut w = cache_arc.write().unwrap();
+            w.last_query = Instant::now();
+            let c_arc = cache_arc.clone();
+            std::thread::spawn(move || {
+                let (fresh_snap, bus_name) = Self::query_active_player();
+                if let Ok(mut writer) = c_arc.write() {
+                    writer.snapshot = fresh_snap;
+                    writer.active_bus_name = bus_name;
+                    writer.last_query = Instant::now();
+                }
+            });
         }
 
-        let (fresh_snap, bus_name) = Self::query_active_player();
-
-        let mut w = cache_arc.write().unwrap();
-        w.last_query = Instant::now();
-        w.snapshot = fresh_snap.clone();
-        w.active_bus_name = bus_name;
-
-        fresh_snap
+        snap
     }
 
     /// Dispatch media transport control command ("play-pause", "next", "prev").
