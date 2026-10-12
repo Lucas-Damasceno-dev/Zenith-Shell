@@ -19,8 +19,8 @@ return Zenith.Window({
     height = 240,
     padding = { x = 16, y = 14 },
     gap = 12,
-    background = Zenith.rgba(18, 20, 26, 225),
-    border_color = Zenith.hex(theme.primary),
+    background = Zenith.hex(theme.surface, 235),
+    border_color = Zenith.hex(theme.outline_variant or theme.outline, 80),
     border_width = 1,
     border_radius = 16,
     shadow = {

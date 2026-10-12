@@ -20,10 +20,13 @@ enum ShellCommand {
     Toggle(String),
     Open(String),
     Close,
+    ToggleInspect,
+    Eval(String, std::sync::mpsc::Sender<String>),
 }
 
 enum AppEvent {
     Reload(String),
+    ReloadActiveTrees,
     Redraw,
     DismissPopup,
 }
@@ -31,6 +34,7 @@ enum AppEvent {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let subcmd = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
+    let inspect_flag = args.iter().any(|a| a == "--inspect");
 
     match subcmd {
         "reload" => send_socket_command("reload"),
@@ -45,19 +49,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "close" => send_socket_command("close"),
         "lock" => send_socket_command("lock"),
         "inspect" => send_socket_command("inspect"),
+        "inspect:toggle" | "inspect-toggle" => send_socket_command("inspect:toggle"),
+        "eval" => {
+            let code = args[2..].join(" ");
+            send_socket_command(&format!("eval {}", code))
+        }
+        "repl" => run_repl(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
         }
         "daemon" | "run" => {
-            let custom_cfg = args.get(2).map(PathBuf::from);
-            run_daemon(custom_cfg)
+            let custom_cfg = args.iter().skip(2).find(|a| !a.starts_with("--")).map(PathBuf::from);
+            run_daemon(custom_cfg, inspect_flag)
         }
         _ => {
-            // If argument is a file path, assume daemon with that config
             let p = PathBuf::from(subcmd);
             if p.exists() || p.extension().and_then(|s| s.to_str()) == Some("luau") {
-                run_daemon(Some(p))
+                run_daemon(Some(p), inspect_flag)
             } else {
                 eprintln!("Unknown command: '{}'. Run 'zenith help' for usage.", subcmd);
                 std::process::exit(1);
@@ -67,20 +76,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Zenith-Shell (Engine v2) — Wayland Desktop Shell Framework");
+    println!("Zenith-Shell (Engine Base v3) — Wayland Desktop Shell Framework");
     println!();
     println!("USAGE:");
     println!("    zenith [COMMAND] [OPTIONS]");
     println!();
     println!("COMMANDS:");
-    println!("    daemon [path]        Run shell daemon (default: config/zenith/bar.luau)");
-    println!("    reload               Trigger sub-10ms hot-reload of active Luau configuration");
-    println!("    toggle <popup_id>    Toggle an overlay popup (e.g. Launcher, AudioPopup)");
-    println!("    open <popup_id>      Open specified overlay popup");
-    println!("    close                Close currently open overlay popup");
-    println!("    lock                 Activate screen locker overlay");
-    println!("    inspect              Display live shell telemetry (RSS, heap, popups)");
-    println!("    help                 Show this help message");
+    println!("    daemon [path] [--inspect] Run shell daemon (default: config/zenith/bar.luau)");
+    println!("    reload                    Trigger sub-10ms hot-reload of active Luau configuration");
+    println!("    toggle <popup_id>         Toggle an overlay popup (e.g. Launcher, AudioPopup)");
+    println!("    open <popup_id>           Open specified overlay popup");
+    println!("    close                     Close currently open overlay popup");
+    println!("    lock                      Activate screen locker overlay");
+    println!("    inspect                   Display live shell telemetry (RSS, heap, popups)");
+    println!("    inspect:toggle            Toggle on-screen visual bounding box overlays");
+    println!("    eval <code>               Evaluate arbitrary Luau expression via daemon");
+    println!("    repl                      Start interactive live Luau shell session");
+    println!("    help                      Show this help message");
 }
 
 fn resolve_socket_path() -> PathBuf {
@@ -123,11 +135,15 @@ fn send_socket_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
-    info!("Starting Zenith Desktop Shell (Engine v2)...");
+    info!("Starting Zenith Desktop Shell (Engine Base v3)...");
 
     let (mut app, conn, event_queue) = WaylandApp::init()?;
+    if inspect_mode {
+        app.set_inspect_mode(true);
+        info!("Inspect mode enabled: Taffy bounding box overlays active");
+    }
 
     // Locate Luau configuration file
     let local_cfg = Path::new("config/zenith/bar.luau");
@@ -207,6 +223,14 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
                         info!("Hot-reload successfully applied in {:?}!", elapsed);
                     }
                 }
+                AppEvent::ReloadActiveTrees => {
+                    info!("Hot-reload triggered for module/overlay, refreshing Luau module cache and active trees...");
+                    let start = std::time::Instant::now();
+                    app.reload_active_trees();
+                    let elapsed = start.elapsed();
+                    info!("Active trees and Luau module cache reloaded in {:?}!", elapsed);
+                    needs_redraw_cb.store(true, Ordering::Release);
+                }
                 AppEvent::Redraw => {
                     needs_redraw_cb.store(true, Ordering::Release);
                 }
@@ -226,6 +250,7 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
 
     let cmd_event_sender = event_sender.clone();
     let cmd_script_path = script_path.clone();
+    let cmd_needs_redraw = needs_redraw.clone();
 
     loop_handle.insert_source(cmd_channel, move |event, _, app: &mut WaylandApp| {
         if let calloop::channel::Event::Msg(cmd) = event {
@@ -240,14 +265,33 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
                 ShellCommand::Toggle(id) => {
                     info!("IPC command: toggle popup '{}'", id);
                     app.toggle_popup(&id);
+                    cmd_needs_redraw.store(true, Ordering::Release);
+                    let _ = app.request_redraw();
                 }
                 ShellCommand::Open(id) => {
                     info!("IPC command: open popup '{}'", id);
                     let _ = app.open_popup(&id);
+                    cmd_needs_redraw.store(true, Ordering::Release);
+                    let _ = app.request_redraw();
                 }
                 ShellCommand::Close => {
                     info!("IPC command: close popup");
                     app.close_popup();
+                    cmd_needs_redraw.store(true, Ordering::Release);
+                    let _ = app.request_redraw();
+                }
+                ShellCommand::ToggleInspect => {
+                    let current = app.inspect_mode;
+                    app.set_inspect_mode(!current);
+                    info!("Toggled visual inspector mode to: {}", !current);
+                    let _ = app.request_redraw();
+                }
+                ShellCommand::Eval(code, tx) => {
+                    let res = match app.eval_code(&code) {
+                        Ok(v) => format!("OK: {}\n", v),
+                        Err(e) => format!("ERR: {}\n", e),
+                    };
+                    let _ = tx.send(res);
                 }
             }
         }
@@ -303,6 +347,20 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
                     vmrss_mb, heap_mb, inspect_sock_path.display()
                 );
                 let _ = stream.write_all(resp.as_bytes());
+            } else if trimmed == "inspect:toggle" || trimmed == "inspect-toggle" {
+                let _ = socket_cmd_sender.send(ShellCommand::ToggleInspect);
+                let _ = stream.write_all(b"OK: inspect mode toggled\n");
+            } else if let Some(stripped) = trimmed.strip_prefix("eval ") {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = socket_cmd_sender.send(ShellCommand::Eval(stripped.to_string(), tx));
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => {
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(_) => {
+                        let _ = stream.write_all(b"ERR: eval timeout\n");
+                    }
+                }
             } else {
                 let _ = stream.write_all(b"ERR: unknown command\n");
             }
@@ -341,8 +399,29 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                        if let Ok(code) = fs::read_to_string(&watch_path) {
-                            let _ = watcher_sender.send(AppEvent::Reload(code));
+                        let is_main_script = event.paths.iter().any(|p| p == &watch_path);
+                        let is_overlay_or_lib = event.paths.iter().any(|p| {
+                            let s = p.to_string_lossy();
+                            s.contains("overlays")
+                                || s.contains("lib/widgets")
+                                || s.contains("widgets")
+                                || s.contains("lib")
+                        });
+
+                        if is_main_script {
+                            if let Ok(code) = fs::read_to_string(&watch_path) {
+                                let _ = watcher_sender.send(AppEvent::Reload(code));
+                            }
+                        } else if is_overlay_or_lib {
+                            let _ = watcher_sender.send(AppEvent::ReloadActiveTrees);
+                        } else {
+                            let is_luau = event.paths.iter().any(|p| {
+                                p.extension().and_then(|ext| ext.to_str()) == Some("luau")
+                                    || p.extension().and_then(|ext| ext.to_str()) == Some("lua")
+                            });
+                            if is_luau {
+                                let _ = watcher_sender.send(AppEvent::ReloadActiveTrees);
+                            }
                         }
                     }
                 }
@@ -350,13 +429,13 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
             Config::default().with_poll_interval(Duration::from_millis(50)),
         )?;
 
-        // Watch directory containing the script to catch atomics/swaps from text editors
+        // Watch directory containing the script to catch atomics/swaps from text editors and nested modules
         if let Some(parent) = path.parent() {
-            watcher.watch(parent, RecursiveMode::NonRecursive)?;
-            info!("Hot-reload watcher active on directory: {}", parent.display());
+            watcher.watch(parent, RecursiveMode::Recursive)?;
+            info!("Hot-reload watcher active on directory: {} (recursive)", parent.display());
         } else {
-            watcher.watch(path, RecursiveMode::NonRecursive)?;
-            info!("Hot-reload watcher active on file: {}", path.display());
+            watcher.watch(path, RecursiveMode::Recursive)?;
+            info!("Hot-reload watcher active on file: {} (recursive)", path.display());
         }
 
         Some(watcher)
@@ -382,11 +461,23 @@ fn run_daemon(custom_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
             Some(Duration::from_millis(8))
         } else if app.dock_last_leave.is_some() || app.bar_last_leave.is_some() {
             Some(Duration::from_millis(40))
+        } else if app.tooltip_hover.is_some() {
+            Some(Duration::from_millis(50))
         } else {
             None
         };
 
         event_loop.dispatch(timeout, &mut app)?;
+
+        if app.tooltip_hover.is_some() && app.check_tooltip_timer() {
+            needs_redraw.store(true, Ordering::Release);
+        }
+
+        if let Ok(count) = app.poll_async_tasks() {
+            if count > 0 {
+                needs_redraw.store(true, Ordering::Release);
+            }
+        }
 
         // Handle dock auto-hide debounce timer when cursor leaves dock
         if let Some(leave_time) = app.dock_last_leave {
@@ -457,4 +548,83 @@ fn dirs_config_path() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(|h| {
         PathBuf::from(h).join(".config/zenith/bar.luau")
     })
+}
+
+fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
+    let sock_path = resolve_socket_path();
+    if !sock_path.exists() {
+        eprintln!(
+            "Error: Zenith daemon is not running (socket not found at {}).",
+            sock_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║  🌟 Zenith Live REPL (Engine Base v3)                    ║");
+    println!("║  Interactive Luau shell connected to active daemon       ║");
+    println!("║  Commands: Zenith.Storage.all(), toggle <id>, quit      ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!();
+
+    let stdin = std::io::stdin();
+    loop {
+        print!("zenith> ");
+        std::io::stdout().flush()?;
+
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "exit" || trimmed == "quit" {
+            println!("Goodbye!");
+            break;
+        }
+
+        let cmd_to_send = if trimmed.starts_with("toggle ")
+            || trimmed.starts_with("open ")
+            || trimmed == "close"
+            || trimmed == "reload"
+            || trimmed == "inspect"
+            || trimmed == "inspect:toggle"
+            || trimmed.starts_with("eval ")
+        {
+            trimmed.to_string()
+        } else {
+            format!("eval {}", trimmed)
+        };
+
+        let mut stream = match UnixStream::connect(&sock_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Lost connection to Zenith daemon: {}", e);
+                break;
+            }
+        };
+
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(format!("{}\n", cmd_to_send).as_bytes())?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        while let Ok(n) = reader.read_line(&mut response) {
+            if n == 0 { break; }
+        }
+
+        let trimmed_resp = response.trim();
+        if let Some(ok_res) = trimmed_resp.strip_prefix("OK: ") {
+            println!("{}", ok_res);
+        } else if let Some(err_res) = trimmed_resp.strip_prefix("ERR: ") {
+            eprintln!("Error: {}", err_res);
+        } else if !trimmed_resp.is_empty() {
+            println!("{}", trimmed_resp);
+        }
+    }
+
+    Ok(())
 }

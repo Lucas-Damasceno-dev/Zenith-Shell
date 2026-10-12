@@ -1,9 +1,23 @@
 //! Zenith Wayland - Protocol bindings and layer-shell integration.
+pub mod clipboard;
+pub mod egl;
+pub mod fractional_scale;
+pub mod gestures;
+pub mod headless;
+pub mod ime;
+pub mod monitor;
+pub mod render;
+
+pub use clipboard::ClipboardManager;
+pub use gestures::{GesturePhase, PinchGestureEvent, PointerGesturesManager, SwipeGestureEvent};
+pub use headless::HeadlessEngine;
+pub use ime::{compose_dead_key, keysym_to_dead_key};
+pub use monitor::{MonitorLifecycleManager, MonitorState, OutputMode};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
+    delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -23,13 +37,50 @@ use smithay_client_toolkit::{
         slot::SlotPool,
         Shm, ShmHandler,
     },
+    subcompositor::SubcompositorState,
 };
 use tracing::{error, info};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
+use wayland_protocols::wp::pointer_gestures::zv1::client::{
+    zwp_pointer_gesture_pinch_v1::{self, ZwpPointerGesturePinchV1},
+    zwp_pointer_gesture_swipe_v1::{self, ZwpPointerGestureSwipeV1},
+    zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
+};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
+
+impl Dispatch<WpCursorShapeManagerV1, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpCursorShapeManagerV1,
+        _event: <WpCursorShapeManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {}
+}
+
+impl Dispatch<WpCursorShapeDeviceV1, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpCursorShapeDeviceV1,
+        _event: <WpCursorShapeDeviceV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {}
+}
+
 use zenith_layout::{LayoutEngine, UiNode};
 use zenith_runtime::LuauRuntime;
 
@@ -85,6 +136,8 @@ pub struct PopupWindow {
     pub root_ui: UiNode,
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
     pub canvas_cache: Vec<u8>,
+    pub egl_surface: Option<crate::egl::EglSurface>,
+    pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
     pub spring: Option<zenith_core::SpringAnimation>,
     pub closing: bool,
 }
@@ -99,6 +152,8 @@ pub struct BarInstance {
     pub configured: bool,
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
     pub canvas_cache: Vec<u8>,
+    pub egl_surface: Option<crate::egl::EglSurface>,
+    pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
 }
 
 /// Main application state for Wayland event handling.
@@ -107,8 +162,12 @@ pub struct WaylandApp {
     pub output_state: OutputState,
     pub seat_state: SeatState,
     pub compositor_state: CompositorState,
+    pub subcompositor_state: SubcompositorState,
+    pub fractional_scale_mgr: crate::fractional_scale::FractionalScaleManager,
     pub shm: Shm,
     pub pool: SlotPool,
+    pub egl_context: Option<std::sync::Arc<crate::egl::EglContext>>,
+    pub gles_renderer: Option<crate::render::GlesRenderer>,
     pub layer_shell: LayerShell,
     pub bars: Vec<BarInstance>,
     pub bar_surface: Option<LayerSurface>,
@@ -138,7 +197,22 @@ pub struct WaylandApp {
     pub bar_script: String,
     pub font_system: cosmic_text::FontSystem,
     pub swash_cache: cosmic_text::SwashCache,
+    pub overlay_path_cache: std::collections::HashMap<String, std::path::PathBuf>,
     pub qh: QueueHandle<Self>,
+    pub inspect_mode: bool,
+    pub modifiers: Modifiers,
+    pub pointer_pressed: bool,
+    pub clipboard: std::sync::Arc<std::sync::Mutex<String>>,
+    pub clipboard_manager: ClipboardManager,
+    pub active_dead_key: Option<char>,
+    pub active_dragging_slider: Option<String>,
+    pub monitor_manager: MonitorLifecycleManager,
+    pub gestures_manager: PointerGesturesManager,
+    pub cursor_shape_mgr: Option<WpCursorShapeManagerV1>,
+    pub cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    pub last_pointer_enter_serial: Option<u32>,
+    pub current_cursor_shape: Option<Shape>,
+    pub tooltip_hover: Option<(String, std::time::Instant)>,
 }
 
 impl WaylandApp {
@@ -149,32 +223,79 @@ impl WaylandApp {
         let qh = event_queue.handle();
 
         let compositor_state = CompositorState::bind(&globals, &qh)?;
+        let subcompositor_state = SubcompositorState::bind(compositor_state.wl_compositor().clone(), &globals, &qh)?;
         let layer_shell = LayerShell::bind(&globals, &qh)?;
         let shm = Shm::bind(&globals, &qh)?;
         let pool = SlotPool::new(1920 * 600 * 4, &shm)?;
+
+        let mut fractional_scale_mgr = crate::fractional_scale::FractionalScaleManager::new();
+        if let Ok(mgr) = globals.bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ()) {
+            fractional_scale_mgr.manager = Some(mgr);
+        }
+        if let Ok(vp) = globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()) {
+            fractional_scale_mgr.viewporter = Some(vp);
+        }
 
         let seat_state = SeatState::new(&globals, &qh);
         let runtime = LuauRuntime::new()?;
         let root_ui = runtime.eval_ui(DEFAULT_LUAU_SCRIPT)?;
         let layout_engine = LayoutEngine::new();
 
+        let mut gestures_manager = PointerGesturesManager::new();
+        if let Ok(gestures) = globals.bind::<ZwpPointerGesturesV1, _, _>(&qh, 1..=3, ()) {
+            gestures_manager.gestures_global = Some(gestures);
+        }
+        let monitor_manager = MonitorLifecycleManager::new();
+
+        let mut cursor_shape_mgr = None;
+        if let Ok(mgr) = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()) {
+            cursor_shape_mgr = Some(mgr);
+        }
+
+        let (egl_context, gles_renderer) = unsafe {
+            let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
+            match crate::egl::EglContext::new(display_ptr) {
+                Ok(ctx) => {
+                    let ctx = std::sync::Arc::new(ctx);
+                    match crate::render::GlesRenderer::new(ctx.gl.clone()) {
+                        Ok(renderer) => {
+                            info!("Wayland EGL + OpenGL ES 3.0 hardware acceleration initialized successfully");
+                            (Some(ctx), Some(renderer))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to initialize GLES 3.0 renderer, falling back to SHM tiny-skia: {}", e);
+                            (None, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize Wayland EGL context, falling back to SHM tiny-skia: {}", e);
+                    (None, None)
+                }
+            }
+        };
+
         let mut app = Self {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
             seat_state,
             compositor_state,
+            subcompositor_state,
+            fractional_scale_mgr,
             shm,
             pool,
+            egl_context,
+            gles_renderer,
             layer_shell,
             bars: Vec::new(),
             bar_surface: None,
             popup: None,
             dock: None,
-            dock_autohide: true,
+            dock_autohide: false,
             dock_hovered: false,
             dock_hidden: false,
             dock_last_leave: None,
-            bar_autohide: true,
+            bar_autohide: false,
             bar_hovered: false,
             bar_hidden: false,
             bar_last_leave: None,
@@ -194,7 +315,22 @@ impl WaylandApp {
             bar_script: DEFAULT_LUAU_SCRIPT.to_string(),
             font_system: cosmic_text::FontSystem::new(),
             swash_cache: cosmic_text::SwashCache::new(),
+            overlay_path_cache: std::collections::HashMap::new(),
             qh: qh.clone(),
+            inspect_mode: false,
+            modifiers: Modifiers::default(),
+            pointer_pressed: false,
+            clipboard: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            clipboard_manager: ClipboardManager::new(),
+            active_dead_key: None,
+            active_dragging_slider: None,
+            monitor_manager,
+            gestures_manager,
+            cursor_shape_mgr,
+            cursor_shape_device: None,
+            last_pointer_enter_serial: None,
+            current_cursor_shape: None,
+            tooltip_hover: None,
         };
 
         app.create_bar(&qh)?;
@@ -236,6 +372,8 @@ impl WaylandApp {
         layer_surface.commit();
         info!("Layer surface created for zenith-bar on output '{}' (height={}, autohide={})", output_name, self.height, autohide);
 
+        let scale_tracker = Some(self.fractional_scale_mgr.attach_surface(&self.qh, layer_surface.wl_surface()));
+
         self.bars.push(BarInstance {
             output: output.cloned(),
             output_name: output_name.to_string(),
@@ -245,6 +383,8 @@ impl WaylandApp {
             configured: false,
             computed_boxes: Vec::new(),
             canvas_cache: Vec::new(),
+            egl_surface: None,
+            scale_tracker,
         });
 
         let _ = self.update_bar_visibility();
@@ -270,8 +410,38 @@ impl WaylandApp {
         }
     }
 
+    /// Polls completed background workers and triggers Promise resolution callbacks.
+    pub fn poll_async_tasks(&mut self) -> Result<usize, Box<dyn std::error::Error>> {
+        let count = self.runtime.poll_async_events()?;
+        Ok(count)
+    }
+
+    /// Evaluates arbitrary Luau code via the embedded runtime (used by REPL).
+    pub fn eval_code(&self, code: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let res = self.runtime.eval_code(code)?;
+        Ok(res)
+    }
+
+    /// Toggles or sets visual inspection mode (displaying Taffy bounding boxes & telemetry).
+    pub fn set_inspect_mode(&mut self, enabled: bool) {
+        self.inspect_mode = enabled;
+        if let Some(ref mut gles) = self.gles_renderer {
+            gles.inspect_mode = enabled;
+        }
+    }
+
     /// Requests an optimized redraw of the active bar and popup surfaces without reloading scripts from disk.
     pub fn request_redraw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        for bar in &self.bars {
+            bar.surface.wl_surface().frame(&self.qh, bar.surface.wl_surface().clone());
+        }
+        if let Some(ref popup) = self.popup {
+            popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
+        }
+        if let Some(ref dock) = self.dock {
+            dock.surface.wl_surface().frame(&self.qh, dock.surface.wl_surface().clone());
+        }
+
         let _ = self.update_bar_visibility();
         self.draw()?;
         if let Some(ref p) = self.popup {
@@ -288,11 +458,108 @@ impl WaylandApp {
         Ok(())
     }
 
-    /// Re-evaluates Luau script and updates the UI tree on hot-reload.
-    pub fn reload_script(&mut self, script: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// Sets the device cursor shape via wp_cursor_shape_v1.
+    pub fn set_cursor_shape(&mut self, shape: Shape) {
+        if self.current_cursor_shape == Some(shape) {
+            return;
+        }
+        if let (Some(ref dev), Some(serial)) = (&self.cursor_shape_device, self.last_pointer_enter_serial) {
+            dev.set_shape(serial, shape);
+            self.current_cursor_shape = Some(shape);
+        }
+    }
+
+    /// Checks if a pending tooltip hover has exceeded 400ms and activates the tooltip box.
+    pub fn check_tooltip_timer(&mut self) -> bool {
+        let mut activated = false;
+        if let Some((ref key, start)) = self.tooltip_hover {
+            if start.elapsed() >= std::time::Duration::from_millis(400) {
+                if let Some(ref mut popup) = self.popup {
+                    for b in &mut popup.computed_boxes {
+                        if b.tooltip.is_some() && key.starts_with("popup:") && key.contains(&format!("@{:.0},{:.0}", b.x, b.y)) {
+                            if !b.tooltip_active {
+                                b.tooltip_active = true;
+                                activated = true;
+                            }
+                        }
+                    }
+                }
+                if let Some(ref mut dock) = self.dock {
+                    for b in &mut dock.computed_boxes {
+                        if b.tooltip.is_some() && key.starts_with("dock:") && key.contains(&format!("@{:.0},{:.0}", b.x, b.y)) {
+                            if !b.tooltip_active {
+                                b.tooltip_active = true;
+                                activated = true;
+                            }
+                        }
+                    }
+                }
+                for bar in &mut self.bars {
+                    for b in &mut bar.computed_boxes {
+                        if b.tooltip.is_some() && key.starts_with(&format!("bar:{}", bar.output_name)) && key.contains(&format!("@{:.0},{:.0}", b.x, b.y)) {
+                            if !b.tooltip_active {
+                                b.tooltip_active = true;
+                                activated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if activated {
+            let _ = self.request_redraw();
+        }
+        activated
+    }
+
+    /// Reloads Luau active component trees after file modifications.
+    pub fn reload_active_trees(&mut self) {
         self.runtime.clear_module_cache();
+
+        // Reload bars
+        for bar in &self.bars {
+            let tree_id = format!("bar_{}", bar.output_name);
+            let _ = self.runtime.mount_tree(&tree_id, &self.bar_script);
+        }
+
+        // Reload open popup if active
+        if let Some(ref popup) = self.popup {
+            let popup_id = popup.id.clone();
+            if let Some(cached_path) = self.overlay_path_cache.get(&popup_id) {
+                if let Ok(new_content) = std::fs::read_to_string(cached_path) {
+                    if let Some(ref mut p) = self.popup {
+                        p.script = new_content;
+                    }
+                }
+            }
+            let _ = self.reload_popup(&popup_id);
+        }
+
+        // Reload dock if active
+        if self.dock.is_some() {
+            if let Some(cached_path) = self.overlay_path_cache.get("dock") {
+                if let Ok(new_content) = std::fs::read_to_string(cached_path) {
+                    if let Some(ref mut d) = self.dock {
+                        d.script = new_content;
+                    }
+                }
+            }
+            let _ = self.reload_dock();
+        }
+
+        let _ = self.request_redraw();
+    }
+
+    /// Re-evaluates Luau script and updates the UI tree on hot-reload.
+    /// Preserves the last rendered frame if syntax or evaluation error occurs (Error Boundary).
+    pub fn reload_script(&mut self, script: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Err(e) = self.runtime.eval_ui(script) {
+            eprintln!("[zenith] Hot-reload compilation error, preserving last frame: {e}");
+            return Ok(());
+        }
         self.bar_script = script.to_string();
-        self.request_redraw()
+        self.reload_active_trees();
+        Ok(())
     }
 
     /// Opens or switches to a popup window by overlay id.
@@ -312,53 +579,67 @@ impl WaylandApp {
             "dock" => ("Dock", Anchor::BOTTOM, 640, 68, 0, 0, 12, 0),
             "island" | "dynamicisland" => ("DynamicIsland", Anchor::TOP, 380, 52, 8, 0, 0, 0),
             "launcher" => ("Launcher", Anchor::TOP, 520, 620, 16, 0, 0, 0),
-            "media" | "mediapopup" => ("MediaPopup", Anchor::TOP, 360, 360, 8, 0, 0, 0),
-            "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 420, 600, 8, 14, 0, 0),
-            "audio" | "audiopopup" => ("AudioPopup", Anchor::TOP | Anchor::RIGHT, 360, 480, 8, 14, 0, 0),
-            "network" | "networkpopup" => ("NetworkPopup", Anchor::TOP | Anchor::RIGHT, 380, 500, 8, 14, 0, 0),
-            "bluetooth" | "bluetoothpopup" => ("BluetoothPopup", Anchor::TOP | Anchor::RIGHT, 380, 460, 8, 14, 0, 0),
-            "calendar" | "calendarpopup" => ("CalendarPopup", Anchor::TOP, 360, 360, 8, 0, 0, 0),
-            "power" | "powermenu" => ("PowerMenu", Anchor::TOP | Anchor::RIGHT, 300, 260, 8, 14, 0, 0),
+            "media" | "mediapopup" => ("MediaPopup", Anchor::TOP, 360, 360, 48, 0, 0, 0),
+            "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 420, 600, 48, 14, 0, 0),
+            "audio" | "audiopopup" => ("AudioPopup", Anchor::TOP | Anchor::RIGHT, 360, 480, 48, 14, 0, 0),
+            "network" | "networkpopup" => ("NetworkPopup", Anchor::TOP | Anchor::RIGHT, 380, 500, 48, 14, 0, 0),
+            "bluetooth" | "bluetoothpopup" => ("BluetoothPopup", Anchor::TOP | Anchor::RIGHT, 380, 460, 48, 14, 0, 0),
+            "battery" | "batterypopup" => ("BatteryPopup", Anchor::TOP | Anchor::RIGHT, 360, 400, 48, 14, 0, 0),
+            "calendar" | "calendarpopup" => ("CalendarPopup", Anchor::TOP, 360, 360, 48, 0, 0, 0),
+            "power" | "powermenu" => ("PowerMenu", Anchor::TOP | Anchor::RIGHT, 300, 260, 48, 14, 0, 0),
             "osd" => ("OSD", Anchor::TOP, 280, 110, 60, 0, 0, 0),
+            "controlcenter" => ("ControlCenter", Anchor::TOP | Anchor::RIGHT, 380, 700, 48, 14, 0, 0),
             "canvas" | "desktopcanvas" => ("DesktopCanvas", Anchor::TOP | Anchor::LEFT, 380, 340, 16, 0, 0, 24),
             "settings" | "settingsmenu" => ("Settings", Anchor::TOP, 760, 580, 16, 0, 0, 0),
             "lock" | "lockscreen" => ("LockScreen", Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT, 0, 0, 0, 0, 0, 0),
             _ => (id, Anchor::TOP | Anchor::RIGHT, 340, 380, 8, 14, 0, 0),
         };
 
-        let candidates = [
-            format!("config/zenith/overlays/{}.luau", script_name),
-            format!("config/zenith/overlays/{}.lua", script_name),
-            format!("config/zenith/overlays/{}Popup.luau", script_name),
-            format!("config/zenith/overlays/{}.luau", id),
-            format!("config/zenith/{}.luau", script_name.to_lowercase()),
-            format!("../../config/zenith/overlays/{}.luau", script_name),
-            format!("../../config/zenith/overlays/{}.luau", id),
-            format!("/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/{}.luau", script_name),
-            format!("/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/{}.luau", id),
-            format!("/home/lucas/.config/zenith/overlays/{}.luau", script_name),
-            format!("/home/lucas/.config/zenith/overlays/{}.luau", id),
-        ];
-
         let mut script_content = None;
-        for c in &candidates {
-            if let Ok(content) = std::fs::read_to_string(c) {
+        if let Some(cached_path) = self.overlay_path_cache.get(id) {
+            if let Ok(content) = std::fs::read_to_string(cached_path) {
                 script_content = Some(content);
-                break;
             }
         }
 
         if script_content.is_none() {
-            if let Ok(home) = std::env::var("HOME") {
-                let home_candidates = [
-                    format!("{}/.config/zenith/overlays/{}.luau", home, script_name),
-                    format!("{}/.config/zenith/overlays/{}.luau", home, id),
-                    format!("{}/.config/zenith/{}.luau", home, script_name.to_lowercase()),
-                ];
-                for c in &home_candidates {
-                    if let Ok(content) = std::fs::read_to_string(c) {
-                        script_content = Some(content);
-                        break;
+            let candidates = [
+                format!("config/zenith/overlays/{}.luau", script_name),
+                format!("config/zenith/overlays/{}.lua", script_name),
+                format!("config/zenith/overlays/{}Popup.luau", script_name),
+                format!("config/zenith/overlays/{}.luau", id),
+                format!("config/zenith/{}.luau", script_name.to_lowercase()),
+                format!("../../config/zenith/overlays/{}.luau", script_name),
+                format!("../../config/zenith/overlays/{}.luau", id),
+                format!("/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/{}.luau", script_name),
+                format!("/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/{}.luau", id),
+                format!("/home/lucas/.config/zenith/overlays/{}.luau", script_name),
+                format!("/home/lucas/.config/zenith/overlays/{}.luau", id),
+            ];
+
+            for c in &candidates {
+                let p = std::path::PathBuf::from(c);
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    self.overlay_path_cache.insert(id.to_string(), p);
+                    script_content = Some(content);
+                    break;
+                }
+            }
+
+            if script_content.is_none() {
+                if let Ok(home) = std::env::var("HOME") {
+                    let home_candidates = [
+                        format!("{}/.config/zenith/overlays/{}.luau", home, script_name),
+                        format!("{}/.config/zenith/overlays/{}.luau", home, id),
+                        format!("{}/.config/zenith/{}.luau", home, script_name.to_lowercase()),
+                    ];
+                    for c in &home_candidates {
+                        let p = std::path::PathBuf::from(c);
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            self.overlay_path_cache.insert(id.to_string(), p);
+                            script_content = Some(content);
+                            break;
+                        }
                     }
                 }
             }
@@ -382,8 +663,18 @@ impl WaylandApp {
 
         // Apply dynamic window metadata if defined in the Luau script
         let (mut anchor, mut margin_top, mut margin_right, mut margin_bottom, mut margin_left) = (anchor, margin_top, margin_right, margin_bottom, margin_left);
-        let mut layer_level = if is_lock { Layer::Overlay } else { Layer::Top };
-        let mut kb_mode = if is_lock { KeyboardInteractivity::Exclusive } else { KeyboardInteractivity::OnDemand };
+        let mut layer_level = Layer::Overlay;
+        let mut kb_mode = if is_lock {
+            KeyboardInteractivity::Exclusive
+        } else if id.eq_ignore_ascii_case("launcher")
+            || id.eq_ignore_ascii_case("controlcenter")
+            || id.eq_ignore_ascii_case("settings")
+            || id.eq_ignore_ascii_case("clipboard")
+        {
+            KeyboardInteractivity::OnDemand
+        } else {
+            KeyboardInteractivity::None
+        };
         let mut exclusive = if id.eq_ignore_ascii_case("dock") { 68 } else { 0 };
 
         if let Some(meta) = root_ui.window_meta() {
@@ -406,10 +697,10 @@ impl WaylandApp {
 
             if let Some(ref l) = meta.layer {
                 layer_level = match l.to_lowercase().as_str() {
-                    "overlay" => Layer::Overlay,
+                    "top" => Layer::Top,
                     "bottom" => Layer::Bottom,
                     "background" => Layer::Background,
-                    _ => Layer::Top,
+                    _ => Layer::Overlay,
                 };
             }
 
@@ -423,6 +714,12 @@ impl WaylandApp {
                     "none" => KeyboardInteractivity::None,
                     _ => KeyboardInteractivity::OnDemand,
                 };
+            } else if id.eq_ignore_ascii_case("launcher")
+                || id.eq_ignore_ascii_case("controlcenter")
+                || id.eq_ignore_ascii_case("settings")
+                || id.eq_ignore_ascii_case("clipboard")
+            {
+                kb_mode = KeyboardInteractivity::OnDemand;
             }
         }
 
@@ -469,8 +766,14 @@ impl WaylandApp {
         let spring = if is_lock {
             None
         } else {
-            Some(zenith_core::SpringAnimation::new(0.0, 1.0))
+            let mut anim = zenith_core::SpringAnimation::new(0.0, 1.0);
+            anim.config.stiffness = 580.0;
+            anim.config.damping = 36.0;
+            anim.config.precision = 0.005;
+            Some(anim)
         };
+
+        let scale_tracker = Some(self.fractional_scale_mgr.attach_surface(&self.qh, layer_surface.wl_surface()));
 
         self.popup = Some(PopupWindow {
             id: id.to_string(),
@@ -482,6 +785,8 @@ impl WaylandApp {
             root_ui,
             computed_boxes: Vec::new(),
             canvas_cache: Vec::new(),
+            egl_surface: None,
+            scale_tracker,
             spring,
             closing: false,
         });
@@ -499,6 +804,7 @@ impl WaylandApp {
         let root_ui = self.runtime.eval_ui(&script)?;
         if let Some(ref mut popup) = self.popup {
             popup.root_ui = root_ui;
+            popup.computed_boxes.clear();
             let _ = self.draw_popup();
         }
 
@@ -527,10 +833,14 @@ impl WaylandApp {
             popup.closing = true;
             if let Some(ref mut anim) = popup.spring {
                 anim.target = 0.0;
+                anim.config.stiffness = 700.0;
+                anim.config.damping = 40.0;
+                anim.config.precision = 0.01;
             } else {
                 let mut anim = zenith_core::SpringAnimation::new(1.0, 0.0);
-                anim.config.stiffness = 320.0;
-                anim.config.damping = 28.0;
+                anim.config.stiffness = 700.0;
+                anim.config.damping = 40.0;
+                anim.config.precision = 0.01;
                 popup.spring = Some(anim);
             }
             popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
@@ -560,7 +870,7 @@ impl WaylandApp {
                         b.get("autoHide").or_else(|| v.get("quick")?.get("barAutoHide")).and_then(|val| val.as_bool())
                     })
             })
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Evaluates whether the top bar should automatically hide based on overlapping windows.
@@ -591,11 +901,10 @@ impl WaylandApp {
             if c.fullscreen {
                 return true;
             }
-            if !c.floating {
-                return true;
-            }
-            // Floating window overlapping the bar area at top: y <= 44 + gaps
-            if c.at.1 <= 54 {
+            // Only hide if the window actually overlaps the top bar area (y <= 44 + gaps)
+            let win_top = c.at.1;
+            let win_bottom = c.at.1 + c.size.1;
+            if win_top < 50 && win_bottom > 0 {
                 return true;
             }
         }
@@ -614,8 +923,8 @@ impl WaylandApp {
                 self.bar_hidden = false;
                 for bar in &mut self.bars {
                     bar.computed_boxes.clear();
-                    bar.surface.set_size(0, 44);
-                    bar.surface.set_exclusive_zone(44);
+                    bar.surface.set_size(0, self.height);
+                    bar.surface.set_exclusive_zone(self.height as i32);
                     bar.surface.commit();
                     bar.surface.wl_surface().commit();
                 }
@@ -638,8 +947,8 @@ impl WaylandApp {
             self.bar_hidden = false;
             for bar in &mut self.bars {
                 bar.computed_boxes.clear();
-                bar.surface.set_size(0, 44);
-                bar.surface.set_exclusive_zone(44);
+                bar.surface.set_size(0, self.height);
+                bar.surface.set_exclusive_zone(self.height as i32);
                 bar.surface.commit();
                 bar.surface.wl_surface().commit();
             }
@@ -671,7 +980,7 @@ impl WaylandApp {
                         d.get("hoverToReveal").or_else(|| d.get("autoHide")).and_then(|b| b.as_bool())
                     })
             })
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Evaluates whether the dock should automatically hide based on overlapping windows.
@@ -701,11 +1010,9 @@ impl WaylandApp {
             if c.fullscreen {
                 return true;
             }
-            if !c.floating {
-                return true;
-            }
+            let win_top = c.at.1;
             let win_bottom = c.at.1 + c.size.1;
-            if win_bottom >= dock_top {
+            if win_bottom >= dock_top && win_top < self.screen_height as i32 {
                 return true;
             }
         }
@@ -818,6 +1125,8 @@ impl WaylandApp {
 
         info!("Created dock layer surface ({}x{}, autohide={})", width, height, autohide);
 
+        let scale_tracker = Some(self.fractional_scale_mgr.attach_surface(&self.qh, layer_surface.wl_surface()));
+
         self.dock = Some(PopupWindow {
             id: "dock".to_string(),
             script: content,
@@ -828,6 +1137,8 @@ impl WaylandApp {
             root_ui,
             computed_boxes: Vec::new(),
             canvas_cache: Vec::new(),
+            egl_surface: None,
+            scale_tracker,
             spring: None,
             closing: false,
         });
@@ -839,6 +1150,9 @@ impl WaylandApp {
 
     /// Renders the persistent dock layer surface into SHM buffer.
     pub fn draw_dock(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.monitor_manager.should_pause_rendering() {
+            return Ok(());
+        }
         let is_hidden = self.dock_hidden;
         let dock = match self.dock.as_mut() {
             Some(d) if d.configured => d,
@@ -898,36 +1212,111 @@ impl WaylandApp {
 
         dock.computed_boxes = new_boxes;
 
-        if dock.canvas_cache.len() != target_len {
-            dock.canvas_cache = vec![0u8; target_len];
-        } else {
-            dock.canvas_cache.fill(0);
+        let scale_factor = dock.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
+        let (phys_w, phys_h) = dock.scale_tracker.as_ref().map(|t| t.physical_size(width, height)).unwrap_or((width, height));
+        if let Some(ref tracker) = dock.scale_tracker {
+            tracker.apply_destination(width as i32, height as i32);
         }
 
-        Self::render_boxes_to_canvas(
-            &mut dock.canvas_cache,
-            &dock.computed_boxes,
-            width,
-            height,
-            1.0,
-            &mut self.font_system,
-            &mut self.swash_cache,
-        )?;
+        let render_boxes: Vec<zenith_layout::ComputedBox> = if (scale_factor - 1.0).abs() > 0.001 {
+            dock.computed_boxes.iter().map(|b| {
+                let mut scaled = b.clone();
+                scaled.x *= scale_factor;
+                scaled.y *= scale_factor;
+                scaled.width *= scale_factor;
+                scaled.height *= scale_factor;
+                scaled.border_width *= scale_factor;
+                scaled.border_radius *= scale_factor;
+                if let Some((ref txt, color, size)) = scaled.text {
+                    scaled.text = Some((txt.clone(), color, size * scale_factor));
+                }
+                if let Some(ref mut input) = scaled.text_input {
+                    input.font_size *= scale_factor;
+                }
+                if let Some(ref mut shadow) = scaled.shadow {
+                    shadow.blur *= scale_factor;
+                    shadow.offset_x *= scale_factor;
+                    shadow.offset_y *= scale_factor;
+                }
+                scaled
+            }).collect()
+        } else {
+            dock.computed_boxes.clone()
+        };
 
-        let (buffer, canvas) = self.pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride as i32,
-            wl_shm::Format::Argb8888,
-        )?;
+        let mut drawn_egl = false;
+        if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (&self.egl_context, &mut self.gles_renderer) {
+            if dock.egl_surface.is_none() {
+                if let Ok(egl_surf) = egl_ctx.create_surface(dock.surface.wl_surface(), phys_w, phys_h) {
+                    dock.egl_surface = Some(egl_surf);
+                }
+            }
 
-        let copy_len = canvas.len().min(dock.canvas_cache.len());
-        canvas[..copy_len].copy_from_slice(&dock.canvas_cache[..copy_len]);
+            if let Some(ref egl_surf) = dock.egl_surface {
+                if egl_ctx.make_current(egl_surf).is_ok() {
+                    let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
+                    let p_dx = ((dx as f32) * scale_factor).round() as i32;
+                    let p_dy = ((dy as f32) * scale_factor).round() as i32;
+                    let p_dw = ((dw as f32) * scale_factor).round() as i32;
+                    let p_dh = ((dh as f32) * scale_factor).round() as i32;
+                    let dmg_rect = Some(crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh));
 
-        buffer.attach_to(dock.surface.wl_surface())?;
-        let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
-        dock.surface.wl_surface().damage_buffer(dx, dy, dw, dh);
-        dock.surface.commit();
+                    if gles_rend.render_boxes(
+                        &render_boxes,
+                        phys_w,
+                        phys_h,
+                        1.0,
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                        dmg_rect,
+                    ).is_ok() {
+                        let _ = egl_surf.swap_buffers_with_damage(dmg_rect);
+                        dock.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
+                        dock.surface.commit();
+                        drawn_egl = true;
+                    }
+                }
+            }
+        }
+
+        if !drawn_egl {
+            let shm_target_len = (phys_w * phys_h * 4) as usize;
+            let shm_stride = phys_w * 4;
+            if dock.canvas_cache.len() != shm_target_len {
+                dock.canvas_cache = vec![0u8; shm_target_len];
+            } else {
+                dock.canvas_cache.fill(0);
+            }
+
+            Self::render_boxes_to_canvas(
+                &mut dock.canvas_cache,
+                &render_boxes,
+                phys_w,
+                phys_h,
+                1.0,
+                &mut self.font_system,
+                &mut self.swash_cache,
+            )?;
+
+            let (buffer, canvas) = self.pool.create_buffer(
+                phys_w as i32,
+                phys_h as i32,
+                shm_stride as i32,
+                wl_shm::Format::Argb8888,
+            )?;
+
+            let copy_len = canvas.len().min(dock.canvas_cache.len());
+            canvas[..copy_len].copy_from_slice(&dock.canvas_cache[..copy_len]);
+
+            buffer.attach_to(dock.surface.wl_surface())?;
+            let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
+            let p_dx = ((dx as f32) * scale_factor).round() as i32;
+            let p_dy = ((dy as f32) * scale_factor).round() as i32;
+            let p_dw = ((dw as f32) * scale_factor).round() as i32;
+            let p_dh = ((dh as f32) * scale_factor).round() as i32;
+            dock.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
+            dock.surface.commit();
+        }
 
         Ok(())
     }
@@ -1045,6 +1434,9 @@ impl WaylandApp {
 
     /// Draw the computed Luau layout into the SHM buffer for all active bar outputs.
     pub fn draw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.monitor_manager.should_pause_rendering() {
+            return Ok(());
+        }
         let is_hidden = self.bar_hidden;
         for bar in &mut self.bars {
             if !bar.configured {
@@ -1096,7 +1488,24 @@ impl WaylandApp {
             let screen_w = self.screen_width.max(1);
             let screen_h = self.screen_height.max(1);
             self.runtime.set_current_output_geometry(&bar.output_name, screen_w, screen_h);
-            let bar_ui = self.runtime.eval_ui(&self.bar_script).unwrap_or_else(|_| self.root_ui.clone());
+
+            let tree_id = format!("bar_{}", bar.output_name);
+            let is_dirty = self.runtime.is_tree_dirty(&tree_id);
+            if !is_dirty && !bar.computed_boxes.is_empty() {
+                continue;
+            }
+
+            let bar_ui = match self.runtime.get_tree(&tree_id) {
+                Some(node) => node,
+                None => match self.runtime.mount_tree(&tree_id, &self.bar_script) {
+                    Ok(mounted) => mounted,
+                    Err(e) => {
+                        eprintln!("[zenith] Failed to mount tree for {}: {e}", bar.output_name);
+                        self.root_ui.clone()
+                    }
+                },
+            };
+            self.runtime.mark_tree_clean(&tree_id);
 
             // Compute Taffy layout on the Luau tree
             let new_boxes = self.layout_engine.compute(&bar_ui, width as f32, height as f32);
@@ -1109,38 +1518,111 @@ impl WaylandApp {
 
             bar.computed_boxes = new_boxes;
 
-            if bar.canvas_cache.len() != target_len {
-                bar.canvas_cache = vec![0u8; target_len];
-            } else {
-                bar.canvas_cache.fill(0);
+            let scale_factor = bar.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
+            let (phys_w, phys_h) = bar.scale_tracker.as_ref().map(|t| t.physical_size(width, height)).unwrap_or((width, height));
+            if let Some(ref tracker) = bar.scale_tracker {
+                tracker.apply_destination(width as i32, height as i32);
             }
 
-            // Rasterize directly onto clean shadow buffer
-            Self::render_boxes_to_canvas(
-                &mut bar.canvas_cache,
-                &bar.computed_boxes,
-                width,
-                height,
-                1.0,
-                &mut self.font_system,
-                &mut self.swash_cache,
-            )?;
+            let render_boxes: Vec<zenith_layout::ComputedBox> = if (scale_factor - 1.0).abs() > 0.001 {
+                bar.computed_boxes.iter().map(|b| {
+                    let mut scaled = b.clone();
+                    scaled.x *= scale_factor;
+                    scaled.y *= scale_factor;
+                    scaled.width *= scale_factor;
+                    scaled.height *= scale_factor;
+                    scaled.border_width *= scale_factor;
+                    scaled.border_radius *= scale_factor;
+                    if let Some((ref txt, color, size)) = scaled.text {
+                        scaled.text = Some((txt.clone(), color, size * scale_factor));
+                    }
+                    if let Some(ref mut input) = scaled.text_input {
+                        input.font_size *= scale_factor;
+                    }
+                    if let Some(ref mut shadow) = scaled.shadow {
+                        shadow.blur *= scale_factor;
+                        shadow.offset_x *= scale_factor;
+                        shadow.offset_y *= scale_factor;
+                    }
+                    scaled
+                }).collect()
+            } else {
+                bar.computed_boxes.clone()
+            };
 
-            let (buffer, canvas) = self.pool.create_buffer(
-                width as i32,
-                height as i32,
-                stride as i32,
-                wl_shm::Format::Argb8888,
-            )?;
+            let mut drawn_egl = false;
+            if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (&self.egl_context, &mut self.gles_renderer) {
+                if bar.egl_surface.is_none() {
+                    if let Ok(egl_surf) = egl_ctx.create_surface(bar.surface.wl_surface(), phys_w, phys_h) {
+                        bar.egl_surface = Some(egl_surf);
+                    }
+                }
 
-            // Blit persistent cache to SHM buffer in ~5 microseconds
-            let copy_len = canvas.len().min(bar.canvas_cache.len());
-            canvas[..copy_len].copy_from_slice(&bar.canvas_cache[..copy_len]);
+                if let Some(ref egl_surf) = bar.egl_surface {
+                    if egl_ctx.make_current(egl_surf).is_ok() {
+                        let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
+                        let p_dx = ((dx as f32) * scale_factor).round() as i32;
+                        let p_dy = ((dy as f32) * scale_factor).round() as i32;
+                        let p_dw = ((dw as f32) * scale_factor).round() as i32;
+                        let p_dh = ((dh as f32) * scale_factor).round() as i32;
+                        let dmg_rect = Some(crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh));
 
-            buffer.attach_to(bar.surface.wl_surface())?;
-            let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
-            bar.surface.wl_surface().damage_buffer(dx, dy, dw, dh);
-            bar.surface.commit();
+                        if gles_rend.render_boxes(
+                            &render_boxes,
+                            phys_w,
+                            phys_h,
+                            1.0,
+                            &mut self.font_system,
+                            &mut self.swash_cache,
+                            dmg_rect,
+                        ).is_ok() {
+                            let _ = egl_surf.swap_buffers_with_damage(dmg_rect);
+                            bar.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
+                            bar.surface.commit();
+                            drawn_egl = true;
+                        }
+                    }
+                }
+            }
+
+            if !drawn_egl {
+                let shm_target_len = (phys_w * phys_h * 4) as usize;
+                let shm_stride = phys_w * 4;
+                if bar.canvas_cache.len() != shm_target_len {
+                    bar.canvas_cache = vec![0u8; shm_target_len];
+                } else {
+                    bar.canvas_cache.fill(0);
+                }
+
+                Self::render_boxes_to_canvas(
+                    &mut bar.canvas_cache,
+                    &render_boxes,
+                    phys_w,
+                    phys_h,
+                    1.0,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                )?;
+
+                let (buffer, canvas) = self.pool.create_buffer(
+                    phys_w as i32,
+                    phys_h as i32,
+                    shm_stride as i32,
+                    wl_shm::Format::Argb8888,
+                )?;
+
+                let copy_len = canvas.len().min(bar.canvas_cache.len());
+                canvas[..copy_len].copy_from_slice(&bar.canvas_cache[..copy_len]);
+
+                buffer.attach_to(bar.surface.wl_surface())?;
+                let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
+                let p_dx = ((dx as f32) * scale_factor).round() as i32;
+                let p_dy = ((dy as f32) * scale_factor).round() as i32;
+                let p_dw = ((dw as f32) * scale_factor).round() as i32;
+                let p_dh = ((dh as f32) * scale_factor).round() as i32;
+                bar.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
+                bar.surface.commit();
+            }
         }
 
         Ok(())
@@ -1148,6 +1630,9 @@ impl WaylandApp {
 
     /// Draw the computed Luau layout for the open popup into the SHM buffer.
     pub fn draw_popup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.monitor_manager.should_pause_rendering() {
+            return Ok(());
+        }
         let popup = match self.popup.as_mut() {
             Some(p) if p.configured => p,
             _ => return Ok(()),
@@ -1155,8 +1640,6 @@ impl WaylandApp {
 
         let width = popup.width.max(1);
         let height = popup.height.max(1);
-        let stride = width * 4;
-        let target_len = (width * height * 4) as usize;
 
         let (spring_val, is_animating) = if let Some(ref s) = popup.spring {
             (s.current, !s.is_settled())
@@ -1164,12 +1647,16 @@ impl WaylandApp {
             (1.0, false)
         };
 
-        if popup.closing && (spring_val <= 0.02 || !is_animating) {
+        if popup.closing && (spring_val <= 0.04 || !is_animating) {
             self.popup = None;
             return Ok(());
         }
 
-        let new_boxes = self.layout_engine.compute(&popup.root_ui, width as f32, height as f32);
+        let new_boxes = if is_animating && !popup.computed_boxes.is_empty() {
+            popup.computed_boxes.clone()
+        } else {
+            self.layout_engine.compute(&popup.root_ui, width as f32, height as f32)
+        };
         let damage = if is_animating {
             Some((0, 0, width as i32, height as i32))
         } else {
@@ -1183,38 +1670,114 @@ impl WaylandApp {
 
         popup.computed_boxes = new_boxes;
 
-        if popup.canvas_cache.len() != target_len {
-            popup.canvas_cache = vec![0u8; target_len];
+        let scale_factor = popup.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
+        let (phys_w, phys_h) = popup.scale_tracker.as_ref().map(|t| t.physical_size(width, height)).unwrap_or((width, height));
+        if let Some(ref tracker) = popup.scale_tracker {
+            tracker.apply_destination(width as i32, height as i32);
+        }
+
+        let render_boxes: Vec<zenith_layout::ComputedBox> = if (scale_factor - 1.0).abs() > 0.001 {
+            popup.computed_boxes.iter().map(|b| {
+                let mut scaled = b.clone();
+                scaled.x *= scale_factor;
+                scaled.y *= scale_factor;
+                scaled.width *= scale_factor;
+                scaled.height *= scale_factor;
+                scaled.border_width *= scale_factor;
+                scaled.border_radius *= scale_factor;
+                if let Some((ref txt, color, size)) = scaled.text {
+                    scaled.text = Some((txt.clone(), color, size * scale_factor));
+                }
+                if let Some(ref mut input) = scaled.text_input {
+                    input.font_size *= scale_factor;
+                }
+                if let Some(ref mut shadow) = scaled.shadow {
+                    shadow.blur *= scale_factor;
+                    shadow.offset_x *= scale_factor;
+                    shadow.offset_y *= scale_factor;
+                }
+                scaled
+            }).collect()
         } else {
-            popup.canvas_cache.fill(0);
+            popup.computed_boxes.clone()
+        };
+
+        let mut drawn_egl = false;
+        if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (&self.egl_context, &mut self.gles_renderer) {
+            if popup.egl_surface.is_none() {
+                if let Ok(egl_surf) = egl_ctx.create_surface(popup.surface.wl_surface(), phys_w, phys_h) {
+                    popup.egl_surface = Some(egl_surf);
+                }
+            }
+
+            if let Some(ref egl_surf) = popup.egl_surface {
+                if egl_ctx.make_current(egl_surf).is_ok() {
+                    let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, width as i32, height as i32));
+                    let p_dx = ((dx as f32) * scale_factor).round() as i32;
+                    let p_dy = ((dy as f32) * scale_factor).round() as i32;
+                    let p_dw = ((dw as f32) * scale_factor).round() as i32;
+                    let p_dh = ((dh as f32) * scale_factor).round() as i32;
+                    let dmg_rect = Some(crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh));
+
+                    if gles_rend.render_boxes(
+                        &render_boxes,
+                        phys_w,
+                        phys_h,
+                        spring_val,
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                        dmg_rect,
+                    ).is_ok() {
+                        let _ = egl_surf.swap_buffers_with_damage(dmg_rect);
+                        if is_animating {
+                            popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
+                        }
+                        popup.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
+                        popup.surface.commit();
+                        drawn_egl = true;
+                    }
+                }
+            }
         }
 
-        Self::render_boxes_to_canvas(
-            &mut popup.canvas_cache,
-            &popup.computed_boxes,
-            width,
-            height,
-            spring_val,
-            &mut self.font_system,
-            &mut self.swash_cache,
-        )?;
+        if !drawn_egl {
+            let shm_target_len = (phys_w * phys_h * 4) as usize;
+            let shm_stride = phys_w * 4;
+            if popup.canvas_cache.len() != shm_target_len {
+                popup.canvas_cache = vec![0u8; shm_target_len];
+            } else {
+                popup.canvas_cache.fill(0);
+            }
 
-        let (buffer, canvas) = self.pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride as i32,
-            wl_shm::Format::Argb8888,
-        )?;
+            Self::render_boxes_to_canvas(
+                &mut popup.canvas_cache,
+                &render_boxes,
+                phys_w,
+                phys_h,
+                spring_val,
+                &mut self.font_system,
+                &mut self.swash_cache,
+            )?;
 
-        let copy_len = canvas.len().min(popup.canvas_cache.len());
-        canvas[..copy_len].copy_from_slice(&popup.canvas_cache[..copy_len]);
+            let (buffer, canvas) = self.pool.create_buffer(
+                phys_w as i32,
+                phys_h as i32,
+                shm_stride as i32,
+                wl_shm::Format::Argb8888,
+            )?;
 
-        buffer.attach_to(popup.surface.wl_surface())?;
-        if is_animating {
-            popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
+            let copy_len = canvas.len().min(popup.canvas_cache.len());
+            canvas[..copy_len].copy_from_slice(&popup.canvas_cache[..copy_len]);
+
+            buffer.attach_to(popup.surface.wl_surface())?;
+            if is_animating {
+                popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
+            }
+            let p_dw = ((width as f32) * scale_factor).round() as i32;
+            let p_dh = ((height as f32) * scale_factor).round() as i32;
+            popup.surface.wl_surface().damage_buffer(0, 0, p_dw, p_dh);
+            popup.surface.commit();
         }
-        popup.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-        popup.surface.commit();
 
         Ok(())
     }
@@ -1290,264 +1853,35 @@ impl WaylandApp {
         font_system: &mut cosmic_text::FontSystem,
         swash_cache: &mut cosmic_text::SwashCache,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let alpha_factor = spring_val.clamp(0.0, 1.0);
-        let scale_y = (0.88 + 0.12 * spring_val.clamp(0.0, 1.15)).max(0.0);
-        let scale_x = (0.95 + 0.05 * spring_val.clamp(0.0, 1.15)).max(0.0);
+        crate::render::ShmFallbackRenderer::render_boxes(
+            canvas,
+            boxes,
+            width,
+            height,
+            spring_val,
+            font_system,
+            swash_cache,
+        )
+    }
 
-        let root_max_y = if !boxes.is_empty() {
-            boxes[0].y + boxes[0].height
-        } else {
-            height as f32
-        };
-
-        // Pass 1: Vector painting via tiny-skia on top of SHM canvas
-        {
-            let mut pixmap = tiny_skia::PixmapMut::from_bytes(canvas, width, height)
-                .ok_or("Failed to wrap SHM canvas with tiny-skia PixmapMut")?;
-
-            for (i, b) in boxes.iter().enumerate() {
-                if b.width <= 0.0 || b.height <= 0.0 {
-                    continue;
-                }
-
-                if i > 0 && b.y >= root_max_y - 2.0 {
-                    continue;
-                }
-
-                let cx = b.x + b.width * 0.5;
-                let cy = b.y;
-                let box_w = b.width * scale_x;
-                let mut box_h = b.height * scale_y;
-                if i > 0 && cy + box_h > root_max_y {
-                    box_h = (root_max_y - cy).max(0.0);
-                    if box_h <= 1.0 {
-                        continue;
-                    }
-                }
-                let box_x = cx - box_w * 0.5;
-                let box_y = cy;
-
-                // Render multi-pass soft vector drop shadow if configured
-                if let Some(ref shadow) = b.shadow {
-                    if shadow.color.a > 0 && shadow.blur > 0.0 {
-                        let steps = ((shadow.blur / 2.0).ceil() as usize).clamp(2, 5);
-                        let base_alpha = shadow.color.a as f32 / (steps as f32 * 1.5);
-                        for i in 1..=steps {
-                            let spread = (i as f32 / steps as f32) * shadow.blur;
-                            let sx = box_x + shadow.offset_x - spread * 0.5;
-                            let sy = box_y + shadow.offset_y - spread * 0.5;
-                            let sw = box_w + spread;
-                            let sh = box_h + spread;
-                            let sr = (b.border_radius + spread * 0.5).max(0.0);
-                            if let Some(spath) = Self::build_rounded_rect_path(sx, sy, sw, sh, sr) {
-                                let mut spaint = tiny_skia::Paint {
-                                    anti_alias: true,
-                                    ..Default::default()
-                                };
-                                let step_alpha = ((base_alpha * (1.0 - (i as f32 - 1.0) / steps as f32)).clamp(1.0, 255.0) * alpha_factor) as u8;
-                                spaint.set_color_rgba8(shadow.color.r, shadow.color.g, shadow.color.b, step_alpha);
-                                pixmap.fill_path(
-                                    &spath,
-                                    &spaint,
-                                    tiny_skia::FillRule::Winding,
-                                    tiny_skia::Transform::identity(),
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                }
-
-                let path = match Self::build_rounded_rect_path(box_x, box_y, box_w, box_h, b.border_radius) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                    // Fill background with anti-aliasing
-                    if b.background_color.a > 0 {
-                        let mut fill_paint = tiny_skia::Paint {
-                            anti_alias: true,
-                            ..Default::default()
-                        };
-                        fill_paint.set_color_rgba8(
-                            b.background_color.r,
-                            b.background_color.g,
-                            b.background_color.b,
-                            (b.background_color.a as f32 * alpha_factor) as u8,
-                        );
-                        pixmap.fill_path(
-                            &path,
-                            &fill_paint,
-                            tiny_skia::FillRule::Winding,
-                            tiny_skia::Transform::identity(),
-                            None,
-                        );
-                    }
-
-                    // Stroke border with anti-aliasing
-                    if b.border_width > 0.0 && b.border_color.a > 0 {
-                        let mut stroke_paint = tiny_skia::Paint {
-                            anti_alias: true,
-                            ..Default::default()
-                        };
-                        stroke_paint.set_color_rgba8(
-                            b.border_color.r,
-                            b.border_color.g,
-                            b.border_color.b,
-                            (b.border_color.a as f32 * alpha_factor) as u8,
-                        );
-
-                        let stroke = tiny_skia::Stroke {
-                            width: b.border_width,
-                            ..Default::default()
-                        };
-
-                        pixmap.stroke_path(
-                            &path,
-                            &stroke_paint,
-                            &stroke,
-                            tiny_skia::Transform::identity(),
-                            None,
-                        );
-                    }
-
-                    // Blit raster (PNG) or vector (SVG) image via ImageService
-                    if let Some(ref src) = b.image {
-                        let target_w = (box_w.round() as u32).max(1);
-                        let target_h = (box_h.round() as u32).max(1);
-                        if let Ok(decoded) = zenith_services::ImageService::load_image(src, Some(target_w), Some(target_h)) {
-                            if let Some(src_pixmap) = tiny_skia::PixmapRef::from_bytes(&decoded.rgba, decoded.width, decoded.height) {
-                                let scale_img_x = box_w / decoded.width as f32;
-                                let scale_img_y = box_h / decoded.height as f32;
-                                let transform = tiny_skia::Transform::from_translate(box_x, box_y)
-                                    .pre_scale(scale_img_x, scale_img_y);
-                                let paint = tiny_skia::PixmapPaint {
-                                    opacity: alpha_factor,
-                                    blend_mode: tiny_skia::BlendMode::SourceOver,
-                                    quality: tiny_skia::FilterQuality::Bilinear,
-                                };
-                                pixmap.draw_pixmap(0, 0, src_pixmap, &paint, transform, None);
-                            }
-                        }
-                    }
-
-                    // For TextInput, draw active focus outline if focused
-                    if let Some(ref input) = b.text_input {
-                        if input.active {
-                            let mut focus_paint = tiny_skia::Paint {
-                                anti_alias: true,
-                                ..Default::default()
-                            };
-                            focus_paint.set_color_rgba8(124, 77, 255, (220.0 * alpha_factor) as u8);
-                            let focus_stroke = tiny_skia::Stroke {
-                                width: 2.0,
-                                ..Default::default()
-                            };
-                            pixmap.stroke_path(&path, &focus_paint, &focus_stroke, tiny_skia::Transform::identity(), None);
-                        }
-                    }
-                }
-            } // pixmap borrow of canvas is dropped here
-
-        // Pass 2: Draw shaped glyphs with cosmic-text onto the anti-aliased canvas
-        for b in boxes {
-            if b.y >= root_max_y - 2.0 {
-                continue;
-            }
-
-            let text_to_draw = if let Some((ref text, color, font_size)) = b.text {
-                Some((text.clone(), color, font_size))
-            } else if let Some(ref input) = b.text_input {
-                let (txt, col) = if input.text.is_empty() {
-                    (input.placeholder.clone(), input.placeholder_color)
-                } else if input.active {
-                    (format!("{}|", input.text), input.color)
-                } else {
-                    (input.text.clone(), input.color)
-                };
-                Some((txt, col, input.font_size))
-            } else {
-                None
-            };
-
-            if let Some((text, color, font_size)) = text_to_draw {
-                let line_height = font_size * 1.3;
-                let metrics = cosmic_text::Metrics::new(font_size, line_height);
-                let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
-                let is_complex = text.chars().any(|c| c as u32 > 0x0600);
-                let shaping = if is_complex { cosmic_text::Shaping::Advanced } else { cosmic_text::Shaping::Basic };
-                buffer.set_text(
-                    &text,
-                    &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
-                    shaping,
-                    None,
-                );
-
-                buffer.shape_until_scroll(font_system, false);
-
-                let cosmic_color = cosmic_text::Color::rgba(
-                    color.r,
-                    color.g,
-                    color.b,
-                    (color.a as f32 * alpha_factor) as u8,
-                );
-                let cx = b.x + b.width * 0.5;
-                let cy = b.y;
-                let box_w = b.width * scale_x;
-                let box_h = b.height * scale_y;
-                let box_x = cx - box_w * 0.5;
-                let box_y = cy;
-
-                let bx = box_x as i32;
-                // Center text vertically inside its computed bounding box
-                let text_offset_y = ((box_h - line_height) / 2.0).max(0.0) as i32;
-                let by = box_y as i32 + text_offset_y;
-
-                buffer.draw(
-                    font_system,
-                    swash_cache,
-                    cosmic_color,
-                    |gx, gy, _gw, _gh, glyph_color| {
-                        let px = bx + gx;
-                        let py = by + gy;
-                        if px >= 0 && px < width as i32 && py >= 0 && (py as f32) < root_max_y {
-                            let idx = (py as usize * width as usize + px as usize) * 4;
-                            let alpha = glyph_color.a() as u32;
-                            if alpha > 0 && idx + 3 < canvas.len() {
-                                let bg_b = canvas[idx] as u32;
-                                let bg_g = canvas[idx + 1] as u32;
-                                let bg_r = canvas[idx + 2] as u32;
-                                let bg_a = canvas[idx + 3] as u32;
-
-                                let fg_b = glyph_color.b() as u32;
-                                let fg_g = glyph_color.g() as u32;
-                                let fg_r = glyph_color.r() as u32;
-                                let inv_a = 255 - alpha;
-
-                                // Fast alpha blending without CPU division: (val * 257 + 257) >> 16
-                                let out_r = ((fg_r * alpha + bg_r * inv_a + 128) * 257 >> 16) as u8;
-                                let out_g = ((fg_g * alpha + bg_g * inv_a + 128) * 257 >> 16) as u8;
-                                let out_b = ((fg_b * alpha + bg_b * inv_a + 128) * 257 >> 16) as u8;
-                                let out_a = ((alpha * 255 + bg_a * inv_a + 128) * 257 >> 16) as u8;
-
-                                canvas[idx] = out_b;
-                                canvas[idx + 1] = out_g;
-                                canvas[idx + 2] = out_r;
-                                canvas[idx + 3] = out_a;
-                            }
-                        }
-                    },
-                );
-            }
-        }
-
-        Ok(())
+    /// Creates a Wayland subsurface attached to a parent surface at the given coordinates.
+    pub fn create_subsurface(
+        &mut self,
+        parent: &wl_surface::WlSurface,
+        x: i32,
+        y: i32,
+    ) -> (wayland_client::protocol::wl_subsurface::WlSubsurface, wl_surface::WlSurface) {
+        let (subsurface, surface) = self.subcompositor_state.create_subsurface(parent.clone(), &self.qh);
+        subsurface.set_position(x, y);
+        subsurface.set_desync();
+        (subsurface, surface)
     }
 
 }
 
 // SCTK Delegate implementations
 delegate_compositor!(WaylandApp);
+delegate_subcompositor!(WaylandApp);
 delegate_output!(WaylandApp);
 delegate_shm!(WaylandApp);
 delegate_layer!(WaylandApp);
@@ -1555,6 +1889,178 @@ delegate_seat!(WaylandApp);
 delegate_pointer!(WaylandApp);
 delegate_keyboard!(WaylandApp);
 delegate_registry!(WaylandApp);
+
+impl AsMut<SubcompositorState> for WaylandApp {
+    fn as_mut(&mut self) -> &mut SubcompositorState {
+        &mut self.subcompositor_state
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, crate::fractional_scale::SurfaceData> for WaylandApp {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: <WpFractionalScaleV1 as Proxy>::Event,
+        data: &crate::fractional_scale::SurfaceData,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::Event::PreferredScale { scale } => {
+                let factor = scale as f32 / 120.0;
+                let surf_id = data.surface_id;
+                for bar in &mut state.bars {
+                    if let Some(ref mut tracker) = bar.scale_tracker {
+                        if tracker.surface_id == surf_id {
+                            tracker.scale_factor = factor;
+                            info!("Bar on output '{}' fractional scale updated to {:.2}x", bar.output_name, factor);
+                        }
+                    }
+                }
+                if let Some(ref mut popup) = state.popup {
+                    if let Some(ref mut tracker) = popup.scale_tracker {
+                        if tracker.surface_id == surf_id {
+                            tracker.scale_factor = factor;
+                            info!("Popup '{}' fractional scale updated to {:.2}x", popup.id, factor);
+                        }
+                    }
+                }
+                if let Some(ref mut dock) = state.dock {
+                    if let Some(ref mut tracker) = dock.scale_tracker {
+                        if tracker.surface_id == surf_id {
+                            tracker.scale_factor = factor;
+                            info!("Dock fractional scale updated to {:.2}x", factor);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: <WpViewporter as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewport, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: <WpViewport as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpPointerGesturesV1, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpPointerGesturesV1,
+        _event: <ZwpPointerGesturesV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpPointerGestureSwipeV1, ()> for WaylandApp {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpPointerGestureSwipeV1,
+        event: <ZwpPointerGestureSwipeV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_pointer_gesture_swipe_v1::Event::Begin { fingers, .. } => {
+                state.gestures_manager.active_swipe = Some(crate::gestures::SwipeGestureEvent {
+                    fingers,
+                    dx: 0.0,
+                    dy: 0.0,
+                    phase: crate::gestures::GesturePhase::Begin,
+                });
+            }
+            zwp_pointer_gesture_swipe_v1::Event::Update { dx, dy, .. } => {
+                let fingers = state.gestures_manager.active_swipe.as_ref().map(|s| s.fingers).unwrap_or(2);
+                let _evt = state.gestures_manager.handle_swipe_update(fingers, dx, dy);
+                if let Some(ref mut popup) = state.popup {
+                    for b in &mut popup.computed_boxes {
+                        if b.overflow == zenith_layout::Overflow::Scroll {
+                            b.scroll_offset_y = state.gestures_manager.kinetic_scroll.offset();
+                        }
+                    }
+                }
+                let _ = state.request_redraw();
+            }
+            zwp_pointer_gesture_swipe_v1::Event::End { cancelled, .. } => {
+                let _evt = state.gestures_manager.handle_swipe_end(cancelled != 0);
+                let _ = state.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpPointerGesturePinchV1, ()> for WaylandApp {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpPointerGesturePinchV1,
+        event: <ZwpPointerGesturePinchV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_pointer_gesture_pinch_v1::Event::Begin { fingers, .. } => {
+                state.gestures_manager.active_pinch = Some(crate::gestures::PinchGestureEvent {
+                    fingers,
+                    dx: 0.0,
+                    dy: 0.0,
+                    scale: 1.0,
+                    rotation: 0.0,
+                    phase: crate::gestures::GesturePhase::Begin,
+                });
+            }
+            zwp_pointer_gesture_pinch_v1::Event::Update { dx, dy, scale, rotation, .. } => {
+                let fingers = state.gestures_manager.active_pinch.as_ref().map(|p| p.fingers).unwrap_or(2);
+                let evt = state.gestures_manager.handle_pinch_update(fingers, dx, dy, scale, rotation);
+                let payload = format!("{{\"scale\":{},\"rotation\":{},\"dx\":{},\"dy\":{}}}", evt.scale, evt.rotation, evt.dx, evt.dy);
+                let _ = state.runtime.trigger_callback_with_arg("on_pinch_gesture", &payload);
+                let _ = state.request_redraw();
+            }
+            zwp_pointer_gesture_pinch_v1::Event::End { .. } => {
+                state.gestures_manager.active_pinch = None;
+                let _ = state.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
 
 impl ProvidesRegistryState for WaylandApp {
     fn registry(&mut self) -> &mut RegistryState {
@@ -1572,6 +2078,18 @@ impl SeatHandler for WaylandApp {
         if self.pointer.is_none() {
             if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
                 info!("Acquired Wayland pointer from seat");
+                if let Some(ref gestures) = self.gestures_manager.gestures_global {
+                    if self.gestures_manager.swipe_gesture.is_none() {
+                        self.gestures_manager.swipe_gesture = Some(gestures.get_swipe_gesture(&ptr, qh, ()));
+                    }
+                    if self.gestures_manager.pinch_gesture.is_none() {
+                        self.gestures_manager.pinch_gesture = Some(gestures.get_pinch_gesture(&ptr, qh, ()));
+                    }
+                }
+                if let Some(ref mgr) = self.cursor_shape_mgr {
+                    let dev = mgr.get_pointer(&ptr, qh, ());
+                    self.cursor_shape_device = Some(dev);
+                }
                 self.pointer = Some(ptr);
             }
         }
@@ -1593,6 +2111,18 @@ impl SeatHandler for WaylandApp {
         if capability == Capability::Pointer && self.pointer.is_none() {
             if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
                 info!("Acquired Wayland pointer on capability");
+                if let Some(ref gestures) = self.gestures_manager.gestures_global {
+                    if self.gestures_manager.swipe_gesture.is_none() {
+                        self.gestures_manager.swipe_gesture = Some(gestures.get_swipe_gesture(&ptr, qh, ()));
+                    }
+                    if self.gestures_manager.pinch_gesture.is_none() {
+                        self.gestures_manager.pinch_gesture = Some(gestures.get_pinch_gesture(&ptr, qh, ()));
+                    }
+                }
+                if let Some(ref mgr) = self.cursor_shape_mgr {
+                    let dev = mgr.get_pointer(&ptr, qh, ());
+                    self.cursor_shape_device = Some(dev);
+                }
                 self.pointer = Some(ptr);
             }
         }
@@ -1613,6 +2143,9 @@ impl SeatHandler for WaylandApp {
     ) {
         if capability == Capability::Pointer {
             self.pointer = None;
+            self.cursor_shape_device = None;
+            self.gestures_manager.swipe_gesture = None;
+            self.gestures_manager.pinch_gesture = None;
         }
         if capability == Capability::Keyboard {
             self.keyboard = None;
@@ -1626,6 +2159,7 @@ impl SeatHandler for WaylandApp {
         _seat: wayland_client::protocol::wl_seat::WlSeat,
     ) {
         self.pointer = None;
+        self.cursor_shape_device = None;
         self.keyboard = None;
     }
 }
@@ -1641,8 +2175,15 @@ impl PointerHandler for WaylandApp {
         for event in events {
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    if let PointerEventKind::Enter { serial } = event.kind {
+                        self.last_pointer_enter_serial = Some(serial);
+                        self.current_cursor_shape = None;
+                    }
                     self.pointer_pos = event.position;
                     let is_dock = self.dock.as_ref().map_or(false, |d| event.surface == *d.surface.wl_surface());
+                    let is_popup = self.popup.as_ref().map_or(false, |p| event.surface == *p.surface.wl_surface());
+                    let is_bar = self.bars.iter().any(|b| event.surface == *b.surface.wl_surface());
+
                     if is_dock {
                         self.dock_hovered = true;
                         self.dock_last_leave = None;
@@ -1650,7 +2191,6 @@ impl PointerHandler for WaylandApp {
                             let _ = self.update_dock_visibility();
                         }
                     }
-                    let is_bar = self.bars.iter().any(|b| event.surface == *b.surface.wl_surface());
                     if is_bar {
                         self.bar_hovered = true;
                         self.bar_last_leave = None;
@@ -1658,8 +2198,250 @@ impl PointerHandler for WaylandApp {
                             let _ = self.update_bar_visibility();
                         }
                     }
+
+                    // 1. Dynamic Cursor Shape (wp_cursor_shape_v1) & Tooltip Hover Detection
+                    let (px, py) = self.pointer_pos;
+                    let mut desired_shape = Shape::Default;
+                    let mut hovered_box_key: Option<String> = None;
+
+                    if is_popup {
+                        if let Some(ref popup) = self.popup {
+                            for b in popup.computed_boxes.iter().rev() {
+                                if px >= b.x as f64 && px <= (b.x + b.width) as f64 && py >= b.y as f64 && py <= (b.y + b.height) as f64 {
+                                    if desired_shape == Shape::Default {
+                                        if let Some(ref inp) = b.text_input {
+                                            if inp.active {
+                                                desired_shape = Shape::Text;
+                                            }
+                                        } else if b.on_click.is_some() || b.slider.is_some() || b.switch.is_some() {
+                                            desired_shape = Shape::Pointer;
+                                        }
+                                    }
+                                    if hovered_box_key.is_none() && b.tooltip.is_some() {
+                                        hovered_box_key = Some(format!("popup:{}@{:.0},{:.0}", b.tooltip.as_ref().unwrap(), b.x, b.y));
+                                    }
+                                    if desired_shape != Shape::Default && hovered_box_key.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else if is_dock {
+                        if let Some(ref dock) = self.dock {
+                            for b in dock.computed_boxes.iter().rev() {
+                                if px >= b.x as f64 && px <= (b.x + b.width) as f64 && py >= b.y as f64 && py <= (b.y + b.height) as f64 {
+                                    if desired_shape == Shape::Default {
+                                        if let Some(ref inp) = b.text_input {
+                                            if inp.active {
+                                                desired_shape = Shape::Text;
+                                            }
+                                        } else if b.on_click.is_some() || b.slider.is_some() || b.switch.is_some() {
+                                            desired_shape = Shape::Pointer;
+                                        }
+                                    }
+                                    if hovered_box_key.is_none() && b.tooltip.is_some() {
+                                        hovered_box_key = Some(format!("dock:{}@{:.0},{:.0}", b.tooltip.as_ref().unwrap(), b.x, b.y));
+                                    }
+                                    if desired_shape != Shape::Default && hovered_box_key.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else if is_bar {
+                        for bar in &self.bars {
+                            if event.surface == *bar.surface.wl_surface() {
+                                for b in bar.computed_boxes.iter().rev() {
+                                    if px >= b.x as f64 && px <= (b.x + b.width) as f64 && py >= b.y as f64 && py <= (b.y + b.height) as f64 {
+                                        if desired_shape == Shape::Default {
+                                            if let Some(ref inp) = b.text_input {
+                                                if inp.active {
+                                                    desired_shape = Shape::Text;
+                                                }
+                                            } else if b.on_click.is_some() || b.slider.is_some() || b.switch.is_some() {
+                                                desired_shape = Shape::Pointer;
+                                            }
+                                        }
+                                        if hovered_box_key.is_none() && b.tooltip.is_some() {
+                                            hovered_box_key = Some(format!("bar:{}:{}@{:.0},{:.0}", bar.output_name, b.tooltip.as_ref().unwrap(), b.x, b.y));
+                                        }
+                                        if desired_shape != Shape::Default && hovered_box_key.is_some() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    self.set_cursor_shape(desired_shape);
+
+                    // 2. Tooltip Hover Timer (>400ms)
+                    let now = std::time::Instant::now();
+                    let is_tooltip_active = match (&self.tooltip_hover, &hovered_box_key) {
+                        (Some((prev_key, start)), Some(curr_key)) if prev_key == curr_key => {
+                            start.elapsed() >= std::time::Duration::from_millis(400)
+                        }
+                        (_, Some(curr_key)) => {
+                            self.tooltip_hover = Some((curr_key.clone(), now));
+                            false
+                        }
+                        _ => {
+                            self.tooltip_hover = None;
+                            false
+                        }
+                    };
+
+                    let mut redraw_for_tooltip = false;
+                    if let Some(ref mut popup) = self.popup {
+                        for b in &mut popup.computed_boxes {
+                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_key.as_ref().map_or(false, |k| k.starts_with("popup:") && k.contains(&format!("@{:.0},{:.0}", b.x, b.y)));
+                            if b.tooltip_active != should_be {
+                                b.tooltip_active = should_be;
+                                redraw_for_tooltip = true;
+                            }
+                        }
+                    }
+                    if let Some(ref mut dock) = self.dock {
+                        for b in &mut dock.computed_boxes {
+                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_key.as_ref().map_or(false, |k| k.starts_with("dock:") && k.contains(&format!("@{:.0},{:.0}", b.x, b.y)));
+                            if b.tooltip_active != should_be {
+                                b.tooltip_active = should_be;
+                                redraw_for_tooltip = true;
+                            }
+                        }
+                    }
+                    for bar in &mut self.bars {
+                        for b in &mut bar.computed_boxes {
+                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_key.as_ref().map_or(false, |k| k.starts_with(&format!("bar:{}", bar.output_name)) && k.contains(&format!("@{:.0},{:.0}", b.x, b.y)));
+                            if b.tooltip_active != should_be {
+                                b.tooltip_active = should_be;
+                                redraw_for_tooltip = true;
+                            }
+                        }
+                    }
+
+                    if redraw_for_tooltip {
+                        let _ = self.request_redraw();
+                    }
+
+                    // Drag selection in active focused TextInput
+                    if self.pointer_pressed {
+                        if let Some(ref input_id) = self.runtime.get_focused_input() {
+                            let mut moved_input = false;
+                            if let Some(ref mut popup) = self.popup {
+                                for b in &mut popup.computed_boxes {
+                                    if let Some(ref mut inp) = b.text_input {
+                                        if inp.id.as_deref() == Some(input_id) && inp.active {
+                                            let (px, _) = self.pointer_pos;
+                                            let rel_x = (px - b.x as f64).max(0.0) as f32;
+                                            let char_w = (inp.font_size * 0.62).max(1.0);
+                                            let char_idx = (rel_x / char_w).round() as usize;
+                                            self.runtime.editor_drag(input_id, char_idx);
+                                            let (cur, sel) = self.runtime.get_editor_state(input_id);
+                                            inp.cursor_pos = cur;
+                                            inp.selection_range = sel;
+                                            moved_input = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if moved_input {
+                                let _ = self.request_redraw();
+                            }
+                        }
+
+                        // Drag active slider if one is being dragged
+                        if let Some(ref dragging_id) = self.active_dragging_slider {
+                            let (px, _) = self.pointer_pos;
+                            let mut updated_val = None;
+                            let mut change_cb = None;
+
+                            // Check popup
+                            if let Some(ref mut popup) = self.popup {
+                                for b in &mut popup.computed_boxes {
+                                    if let Some(ref mut sl) = b.slider {
+                                        if sl.id.as_deref() == Some(dragging_id) || dragging_id == "slider" {
+                                            let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
+                                            let fraction = if b.width > 0.0 { rel_x / b.width } else { 0.0 };
+                                            let new_val = fraction * (sl.max - sl.min) + sl.min;
+                                            sl.value = new_val;
+                                            updated_val = Some(new_val);
+                                            change_cb = sl.on_change.clone();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Check bars
+                            if updated_val.is_none() {
+                                for bar in &mut self.bars {
+                                    for b in &mut bar.computed_boxes {
+                                        if let Some(ref mut sl) = b.slider {
+                                            if sl.id.as_deref() == Some(dragging_id) || dragging_id == "slider" {
+                                                let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
+                                                let fraction = if b.width > 0.0 { rel_x / b.width } else { 0.0 };
+                                                let new_val = fraction * (sl.max - sl.min) + sl.min;
+                                                sl.value = new_val;
+                                                updated_val = Some(new_val);
+                                                change_cb = sl.on_change.clone();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if updated_val.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(val) = updated_val {
+                                if let Some(cb) = change_cb {
+                                    let _ = self.runtime.trigger_callback_with_arg(&cb, &val.to_string());
+                                }
+                                let _ = self.request_redraw();
+                            }
+                        }
+                    }
+                }
+                PointerEventKind::Release { .. } => {
+                    self.pointer_pressed = false;
+                    self.active_dragging_slider = None;
                 }
                 PointerEventKind::Leave { .. } => {
+                    self.current_cursor_shape = None;
+                    self.tooltip_hover = None;
+                    let mut cleared_tooltip = false;
+                    if let Some(ref mut popup) = self.popup {
+                        for b in &mut popup.computed_boxes {
+                            if b.tooltip_active {
+                                b.tooltip_active = false;
+                                cleared_tooltip = true;
+                            }
+                        }
+                    }
+                    if let Some(ref mut dock) = self.dock {
+                        for b in &mut dock.computed_boxes {
+                            if b.tooltip_active {
+                                b.tooltip_active = false;
+                                cleared_tooltip = true;
+                            }
+                        }
+                    }
+                    for bar in &mut self.bars {
+                        for b in &mut bar.computed_boxes {
+                            if b.tooltip_active {
+                                b.tooltip_active = false;
+                                cleared_tooltip = true;
+                            }
+                        }
+                    }
+                    if cleared_tooltip {
+                        let _ = self.request_redraw();
+                    }
                     let is_dock = self.dock.as_ref().map_or(false, |d| event.surface == *d.surface.wl_surface());
                     if is_dock {
                         self.dock_hovered = false;
@@ -1672,6 +2454,7 @@ impl PointerHandler for WaylandApp {
                     }
                 }
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT || button == BTN_RIGHT => {
+                    self.pointer_pressed = true;
                     let is_right = button == BTN_RIGHT;
                     let (px, py) = self.pointer_pos;
                     let mut target_action: Option<String> = None;
@@ -1707,21 +2490,44 @@ impl PointerHandler for WaylandApp {
                     }
 
                     // Check if click was on popup window
-                    if let Some(ref popup) = self.popup {
-                        if event.surface == *popup.surface.wl_surface() {
-                            let mut clicked_box = false;
-                            let mut focused_new_input: Option<String> = None;
+                    let is_popup_surface = self.popup.as_ref().map_or(false, |p| event.surface == *p.surface.wl_surface());
+                    if is_popup_surface {
+                        let mut _clicked_box = false;
+                        let mut focused_new_input: Option<(String, usize, Option<(usize, usize)>)> = None;
+                        let mut toggled_switch: Option<(bool, Option<String>)> = None;
+                        let mut clicked_slider: Option<(f32, Option<String>, Option<String>)> = None;
 
-                            for b in popup.computed_boxes.iter().rev() {
+                        if let Some(ref mut popup) = self.popup {
+                            for b in popup.computed_boxes.iter_mut().rev() {
                                 if px >= b.x as f64
                                     && px <= (b.x + b.width) as f64
                                     && py >= b.y as f64
                                     && py <= (b.y + b.height) as f64
                                 {
-                                    clicked_box = true;
+                                    _clicked_box = true;
                                     if let Some(ref input) = b.text_input {
                                         let id = input.id.clone().unwrap_or_else(|| "text_input".to_string());
-                                        focused_new_input = Some(id);
+                                        let rel_x = (px - b.x as f64).max(0.0) as f32;
+                                        let char_w = (input.font_size * 0.62).max(1.0);
+                                        let char_idx = (rel_x / char_w).round() as usize;
+                                        self.runtime.editor_click(&id, char_idx, self.modifiers.shift, std::time::Instant::now());
+                                        let (cur, sel) = self.runtime.get_editor_state(&id);
+                                        focused_new_input = Some((id, cur, sel));
+                                        break;
+                                    }
+
+                                    if let Some(ref mut sw) = b.switch {
+                                        sw.checked = !sw.checked;
+                                        toggled_switch = Some((sw.checked, sw.on_toggle.clone()));
+                                        break;
+                                    }
+
+                                    if let Some(ref mut sl) = b.slider {
+                                        let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
+                                        let fraction = if b.width > 0.0 { rel_x / b.width } else { 0.0 };
+                                        let new_val = fraction * (sl.max - sl.min) + sl.min;
+                                        sl.value = new_val;
+                                        clicked_slider = Some((new_val, sl.id.clone(), sl.on_change.clone()));
                                         break;
                                     }
 
@@ -1732,31 +2538,57 @@ impl PointerHandler for WaylandApp {
                                     }
                                 }
                             }
+                        }
 
-                            if let Some(input_id) = focused_new_input {
-                                self.runtime.set_focused_input(Some(input_id.clone()));
-                                if let Some(ref mut p) = self.popup {
-                                    for pb in p.computed_boxes.iter_mut() {
-                                        if let Some(ref mut inp) = pb.text_input {
-                                            inp.active = inp.id.as_deref() == Some(&input_id);
+                        if let Some((checked, cb_opt)) = toggled_switch {
+                            if let Some(cb) = cb_opt {
+                                let _ = self.runtime.trigger_callback_with_arg(&cb, if checked { "true" } else { "false" });
+                            }
+                            let _ = self.request_redraw();
+                            return;
+                        }
+
+                        if let Some((new_val, id_opt, cb_opt)) = clicked_slider {
+                            let slider_id = id_opt.unwrap_or_else(|| "slider".to_string());
+                            self.active_dragging_slider = Some(slider_id);
+                            if let Some(cb) = cb_opt {
+                                let _ = self.runtime.trigger_callback_with_arg(&cb, &new_val.to_string());
+                            }
+                            let _ = self.request_redraw();
+                            return;
+                        }
+
+                        if let Some((input_id, cursor_pos, selection_range)) = focused_new_input {
+                            self.runtime.set_focused_input(Some(input_id.clone()));
+                            if let Some(ref mut p) = self.popup {
+                                for pb in p.computed_boxes.iter_mut() {
+                                    if let Some(ref mut inp) = pb.text_input {
+                                        let is_target = inp.id.as_deref() == Some(&input_id);
+                                        inp.active = is_target;
+                                        if is_target {
+                                            inp.cursor_pos = cursor_pos;
+                                            inp.selection_range = selection_range;
                                         }
                                     }
                                 }
-                                let _ = self.draw_popup();
-                                return;
                             }
-
-                            if let Some(action) = target_action {
-                                self.execute_action(&action);
-                            } else if !clicked_box && popup.id != "lock" && popup.id != "lockscreen" && popup.id != "dock" {
-                                self.close_popup();
-                            }
+                            let _ = self.request_redraw();
                             return;
+                        }
+
+                        if let Some(action) = target_action {
+                            self.execute_action(&action);
+                        }
+                        return;
+                    } else if let Some(ref popup) = self.popup {
+                        if popup.id != "lock" && popup.id != "lockscreen" && popup.id != "dock" {
+                            // Click was OUTSIDE the popup surface - close the popup!
+                            self.close_popup();
                         }
                     }
 
                     // Check if click was on any status bar
-                    for bar in &self.bars {
+                    for bar in &mut self.bars {
                         if event.surface == *bar.surface.wl_surface() {
                             if self.bar_hidden {
                                 self.bar_hovered = true;
@@ -1764,12 +2596,30 @@ impl PointerHandler for WaylandApp {
                                 let _ = self.update_bar_visibility();
                                 return;
                             }
-                            for b in bar.computed_boxes.iter().rev() {
+                            let mut bar_toggled_switch: Option<(bool, Option<String>)> = None;
+                            let mut bar_clicked_slider: Option<(f32, Option<String>, Option<String>)> = None;
+
+                            for b in bar.computed_boxes.iter_mut().rev() {
                                 if px >= b.x as f64
                                     && px <= (b.x + b.width) as f64
                                     && py >= b.y as f64
                                     && py <= (b.y + b.height) as f64
                                 {
+                                    if let Some(ref mut sw) = b.switch {
+                                        sw.checked = !sw.checked;
+                                        bar_toggled_switch = Some((sw.checked, sw.on_toggle.clone()));
+                                        break;
+                                    }
+
+                                    if let Some(ref mut sl) = b.slider {
+                                        let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
+                                        let fraction = if b.width > 0.0 { rel_x / b.width } else { 0.0 };
+                                        let new_val = fraction * (sl.max - sl.min) + sl.min;
+                                        sl.value = new_val;
+                                        bar_clicked_slider = Some((new_val, sl.id.clone(), sl.on_change.clone()));
+                                        break;
+                                    }
+
                                     let action_opt = if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
                                     if let Some(action) = action_opt {
                                         target_action = Some(action.clone());
@@ -1778,10 +2628,29 @@ impl PointerHandler for WaylandApp {
                                 }
                             }
 
+                            if let Some((checked, cb_opt)) = bar_toggled_switch {
+                                if let Some(cb) = cb_opt {
+                                    let _ = self.runtime.trigger_callback_with_arg(&cb, if checked { "true" } else { "false" });
+                                }
+                                let _ = self.request_redraw();
+                                return;
+                            }
+
+                            if let Some((new_val, id_opt, cb_opt)) = bar_clicked_slider {
+                                let slider_id = id_opt.unwrap_or_else(|| "slider".to_string());
+                                self.active_dragging_slider = Some(slider_id);
+                                if let Some(cb) = cb_opt {
+                                    let _ = self.runtime.trigger_callback_with_arg(&cb, &new_val.to_string());
+                                }
+                                let _ = self.request_redraw();
+                                return;
+                            }
+
                             if let Some(action) = target_action {
                                 if let Some(ref p) = self.popup {
                                     let toggle_needle = format!("popup:toggle:{}", p.id.to_lowercase());
                                     if !action.to_lowercase().contains(&toggle_needle)
+                                        && !action.to_lowercase().contains(&p.id.to_lowercase())
                                         && p.id != "dock"
                                         && p.id != "lock"
                                         && p.id != "lockscreen"
@@ -1821,7 +2690,8 @@ impl PointerHandler for WaylandApp {
                                 {
                                     if b.overflow == zenith_layout::Overflow::Scroll {
                                         let delta = if is_up { -24.0 } else { 24.0 };
-                                        b.scroll_offset_y = (b.scroll_offset_y + delta).max(0.0);
+                                        self.gestures_manager.kinetic_scroll.add_impulse(delta);
+                                        b.scroll_offset_y = self.gestures_manager.kinetic_scroll.offset();
                                         handled_scroll = true;
                                         break;
                                     }
@@ -1918,6 +2788,50 @@ impl KeyboardHandler for WaylandApp {
             return;
         }
 
+        let is_shift = self.modifiers.shift;
+
+        // Tab / Shift+Tab keyboard focus cycling across TextInputs
+        if event.keysym == Keysym::Tab || event.keysym == Keysym::ISO_Left_Tab {
+            if let Some(ref popup) = self.popup {
+                let input_ids: Vec<String> = popup
+                    .computed_boxes
+                    .iter()
+                    .filter_map(|b| b.text_input.as_ref().and_then(|inp| inp.id.clone()))
+                    .collect();
+                if !input_ids.is_empty() {
+                    let focused_input = self.runtime.get_focused_input();
+                    let cur_idx = focused_input
+                        .as_ref()
+                        .and_then(|fid| input_ids.iter().position(|id| id == fid));
+                    let next_idx = match cur_idx {
+                        Some(idx) => {
+                            if is_shift || event.keysym == Keysym::ISO_Left_Tab {
+                                if idx == 0 {
+                                    input_ids.len() - 1
+                                } else {
+                                    idx - 1
+                                }
+                            } else {
+                                (idx + 1) % input_ids.len()
+                            }
+                        }
+                        None => 0,
+                    };
+                    let next_id = input_ids[next_idx].clone();
+                    self.runtime.set_focused_input(Some(next_id.clone()));
+                    if let Some(ref mut popup) = self.popup {
+                        for pb in popup.computed_boxes.iter_mut() {
+                            if let Some(ref mut pb_inp) = pb.text_input {
+                                pb_inp.active = pb_inp.id.as_deref() == Some(&next_id);
+                            }
+                        }
+                    }
+                    let _ = self.request_redraw();
+                    return;
+                }
+            }
+        }
+
         // Handle generic focused TextInput typing if active
         let focused_input = self.runtime.get_focused_input();
         if let Some(ref input_id) = focused_input {
@@ -1934,6 +2848,15 @@ impl KeyboardHandler for WaylandApp {
             }
 
             if let Some(inp) = matched_input {
+                let is_ctrl = self.modifiers.ctrl;
+                let is_shift = self.modifiers.shift;
+
+                // Dead-key interception for ABNT2 / international layout
+                if let Some(dead_char) = keysym_to_dead_key(event.keysym) {
+                    self.active_dead_key = Some(dead_char);
+                    return;
+                }
+
                 match event.keysym {
                     Keysym::Escape => {
                         self.runtime.set_focused_input(None);
@@ -1944,7 +2867,7 @@ impl KeyboardHandler for WaylandApp {
                                 }
                             }
                         }
-                        let _ = self.draw_popup();
+                        let _ = self.request_redraw();
                         return;
                     }
                     Keysym::Return => {
@@ -1954,58 +2877,109 @@ impl KeyboardHandler for WaylandApp {
                         }
                         return;
                     }
-                    Keysym::BackSpace => {
-                        let mut cur_txt = self.runtime.get_input_text(input_id);
-                        if cur_txt.is_empty() && !inp.text.is_empty() {
-                            cur_txt = inp.text.clone();
-                        }
-                        if !cur_txt.is_empty() {
-                            cur_txt.pop();
-                            self.runtime.set_input_text(input_id, &cur_txt);
-                            if let Some(ref cb) = inp.on_change {
-                                let _ = self.runtime.trigger_callback_with_arg(cb, &cur_txt);
+                    // Ctrl+A: Select All
+                    Keysym::a | Keysym::A if is_ctrl => {
+                        self.runtime.editor_select_all(input_id);
+                    }
+                    // Ctrl+C: Copy (Zero-Fork Native Wayland Clipboard + RAM Buffer)
+                    Keysym::c | Keysym::C if is_ctrl => {
+                        if let Some(text) = self.runtime.editor_copy(input_id) {
+                            self.clipboard_manager.copy(&text);
+                            if let Ok(mut lock) = self.clipboard.lock() {
+                                *lock = text;
                             }
-                            if let Some(ref mut popup) = self.popup {
-                                for pb in popup.computed_boxes.iter_mut() {
-                                    if let Some(ref mut pb_inp) = pb.text_input {
-                                        if pb_inp.id.as_deref() == Some(input_id) {
-                                            pb_inp.text = cur_txt.clone();
-                                        }
-                                    }
-                                }
-                            }
-                            let _ = self.draw_popup();
                         }
                         return;
                     }
+                    // Ctrl+X: Cut (Zero-Fork Native Wayland Clipboard + RAM Buffer)
+                    Keysym::x | Keysym::X if is_ctrl => {
+                        if let Some(text) = self.runtime.editor_cut(input_id) {
+                            self.clipboard_manager.copy(&text);
+                            if let Ok(mut lock) = self.clipboard.lock() {
+                                *lock = text;
+                            }
+                        }
+                    }
+                    // Ctrl+V: Paste (Zero-Fork Native Wayland Clipboard Offer + RAM Buffer)
+                    Keysym::v | Keysym::V if is_ctrl => {
+                        let paste_text = self.clipboard_manager.paste();
+                        if !paste_text.is_empty() {
+                            self.runtime.editor_paste(input_id, &paste_text);
+                        }
+                    }
+                    // Ctrl+Z (Undo) / Ctrl+Shift+Z (Redo)
+                    Keysym::z | Keysym::Z if is_ctrl => {
+                        if is_shift {
+                            self.runtime.editor_redo(input_id);
+                        } else {
+                            self.runtime.editor_undo(input_id);
+                        }
+                    }
+                    // Ctrl+Y: Redo
+                    Keysym::y | Keysym::Y if is_ctrl => {
+                        self.runtime.editor_redo(input_id);
+                    }
+                    // Arrow Keys with optional Shift
+                    Keysym::Left => {
+                        self.runtime.editor_move_cursor(input_id, zenith_layout::CursorDirection::Left, is_shift);
+                    }
+                    Keysym::Right => {
+                        self.runtime.editor_move_cursor(input_id, zenith_layout::CursorDirection::Right, is_shift);
+                    }
+                    Keysym::Home => {
+                        self.runtime.editor_move_cursor(input_id, zenith_layout::CursorDirection::Home, is_shift);
+                    }
+                    Keysym::End => {
+                        self.runtime.editor_move_cursor(input_id, zenith_layout::CursorDirection::End, is_shift);
+                    }
+                    Keysym::BackSpace => {
+                        self.runtime.editor_backspace(input_id);
+                    }
+                    Keysym::Delete => {
+                        self.runtime.editor_delete(input_id);
+                    }
                     _ => {
-                        if let Some(ref text) = event.utf8 {
-                            let text = text.trim_matches(|c: char| c.is_control());
-                            if !text.is_empty() {
-                                let mut cur_txt = self.runtime.get_input_text(input_id);
-                                if cur_txt.is_empty() && !inp.text.is_empty() {
-                                    cur_txt = inp.text.clone();
+                        if !is_ctrl {
+                            if let Some(dead_char) = self.active_dead_key.take() {
+                                if let Some(ref text) = event.utf8 {
+                                    let base_char = text.chars().next().unwrap_or(' ');
+                                    let composed = compose_dead_key(dead_char, base_char);
+                                    self.runtime.editor_insert(input_id, &composed);
+                                } else {
+                                    let composed = compose_dead_key(dead_char, ' ');
+                                    self.runtime.editor_insert(input_id, &composed);
                                 }
-                                cur_txt.push_str(text);
-                                self.runtime.set_input_text(input_id, &cur_txt);
-                                if let Some(ref cb) = inp.on_change {
-                                    let _ = self.runtime.trigger_callback_with_arg(cb, &cur_txt);
+                            } else if let Some(ref text) = event.utf8 {
+                                let text = text.trim_matches(|c: char| c.is_control());
+                                if !text.is_empty() {
+                                    self.runtime.editor_insert(input_id, text);
                                 }
-                                if let Some(ref mut popup) = self.popup {
-                                    for pb in popup.computed_boxes.iter_mut() {
-                                        if let Some(ref mut pb_inp) = pb.text_input {
-                                            if pb_inp.id.as_deref() == Some(input_id) {
-                                                pb_inp.text = cur_txt.clone();
-                                            }
-                                        }
-                                    }
-                                }
-                                let _ = self.draw_popup();
-                                return;
                             }
                         }
                     }
                 }
+
+                let cur_txt = self.runtime.get_input_text(input_id);
+                let (cursor_pos, selection_range) = self.runtime.get_editor_state(input_id);
+
+                if let Some(ref cb) = inp.on_change {
+                    let _ = self.runtime.trigger_callback_with_arg(cb, &cur_txt);
+                }
+
+                if let Some(ref mut popup) = self.popup {
+                    for pb in popup.computed_boxes.iter_mut() {
+                        if let Some(ref mut pb_inp) = pb.text_input {
+                            if pb_inp.id.as_deref() == Some(input_id) {
+                                pb_inp.text = cur_txt.clone();
+                                pb_inp.cursor_pos = cursor_pos;
+                                pb_inp.selection_range = selection_range;
+                            }
+                        }
+                    }
+                }
+
+                let _ = self.request_redraw();
+                return;
             }
         }
 
@@ -2014,7 +2988,8 @@ impl KeyboardHandler for WaylandApp {
         match event.keysym {
             Keysym::Escape => {
                 if !popup_id.eq_ignore_ascii_case("lock") && !popup_id.eq_ignore_ascii_case("lockscreen") {
-                    self.close_popup();
+                    self.destroy_popup_immediately();
+                    return;
                 }
             }
             Keysym::Return => {
@@ -2034,10 +3009,10 @@ impl KeyboardHandler for WaylandApp {
                 if popup_id.eq_ignore_ascii_case("launcher") {
                     let selected_idx = self.runtime.get_selected_index();
                     let query = self.runtime.get_search_query();
-                    let list = zenith_services::LauncherService::search(&query, 100);
+                    let list = zenith_services::LauncherService::search(&query, 30);
                     if let Some(app) = list.get(selected_idx.saturating_sub(1)) {
                         let _ = zenith_services::LauncherService::launch(&app.exec);
-                        self.close_popup();
+                        self.destroy_popup_immediately();
                         return;
                     }
                 }
@@ -2074,8 +3049,7 @@ impl KeyboardHandler for WaylandApp {
             Keysym::Down => {
                 let current = self.runtime.get_selected_index();
                 let max_count = if popup_id.eq_ignore_ascii_case("launcher") {
-                    let query = self.runtime.get_search_query();
-                    zenith_services::LauncherService::search(&query, 100).len()
+                    30
                 } else {
                     50
                 };
@@ -2126,9 +3100,11 @@ impl KeyboardHandler for WaylandApp {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _modifiers: Modifiers,
+        modifiers: Modifiers,
         _layout: u32,
-    ) {}
+    ) {
+        self.modifiers = modifiers;
+    }
 }
 
 impl CompositorHandler for WaylandApp {
@@ -2160,10 +3136,19 @@ impl CompositorHandler for WaylandApp {
             if popup.surface.wl_surface() == surface {
                 if let Some(ref mut anim) = popup.spring {
                     anim.step(0.016);
-                    if popup.closing && (anim.is_settled() || anim.current <= 0.02) {
+                    if popup.closing && (anim.is_settled() || anim.current <= 0.04) {
                         self.popup = None;
                         return;
                     }
+                }
+                if !self.gestures_manager.is_scroll_settled() {
+                    let new_scroll = self.gestures_manager.step_scroll(0.016);
+                    for b in &mut popup.computed_boxes {
+                        if b.overflow == zenith_layout::Overflow::Scroll {
+                            b.scroll_offset_y = new_scroll;
+                        }
+                    }
+                    let _ = self.request_redraw();
                 }
                 let _ = self.draw_popup();
                 return;
@@ -2212,15 +3197,30 @@ impl OutputHandler for WaylandApp {
             .unwrap_or_else(|| format!("output-{}", self.bars.len()));
         info!("Wayland output added: name={:?}", name);
 
+        let mut log_size = (1920, 1080);
+        let mut scale = 1.0;
+        let mut current_mode = None;
+
         if let Some(info) = self.output_state.info(&output) {
+            scale = info.scale_factor as f64;
             if let Some((w, h)) = info.logical_size {
                 if w > 0 && h > 0 {
                     self.screen_width = w as u32;
                     self.screen_height = h as u32;
+                    log_size = (w as u32, h as u32);
                     self.runtime.set_current_output_geometry(&name, w as u32, h as u32);
                 }
             }
+            if let Some(m) = info.modes.iter().find(|m| m.current).or_else(|| info.modes.first()) {
+                current_mode = Some(crate::monitor::OutputMode {
+                    width: m.dimensions.0,
+                    height: m.dimensions.1,
+                    refresh_mhz: m.refresh_rate,
+                });
+            }
         }
+
+        self.monitor_manager.register_output(&name, log_size, scale, current_mode);
 
         // If we only had the unassigned default bar, assign this output to it
         if self.bars.len() == 1 && self.bars[0].output.is_none() {
@@ -2247,13 +3247,24 @@ impl OutputHandler for WaylandApp {
         if let Some(info) = self.output_state.info(&output) {
             info!("Wayland output updated: name={:?}, size={:?}", info.name, info.logical_size);
             let name = info.name.as_deref().unwrap_or("default");
+            let mut log_size = (self.screen_width, self.screen_height);
             if let Some((w, h)) = info.logical_size {
                 if w > 0 && h > 0 {
                     self.screen_width = w as u32;
                     self.screen_height = h as u32;
+                    log_size = (w as u32, h as u32);
                     self.runtime.set_current_output_geometry(name, w as u32, h as u32);
                 }
             }
+            let mode = info.modes.iter().find(|m| m.current).map(|m| crate::monitor::OutputMode {
+                width: m.dimensions.0,
+                height: m.dimensions.1,
+                refresh_mhz: m.refresh_rate,
+            });
+            if let Some(m) = mode {
+                self.monitor_manager.update_mode(name, m.width, m.height, m.refresh_mhz);
+            }
+            self.monitor_manager.register_output(name, log_size, info.scale_factor as f64, mode);
         }
     }
 
@@ -2264,6 +3275,11 @@ impl OutputHandler for WaylandApp {
         output: wl_output::WlOutput,
     ) {
         info!("Wayland output destroyed");
+        if let Some(info) = self.output_state.info(&output) {
+            if let Some(ref name) = info.name {
+                self.monitor_manager.unregister_output(name);
+            }
+        }
         self.bars.retain(|b| b.output.as_ref() != Some(&output));
     }
 }
@@ -2279,9 +3295,7 @@ impl LayerShellHandler for WaylandApp {
         if let Some(pos) = self.bars.iter().position(|b| b.surface.wl_surface() == layer.wl_surface()) {
             info!("Layer surface closed by compositor on output '{}'", self.bars[pos].output_name);
             self.bars.remove(pos);
-            if self.bars.is_empty() {
-                self.running = false;
-            }
+            info!("Bar removed. Active bars remaining: {}", self.bars.len());
             return;
         }
 
@@ -2311,6 +3325,9 @@ impl LayerShellHandler for WaylandApp {
                 if new_height > 0 {
                     bar.height = new_height;
                 }
+                if let Some(ref mut egl_surf) = bar.egl_surface {
+                    egl_surf.resize(bar.width, bar.height);
+                }
                 bar.configured = true;
                 bar.computed_boxes.clear();
                 info!("Bar surface configured on '{}': {}x{}", bar.output_name, bar.width, bar.height);
@@ -2329,6 +3346,9 @@ impl LayerShellHandler for WaylandApp {
                 if new_height > 0 {
                     popup.height = new_height;
                 }
+                if let Some(ref mut egl_surf) = popup.egl_surface {
+                    egl_surf.resize(popup.width, popup.height);
+                }
                 popup.configured = true;
                 popup.computed_boxes.clear();
                 info!("Popup surface configured '{}': {}x{}", popup.id, popup.width, popup.height);
@@ -2346,6 +3366,9 @@ impl LayerShellHandler for WaylandApp {
                 }
                 if new_height > 0 {
                     dock.height = new_height;
+                }
+                if let Some(ref mut egl_surf) = dock.egl_surface {
+                    egl_surf.resize(dock.width, dock.height);
                 }
                 dock.configured = true;
                 dock.computed_boxes.clear();
@@ -2390,4 +3413,157 @@ fn verify_pam_password(password: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use zenith_layout::{Color, ComputedBox, ComputedSlider, ComputedSwitch, LayoutEngine, NodeStyle, UiNode};
+
+    #[test]
+    fn test_switch_toggle_interaction() {
+        let sw = ComputedSwitch {
+            id: Some("toggle_wifi".to_string()),
+            checked: false,
+            active_color: Color::rgb(124, 77, 255),
+            inactive_color: Color::rgba(255, 255, 255, 50),
+            thumb_color: Color::rgb(255, 255, 255),
+            on_toggle: Some("wifi_changed".to_string()),
+        };
+
+        let mut b = ComputedBox {
+            x: 10.0,
+            y: 20.0,
+            width: 50.0,
+            height: 26.0,
+            background_color: Color::transparent(),
+            border_color: Color::transparent(),
+            border_width: 0.0,
+            border_radius: 13.0,
+            shadow: None,
+            custom_shader: None,
+            text: None,
+            image: None,
+            text_input: None,
+            slider: None,
+            switch: Some(sw),
+            overflow: zenith_layout::Overflow::Visible,
+            scroll_offset_y: 0.0,
+            on_click: Some("wifi_changed".to_string()),
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+            tooltip_active: false,
+        };
+
+        // Click inside switch bounds (25.0, 30.0)
+        let px = 25.0;
+        let py = 30.0;
+        assert!(px >= b.x as f64 && px <= (b.x + b.width) as f64);
+        assert!(py >= b.y as f64 && py <= (b.y + b.height) as f64);
+
+        if let Some(ref mut s) = b.switch {
+            s.checked = !s.checked;
+            assert_eq!(s.checked, true);
+        }
+
+        // Second click toggles back to false
+        if let Some(ref mut s) = b.switch {
+            s.checked = !s.checked;
+            assert_eq!(s.checked, false);
+        }
+    }
+
+    #[test]
+    fn test_slider_click_and_drag_math() {
+        let sl = ComputedSlider {
+            id: Some("volume_slider".to_string()),
+            min: 0.0,
+            max: 100.0,
+            value: 20.0,
+            track_height: 6.0,
+            thumb_radius: 10.0,
+            track_color: Color::rgba(255, 255, 255, 50),
+            active_track_color: Color::rgb(124, 77, 255),
+            thumb_color: Color::rgb(255, 255, 255),
+            on_change: Some("on_volume".to_string()),
+        };
+
+        let b = ComputedBox {
+            x: 100.0,
+            y: 50.0,
+            width: 200.0,
+            height: 30.0,
+            background_color: Color::transparent(),
+            border_color: Color::transparent(),
+            border_width: 0.0,
+            border_radius: 0.0,
+            shadow: None,
+            custom_shader: None,
+            text: None,
+            image: None,
+            text_input: None,
+            slider: Some(sl),
+            switch: None,
+            overflow: zenith_layout::Overflow::Visible,
+            scroll_offset_y: 0.0,
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+            tooltip_active: false,
+        };
+
+        let sl_ref = b.slider.as_ref().unwrap();
+
+        // Click at middle (px = 200.0 -> rel_x = 100.0)
+        let px = 200.0;
+        let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
+        let fraction = rel_x / b.width;
+        let new_val = fraction * (sl_ref.max - sl_ref.min) + sl_ref.min;
+        assert_eq!(new_val, 50.0);
+
+        // Drag to 75% (px = 250.0 -> rel_x = 150.0)
+        let px_drag = 250.0;
+        let rel_x_drag = (px_drag - b.x as f64).clamp(0.0, b.width as f64) as f32;
+        let fraction_drag = rel_x_drag / b.width;
+        let val_drag = fraction_drag * (sl_ref.max - sl_ref.min) + sl_ref.min;
+        assert_eq!(val_drag, 75.0);
+
+        // Clamp below left edge (px = 50.0 < 100.0)
+        let px_under = 50.0;
+        let rel_x_under = (px_under - b.x as f64).clamp(0.0, b.width as f64) as f32;
+        assert_eq!(rel_x_under, 0.0);
+
+        // Clamp beyond right edge (px = 350.0 > 300.0)
+        let px_over = 350.0;
+        let rel_x_over = (px_over - b.x as f64).clamp(0.0, b.width as f64) as f32;
+        assert_eq!(rel_x_over, 200.0);
+    }
+
+    #[test]
+    fn test_layout_maps_switch_on_toggle_to_on_click() {
+        let mut engine = LayoutEngine::new();
+        let node = UiNode::Switch {
+            id: Some("sw1".to_string()),
+            checked: true,
+            active_color: Color::rgb(10, 20, 30),
+            inactive_color: Color::rgb(40, 50, 60),
+            thumb_color: Color::rgb(255, 255, 255),
+            style: NodeStyle {
+                width: Some(60.0),
+                height: Some(30.0),
+                ..Default::default()
+            },
+            on_toggle: Some("my_toggle_action".to_string()),
+        };
+
+        let boxes = engine.compute(&node, 800.0, 600.0);
+        assert_eq!(boxes.len(), 1);
+        let b = &boxes[0];
+        assert_eq!(b.on_click.as_deref(), Some("my_toggle_action"));
+        assert!(b.switch.is_some());
+        assert_eq!(b.switch.as_ref().unwrap().checked, true);
+    }
 }

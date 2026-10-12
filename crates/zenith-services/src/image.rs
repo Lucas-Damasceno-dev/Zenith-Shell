@@ -59,6 +59,16 @@ impl ImageService {
         } else if src.ends_with(".png") || Path::new(src).exists() {
             // PNG or raster file
             Self::decode_png_file(Path::new(src))?
+        } else if let Some(icon_path) = crate::icon::XdgIconResolver::resolve(src, target_width.unwrap_or(32)) {
+            let path_str = icon_path.to_string_lossy();
+            if path_str.ends_with(".svg") {
+                let w = target_width.unwrap_or(32);
+                let h = target_height.unwrap_or(32);
+                let rgba = SystemService::render_svg_file(&icon_path, w, h)?;
+                DecodedImage { width: w, height: h, rgba }
+            } else {
+                Self::decode_png_file(&icon_path)?
+            }
         } else {
             return Err(format!("Unsupported or non-existent image source: {}", src).into());
         };

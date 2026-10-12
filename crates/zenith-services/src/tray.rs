@@ -65,6 +65,17 @@ impl TrayService {
 
     /// Dispatch primary activation click (Activate(x, y)).
     pub fn activate(service: &str) {
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            let _ = conn.call_method(
+                Some(service),
+                "/StatusNotifierItem",
+                Some("org.kde.StatusNotifierItem"),
+                "Activate",
+                &(0i32, 0i32),
+            );
+            return;
+        }
+
         let bus_addr = resolve_bus_address();
         let mut cmd = std::process::Command::new("busctl");
         cmd.args(["--user", "call", service, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "Activate", "ii", "0", "0"]);
@@ -76,6 +87,17 @@ impl TrayService {
 
     /// Dispatch context menu click (ContextMenu(x, y)).
     pub fn context_menu(service: &str) {
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            let _ = conn.call_method(
+                Some(service),
+                "/StatusNotifierItem",
+                Some("org.kde.StatusNotifierItem"),
+                "ContextMenu",
+                &(0i32, 0i32),
+            );
+            return;
+        }
+
         let bus_addr = resolve_bus_address();
         let mut cmd = std::process::Command::new("busctl");
         cmd.args(["--user", "call", service, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "ContextMenu", "ii", "0", "0"]);
@@ -101,6 +123,19 @@ fn resolve_bus_address() -> Option<String> {
 }
 
 fn query_registered_items() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if let Ok(conn) = zbus::blocking::Connection::session() {
+        if let Ok(proxy) = zbus::blocking::Proxy::new(
+            &conn,
+            "org.kde.StatusNotifierWatcher",
+            "/StatusNotifierWatcher",
+            "org.kde.StatusNotifierWatcher",
+        ) {
+            if let Ok(items) = proxy.get_property::<Vec<String>>("RegisteredStatusNotifierItems") {
+                return Ok(items);
+            }
+        }
+    }
+
     let bus_addr = resolve_bus_address();
     if bus_addr.is_none() {
         return Err("No D-Bus session bus available".into());
@@ -142,6 +177,26 @@ fn inspect_item(service_path: &str) -> Result<TrayItem, Box<dyn std::error::Erro
     } else {
         (service_path, "/StatusNotifierItem".to_string())
     };
+
+    if let Ok(conn) = zbus::blocking::Connection::session() {
+        if let Ok(proxy) = zbus::blocking::Proxy::new(
+            &conn,
+            service,
+            path.as_str(),
+            "org.kde.StatusNotifierItem",
+        ) {
+            let id = proxy.get_property::<String>("Id").unwrap_or_default();
+            let title = proxy.get_property::<String>("Title").unwrap_or_default();
+            let icon_name = proxy.get_property::<String>("IconName").unwrap_or_default();
+
+            return Ok(TrayItem {
+                id: if id.is_empty() { service.to_string() } else { id },
+                title: if title.is_empty() { service.to_string() } else { title },
+                icon_name: if icon_name.is_empty() { "󰀻".to_string() } else { icon_name },
+                service: service.to_string(),
+            });
+        }
+    }
 
     let bus_addr = resolve_bus_address();
 

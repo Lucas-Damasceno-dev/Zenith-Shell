@@ -60,10 +60,7 @@ impl LauncherService {
         let q = query.trim().to_lowercase();
 
         if q.is_empty() {
-            let mut res: Vec<AppEntry> = apps_guard.clone();
-            res.sort_by_key(|a| a.name.to_lowercase());
-            res.truncate(limit);
-            return res;
+            return apps_guard.iter().take(limit).cloned().collect();
         }
 
         let mut scored: Vec<(i32, &AppEntry)> = apps_guard
@@ -274,6 +271,7 @@ impl LauncherService {
             }
         }
 
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         entries
     }
 

@@ -52,8 +52,8 @@ else
             align_items = "center",
             padding = { x = 12, y = 8 },
             border_radius = 8,
-            background = ap.in_use and Zenith.rgba(124, 77, 255, 40) or Zenith.hex(theme.surface_container),
-            border_color = ap.in_use and Zenith.hex(theme.primary) or Zenith.rgba(255, 255, 255, 12),
+            background = ap.in_use and Zenith.hex(theme.primary, 40) or Zenith.hex(theme.surface_container),
+            border_color = ap.in_use and Zenith.hex(theme.primary) or Zenith.hex(theme.outline, 30),
             border_width = 1,
             on_click = "wifi:connect:" .. ap.ssid,
             children = {
@@ -114,8 +114,8 @@ return Zenith.Window({
     height = win_height,
     padding = { x = 16, y = 14 },
     gap = 12,
-    background = Zenith.rgba(18, 20, 26, 230),
-    border_color = Zenith.hex(theme.primary),
+    background = Zenith.hex(theme.surface, 235),
+    border_color = Zenith.hex(theme.outline_variant or theme.outline, 80),
     border_width = 1,
     border_radius = 16,
     on_scroll_up = scroll_up,
@@ -127,17 +127,33 @@ return Zenith.Window({
         offset_y = 8,
     },
     children = {
-        -- Header: Title + Close
+        -- Header: Title + Wi-Fi Switch + Close
         Zenith.Box({
             direction = "row",
             align_items = "center",
             children = {
                 Zenith.Text({
-                    text = "󰤨 Network & Wi-Fi",
+                    text = "󰤨 Rede & Wi-Fi",
                     font_size = 13,
                     color = Zenith.hex(theme.primary),
                 }),
                 Zenith.Box({ flex_grow = 1 }),
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    gap = 6,
+                    children = {
+                        Zenith.Switch({
+                            id = "wifi_toggle_switch",
+                            checked = net.connected,
+                            active_color = theme.primary,
+                            on_toggle = function(checked)
+                                Zenith.exec("nmcli radio wifi " .. (if checked then "on" else "off"))
+                            end,
+                        }),
+                    }
+                }),
+                Zenith.Box({ width = 6 }),
                 Zenith.Box({
                     padding = { x = 6, y = 2 },
                     border_radius = 6,

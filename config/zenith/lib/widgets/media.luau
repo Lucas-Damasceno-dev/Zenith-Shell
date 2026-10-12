@@ -1,26 +1,21 @@
 --!strict
 -- Zenith UI Kit - Media Pill Component (MPRIS2 / Caelestia style)
 
+local Pill = Zenith.import("widgets/pill")
+
 local function MediaWidget()
     local theme = Zenith.Theme()
     local media = Zenith.Services.Media()
 
     if not media.is_available or media.status == "Stopped" then
-        return Zenith.Box({
-            direction = "row",
-            padding = { x = 8, y = 3 },
-            border_radius = 12,
-            background = Zenith.rgba(255, 255, 255, 8),
-            border_color = Zenith.rgba(255, 255, 255, 16),
-            border_width = 1,
+        return Pill({
+            height = 26,
+            border_radius = 13,
+            padding = { x = 8, y = 2 },
+            icon = "󰎆",
+            icon_size = 12,
+            icon_color = Zenith.hex(theme.on_surface_variant or theme.outline, 140),
             on_click = "popup:toggle:MediaPopup",
-            children = {
-                Zenith.Text({
-                    text = "󰎆",
-                    font_size = 12,
-                    color = Zenith.rgba(255, 255, 255, 120),
-                })
-            }
         })
     end
 
@@ -38,10 +33,10 @@ local function MediaWidget()
         label = label:sub(1, max_len - 2) .. ".."
     end
 
-    local spectrum = Zenith.Services.Spectrum(3)
+    local spectrum = Zenith.Services.Spectrum(4)
     local spectrum_bars = {}
     for _, val in ipairs(spectrum) do
-        local bar_h = math.clamp(math.floor(val * 10) + 2, 2, 12)
+        local bar_h = math.clamp(math.floor(val * 11) + 3, 3, 14)
         table.insert(spectrum_bars, Zenith.Box({
             width = 2,
             height = bar_h,
@@ -50,19 +45,18 @@ local function MediaWidget()
         }))
     end
 
-    return Zenith.Box({
-        direction = "row",
-        padding = { x = if screen_w < 1440 then 7 else 9, y = 3 },
-        gap = 4,
-        border_radius = 12,
-        background = Zenith.rgba(255, 255, 255, 14),
-        border_color = Zenith.rgba(122, 162, 247, 90),
-        border_width = 1,
+    return Pill({
+        height = 26,
+        border_radius = 13,
+        padding = { x = if screen_w < 1440 then 8 else 10, y = 2 },
+        gap = 5,
+        background = Zenith.hex(theme.surface_container_high or theme.surface_container, 140),
+        border_color = Zenith.hex(theme.primary, 90),
         on_click = "popup:toggle:MediaPopup",
         children = {
             Zenith.Text({
                 text = status_icon,
-                font_size = 11,
+                font_size = 12,
                 color = Zenith.hex(theme.primary),
             }),
             Zenith.Text({
@@ -72,8 +66,9 @@ local function MediaWidget()
             }),
             Zenith.Box({
                 direction = "row",
+                align_items = "flex-end",
                 gap = 2,
-                height = 12,
+                height = 14,
                 children = spectrum_bars,
             })
         }

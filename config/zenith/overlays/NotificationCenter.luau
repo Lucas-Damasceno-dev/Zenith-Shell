@@ -2,6 +2,7 @@
 -- Zenith-Shell (Engine v2) - Notification Center Overlay (Desktop Notifications & History & DND)
 
 local theme = Zenith.Theme()
+local UIKit = Zenith.import("ui_kit")
 local notifs = Zenith.Services.Notifications()
 local history = Zenith.Services.NotificationHistory()
 local is_dnd = Zenith.Services.IsDND()
@@ -196,8 +197,8 @@ return Zenith.Window({
     height = win_height,
     padding = { x = 16, y = 14 },
     gap = 12,
-    background = Zenith.rgba(18, 20, 26, 230),
-    border_color = Zenith.hex(theme.primary),
+    background = Zenith.hex(theme.surface, 235),
+    border_color = Zenith.hex(theme.outline_variant or theme.outline, 80),
     border_width = 1,
     border_radius = 16,
     on_scroll_up = scroll_up,
@@ -221,30 +222,21 @@ return Zenith.Window({
                 }),
                 Zenith.Box({ flex_grow = 1 }),
                 -- DND Button
-                Zenith.Box({
-                    padding = { x = 8, y = 4 },
-                    border_radius = 6,
-                    background = is_dnd and Zenith.rgba(224, 108, 117, 45) or Zenith.rgba(255, 255, 255, 12),
-                    border_color = is_dnd and Zenith.hex("#e06c75") or Zenith.rgba(255, 255, 255, 20),
-                    border_width = 1,
+                UIKit.Button({
+                    label = is_dnd and "DND" or "DND",
+                    icon = is_dnd and "󰂛" or "󰂚",
+                    variant = is_dnd and "danger" or "tonal",
+                    size = "sm",
                     on_click = "notification:toggle_dnd",
-                    children = {
-                        Zenith.Text({
-                            text = is_dnd and "󰂛 DND ON" or "󰂚 DND OFF",
-                            font_size = 10,
-                            color = is_dnd and Zenith.hex("#e06c75") or Zenith.hex(theme.on_surface),
-                        }),
-                    }
                 }),
                 Zenith.Box({ width = 6 }),
-                Zenith.Box({
-                    padding = { x = 8, y = 4 },
-                    border_radius = 6,
-                    background = Zenith.rgba(255, 255, 255, 12),
+                -- Clear All Button
+                UIKit.Button({
+                    label = "Limpar Tudo",
+                    icon = "󰃢",
+                    variant = "outlined",
+                    size = "sm",
                     on_click = "notification:clear",
-                    children = {
-                        Zenith.Text({ text = "Clear All", font_size = 10, color = Zenith.hex(theme.on_surface) }),
-                    }
                 }),
                 Zenith.Box({ width = 6 }),
                 Zenith.Box({

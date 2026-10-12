@@ -629,19 +629,105 @@ fn send_sway_ipc(sock_path: &Path, msg_type: u32, payload: &str) -> Result<Strin
     Ok(String::from_utf8(resp_buf)?)
 }
 
-/// Spawn the background thread streaming events from `.socket2.sock`.
+/// Resync all Hyprland state snapshots from command socket upon reconnect.
+fn resync_hyprland_state(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
+    let mut active_workspace = 1;
+    let mut workspaces = Vec::new();
+    let mut active_window = ActiveWindowSnapshot {
+        title: "Zenith Shell".to_string(),
+        class: "zenith".to_string(),
+        address: String::new(),
+    };
+    let mut clients = Vec::new();
+
+    if let Ok(resp) = send_socket_command(cmd_sock, "j/activeworkspace") {
+        if let Ok(val) = serde_json::from_str::<Value>(&resp) {
+            if let Some(id) = val["id"].as_i64() {
+                active_workspace = id as i32;
+            }
+        }
+    }
+
+    if let Ok(resp) = send_socket_command(cmd_sock, "j/workspaces") {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&resp) {
+            for item in items {
+                let id = item["id"].as_i64().unwrap_or(1) as i32;
+                let name = item["name"].as_str().unwrap_or("").to_string();
+                let monitor = item["monitor"].as_str().unwrap_or("").to_string();
+                let windows = item["windows"].as_u64().unwrap_or(0) as u32;
+                workspaces.push(WorkspaceItem {
+                    id,
+                    name,
+                    monitor,
+                    active: id == active_workspace,
+                    urgent: false,
+                    windows,
+                });
+            }
+        }
+    }
+    workspaces.sort_by_key(|w| w.id);
+    ensure_minimum_workspaces(&mut workspaces, active_workspace, 4);
+
+    if let Ok(resp) = send_socket_command(cmd_sock, "j/activewindow") {
+        if let Ok(val) = serde_json::from_str::<Value>(&resp) {
+            active_window = ActiveWindowSnapshot {
+                title: val["title"].as_str().unwrap_or("").to_string(),
+                class: val["class"].as_str().unwrap_or("").to_string(),
+                address: val["address"].as_str().unwrap_or("").to_string(),
+            };
+        }
+    }
+
+    if let Ok(resp) = send_socket_command(cmd_sock, "j/clients") {
+        clients = parse_clients_json(&resp);
+    }
+
+    if let Ok(mut w) = state.write() {
+        w.is_hyprland = true;
+        w.active_workspace = active_workspace;
+        w.workspaces = workspaces;
+        w.active_window = active_window;
+        w.clients = clients;
+    }
+    notify_change();
+}
+
+/// Spawn the background thread streaming events from `.socket2.sock` with resilient auto-reconnect and exponential backoff.
 fn spawn_event_listener(
-    event_sock: PathBuf,
-    cmd_sock: PathBuf,
+    initial_event_sock: PathBuf,
+    initial_cmd_sock: PathBuf,
     state: Arc<RwLock<HyprlandState>>,
 ) {
     let _ = std::thread::Builder::new()
         .name("hyprland-ipc".to_string())
         .spawn(move || {
+            let mut event_sock = initial_event_sock;
+            let mut cmd_sock = initial_cmd_sock;
+            let mut backoff = Duration::from_millis(50);
+            let max_backoff = Duration::from_millis(2000);
+
             loop {
+                // If socket doesn't exist on disk, re-resolve hypr runtime directory
+                if !event_sock.exists() {
+                    if let Some(dir) = resolve_hypr_dir() {
+                        event_sock = dir.join(".socket2.sock");
+                        cmd_sock = dir.join(".socket.sock");
+                        if let Ok(mut w) = state.write() {
+                            w.socket_dir = Some(dir);
+                            w.is_hyprland = true;
+                        }
+                    }
+                }
+
                 match UnixStream::connect(&event_sock) {
                     Ok(stream) => {
                         info!("Connected to Hyprland event stream: {}", event_sock.display());
+                        backoff = Duration::from_millis(50);
+
+                        // Resynchronize state upon fresh connection
+                        resync_hyprland_state(&cmd_sock, &state);
+
                         let reader = BufReader::new(stream);
                         for line in reader.lines() {
                             match line {
@@ -656,10 +742,12 @@ fn spawn_event_listener(
                         }
                     }
                     Err(e) => {
-                        debug!("Waiting for Hyprland event socket ({})...", e);
+                        debug!("Waiting for Hyprland event socket ({}), retry in {:?}...", e, backoff);
                     }
                 }
-                std::thread::sleep(Duration::from_secs(1));
+
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(max_backoff);
             }
         });
 }
@@ -783,13 +871,9 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 changed = true;
             }
             "openwindow" | "closewindow" | "movewindowv2" | "urgent" => {
-                let cmd_sock_clone = cmd_sock.to_path_buf();
-                let state_clone = state.clone();
-                std::thread::spawn(move || {
-                    resync_workspaces(&cmd_sock_clone, &state_clone);
-                    resync_clients(&cmd_sock_clone, &state_clone);
-                    notify_change();
-                });
+                resync_workspaces(cmd_sock, state);
+                resync_clients(cmd_sock, state);
+                notify_change();
             }
             "configreloaded" => {
                 let gaps = query_gaps_out(cmd_sock);
@@ -797,13 +881,9 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     let mut w = state.write().unwrap();
                     w.gaps_out = gaps;
                 }
-                let cmd_sock_clone = cmd_sock.to_path_buf();
-                let state_clone = state.clone();
-                std::thread::spawn(move || {
-                    resync_workspaces(&cmd_sock_clone, &state_clone);
-                    resync_clients(&cmd_sock_clone, &state_clone);
-                    notify_change();
-                });
+                resync_workspaces(cmd_sock, state);
+                resync_clients(cmd_sock, state);
+                notify_change();
             }
             _ => {}
         }

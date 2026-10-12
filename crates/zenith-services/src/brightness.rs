@@ -43,7 +43,12 @@ impl BrightnessService {
         });
 
         if let Ok(guard) = lock.read() {
-            if guard.1.elapsed() < Duration::from_millis(500) {
+            let ttl = if guard.0.device == "fallback" || guard.0.device.is_empty() {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(1000)
+            };
+            if guard.1.elapsed() < ttl {
                 return guard.0.clone();
             }
         }

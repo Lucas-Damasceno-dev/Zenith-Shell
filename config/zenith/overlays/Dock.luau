@@ -1,24 +1,25 @@
--- Dock: Floating Glassmorphic Wayland Bottom Dock (Caelestia / macOS Style)
--- Integrates with Hyprland client tracking, running window indicators, and launcher dispatch.
+--!strict
+-- Zenith-Shell (Engine v2) - Floating Glassmorphic Wayland Bottom Dock
+-- Parity 1:1 with Quickshell dock, Hyprland client tracking, spring physics and focus:<address>.
 
 local theme = Zenith.Theme()
 local clients = Zenith.Services.Clients()
 
--- Pinned applications configuration (user installed tools)
+-- Pinned applications (Terminal, Navegador, Editor de Código, Gerenciador de Arquivos, Spotify, Discord)
 local pinned_apps = {
     { icon = "", name = "Terminal", class = "foot", exec = "foot" },
-    { icon = "󰈹", name = "Brave Browser", class = "brave", exec = "brave" },
-    { icon = "󰉋", name = "Files", class = "thunar", exec = "thunar" },
-    { icon = "", name = "Neovim", class = "nvim", exec = "foot -e nvim" },
-    { icon = "󰓃", name = "EasyEffects", class = "easyeffects", exec = "easyeffects" },
-    { icon = "󰢮", name = "System Monitor", class = "btop", exec = "foot -e btop" },
+    { icon = "󰈹", name = "Navegador", class = "brave", exec = "brave" },
+    { icon = "󰨞", name = "Editor de Código", class = "code", exec = "code" },
+    { icon = "󰉋", name = "Gerenciador de Arquivos", class = "thunar", exec = "thunar" },
+    { icon = "󰓇", name = "Spotify", class = "spotify", exec = "spotify" },
+    { icon = "󰭹", name = "Discord", class = "vesktop", exec = "vesktop" },
 }
 
-local function find_client(class_pattern)
+local function find_client(class_pattern: string)
+    local pat = string.lower(class_pattern)
     for _, c in ipairs(clients) do
         local c_class = string.lower(c.class or "")
         local c_init = string.lower(c.initial_class or "")
-        local pat = string.lower(class_pattern)
         if string.find(c_class, pat) or string.find(c_init, pat) then
             return c
         end
@@ -26,7 +27,7 @@ local function find_client(class_pattern)
     return nil
 end
 
-local function is_pinned(class_name)
+local function is_pinned(class_name: string?): boolean
     local pat = string.lower(class_name or "")
     for _, pin in ipairs(pinned_apps) do
         if string.find(pat, string.lower(pin.class)) then
@@ -37,38 +38,38 @@ local function is_pinned(class_name)
 end
 
 -- Render individual app capsule item
-local function DockItem(icon, name, is_running, client, exec)
+local function DockItem(icon: string, name: string, is_running: boolean, client: any?, exec: string?)
     local click_action = ""
     if is_running and client and client.address then
-        click_action = "window:toggle_minimize:" .. client.address
+        -- Focus window directly via Hyprland address
+        click_action = "focus:" .. client.address
     else
         click_action = "cmd:" .. (exec or name) .. " &"
     end
 
-    local bg = is_running and Zenith.hex("#ffffff12") or Zenith.hex("#ffffff00")
+    local bg = is_running and Zenith.hex(theme.surface_container_high or theme.surface_container, 130) or Zenith.rgba(255, 255, 255, 0)
     local icon_color = is_running and theme.primary or theme.on_surface
-    local indicator_color = is_running and theme.primary or Zenith.hex("#ffffff00")
+    local indicator_color = is_running and theme.primary or Zenith.rgba(0, 0, 0, 0)
 
     return Zenith.Box({
         direction = "column",
         align_items = "center",
         justify_content = "center",
-        padding = { x = 10, y = 4 },
-        border_radius = 12,
+        padding = { x = 11, y = 4 },
+        border_radius = 14,
         background = bg,
+        tooltip = if is_running and client and client.title and #client.title > 0 then (name .. " • " .. client.title) else name,
         on_click = click_action,
         children = {
             Zenith.Text({
                 text = icon,
-                font_size = 18,
-                font_family = "JetBrainsMono Nerd Font",
+                font_size = 20,
                 color = icon_color,
             }),
             -- Running indicator dot
             Zenith.Text({
                 text = "●",
-                font_size = 6,
-                font_family = "JetBrainsMono Nerd Font",
+                font_size = 7,
                 color = indicator_color,
             }),
         }
@@ -77,20 +78,20 @@ end
 
 local dock_children = {}
 
--- 1. App Launcher shortcut at left
+-- 1. App Launcher shortcut at left (NixOS icon )
 table.insert(dock_children, Zenith.Box({
     direction = "column",
     align_items = "center",
     justify_content = "center",
-    padding = { x = 10, y = 4 },
-    border_radius = 12,
-    background = Zenith.hex("#ffffff0c"),
-    on_click = "popup:toggle:launcher",
+    padding = { x = 11, y = 4 },
+    border_radius = 14,
+    background = Zenith.hex(theme.surface_container_high or theme.surface_container, 110),
+    tooltip = "Abrir Launcher (Super)",
+    on_click = "popup:toggle:Launcher",
     children = {
         Zenith.Text({
-            text = "󰀻",
-            font_size = 18,
-            font_family = "JetBrainsMono Nerd Font",
+            text = "",
+            font_size = 19,
             color = theme.primary,
         }),
         Zenith.Text({
@@ -105,12 +106,12 @@ table.insert(dock_children, Zenith.Box({
 table.insert(dock_children, Zenith.Box({
     width = 1,
     height = 28,
-    background = theme.outline,
+    background = Zenith.hex(theme.outline_variant or theme.outline, 45),
     margin = { x = 4, y = 0 },
     children = {},
 }))
 
--- 2. Pinned Apps
+-- 2. Pinned Apps (Terminal, Browser, Code, Files, Spotify, Discord)
 for _, pin in ipairs(pinned_apps) do
     local client = find_client(pin.class)
     local is_running = client ~= nil
@@ -126,7 +127,7 @@ for _, c in ipairs(clients) do
             table.insert(dock_children, Zenith.Box({
                 width = 1,
                 height = 28,
-                background = theme.outline,
+                background = Zenith.hex(theme.outline_variant or theme.outline, 45),
                 margin = { x = 4, y = 0 },
                 children = {},
             }))
@@ -135,22 +136,24 @@ for _, c in ipairs(clients) do
 
         local icon = ""
         local lower_cls = string.lower(c.class)
-        if string.find(lower_cls, "chrome") or string.find(lower_cls, "brave") then icon = "󰈹"
+        if string.find(lower_cls, "chrome") or string.find(lower_cls, "chromium") then icon = "󰈹"
+        elseif string.find(lower_cls, "firefox") then icon = "󰈹"
         elseif string.find(lower_cls, "steam") then icon = "󰓓"
         elseif string.find(lower_cls, "obs") then icon = "󰑋"
-        elseif string.find(lower_cls, "gimp") or string.find(lower_cls, "inkscape") then icon = "󰽉"
+        elseif string.find(lower_cls, "gimp") or string.find(lower_cls, "inkscape") or string.find(lower_cls, "blender") then icon = "󰽉"
         elseif string.find(lower_cls, "telegram") then icon = "󰀨"
+        elseif string.find(lower_cls, "mpv") or string.find(lower_cls, "vlc") then icon = "󰕼"
         end
 
         table.insert(dock_children, DockItem(icon, c.class, true, c, c.class))
     end
 end
 
--- 4. Right Utility Section
+-- 4. Right Utility Section: Notifications + Power Menu
 table.insert(dock_children, Zenith.Box({
     width = 1,
     height = 28,
-    background = theme.outline,
+    background = Zenith.hex(theme.outline_variant or theme.outline, 45),
     margin = { x = 4, y = 0 },
     children = {},
 }))
@@ -159,15 +162,15 @@ table.insert(dock_children, Zenith.Box({
     direction = "column",
     align_items = "center",
     justify_content = "center",
-    padding = { x = 10, y = 4 },
-    border_radius = 12,
-    background = Zenith.hex("#ffffff08"),
-    on_click = "popup:toggle:notifications",
+    padding = { x = 11, y = 4 },
+    border_radius = 14,
+    background = Zenith.hex(theme.surface_container_high or theme.surface_container, 80),
+    tooltip = "Centro de Notificações",
+    on_click = "popup:toggle:NotificationCenter",
     children = {
         Zenith.Text({
             text = "󰂚",
-            font_size = 17,
-            font_family = "JetBrainsMono Nerd Font",
+            font_size = 18,
             color = theme.on_surface,
         }),
         Zenith.Text({
@@ -182,46 +185,46 @@ table.insert(dock_children, Zenith.Box({
     direction = "column",
     align_items = "center",
     justify_content = "center",
-    padding = { x = 10, y = 4 },
-    border_radius = 12,
-    background = Zenith.hex("#ffffff08"),
-    on_click = "popup:toggle:power",
+    padding = { x = 11, y = 4 },
+    border_radius = 14,
+    background = Zenith.hex(theme.surface_container_high or theme.surface_container, 80),
+    tooltip = "Menu de Energia",
+    on_click = "popup:toggle:PowerMenu",
     children = {
         Zenith.Text({
             text = "󰐥",
-            font_size = 17,
-            font_family = "JetBrainsMono Nerd Font",
-            color = Zenith.hex("#f38ba8"),
+            font_size = 18,
+            color = Zenith.hex(theme.error or "#f38ba8"),
         }),
         Zenith.Text({
             text = " ",
             font_size = 6,
-            color = Zenith.hex("#00000000"),
+            color = Zenith.rgba(0, 0, 0, 0),
         }),
     }
 }))
 
--- Root Dock Container: Outer transparent centering wrapper + inner glass pill
+-- Root Dock Container: Bottom centered with 12px margin and glassmorphic pill
 return Zenith.Box({
     direction = "row",
-    align_items = "flex-start",
+    align_items = "flex-end",
     justify_content = "center",
-    padding = { x = 0, top = 0, bottom = 8 },
+    padding = { x = 0, top = 0, bottom = 12 },
     children = {
         Zenith.Box({
             direction = "row",
             align_items = "center",
-            height = 52,
+            height = 56,
             padding = { x = 14, y = 5 },
-            gap = 4,
-            border_radius = 20,
-            background = Zenith.hex("#181b22e8"),
-            border_color = theme.outline,
+            gap = 6,
+            border_radius = 24,
+            background = Zenith.hex(theme.surface, 215),
+            border_color = Zenith.hex(theme.outline_variant or theme.outline, 45),
             border_width = 1,
             shadow = {
-                blur = 16,
-                color = Zenith.hex("#00000088"),
-                offset_y = 4,
+                blur = 22,
+                color = Zenith.rgba(0, 0, 0, 160),
+                offset_y = 6,
             },
             children = dock_children,
         }),

@@ -60,6 +60,9 @@ pub struct WindowMeta {
     pub keyboard_mode: Option<String>,
 }
 
+pub mod editor;
+pub use editor::{CursorDirection, TextEditorEngine};
+
 /// Computed text input parameters for Wayland focus and text rendering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedTextInput {
@@ -71,8 +74,37 @@ pub struct ComputedTextInput {
     pub placeholder_color: Color,
     pub active: bool,
     pub cursor_pos: usize,
+    pub selection_range: Option<(usize, usize)>,
+    pub cursor_offset_x: f32,
+    pub selection_rect: Option<(f32, f32, f32, f32)>,
     pub on_change: Option<String>,
     pub on_submit: Option<String>,
+}
+
+/// Computed slider parameters for interactive range controls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedSlider {
+    pub id: Option<String>,
+    pub min: f32,
+    pub max: f32,
+    pub value: f32,
+    pub track_height: f32,
+    pub thumb_radius: f32,
+    pub track_color: Color,
+    pub active_track_color: Color,
+    pub thumb_color: Color,
+    pub on_change: Option<String>,
+}
+
+/// Computed switch parameters for animated toggle controls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedSwitch {
+    pub id: Option<String>,
+    pub checked: bool,
+    pub active_color: Color,
+    pub inactive_color: Color,
+    pub thumb_color: Color,
+    pub on_toggle: Option<String>,
 }
 
 /// Shadow parameters for vector drop shadows.
@@ -82,6 +114,13 @@ pub struct ShadowStyle {
     pub blur: f32,
     pub offset_x: f32,
     pub offset_y: f32,
+}
+
+/// Custom GLSL ES 3.0 fragment shader style.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomShaderStyle {
+    pub fragment: String,
+    pub uniforms: Vec<(String, f32)>,
 }
 
 /// Node style properties for Zenith UI elements.
@@ -103,6 +142,7 @@ pub struct NodeStyle {
     pub flex_shrink: f32,
     pub max_width: Option<f32>,
     pub shadow: Option<ShadowStyle>,
+    pub custom_shader: Option<CustomShaderStyle>,
     pub overflow: Overflow,
     pub scroll_offset_y: f32,
 }
@@ -127,6 +167,7 @@ impl Default for NodeStyle {
             flex_shrink: 1.0,
             max_width: None,
             shadow: None,
+            custom_shader: None,
             overflow: Overflow::Visible,
             scroll_offset_y: 0.0,
         }
@@ -143,6 +184,7 @@ pub enum UiNode {
         on_right_click: Option<String>,
         on_scroll_up: Option<String>,
         on_scroll_down: Option<String>,
+        tooltip: Option<String>,
     },
     Text {
         text: String,
@@ -159,6 +201,7 @@ pub enum UiNode {
         placeholder_color: Color,
         active: bool,
         cursor_pos: usize,
+        selection_range: Option<(usize, usize)>,
         style: NodeStyle,
         on_change: Option<String>,
         on_submit: Option<String>,
@@ -166,6 +209,33 @@ pub enum UiNode {
     Image {
         src: String,
         style: NodeStyle,
+    },
+    Shader {
+        fragment: String,
+        uniforms: Vec<(String, f32)>,
+        style: NodeStyle,
+    },
+    Slider {
+        id: Option<String>,
+        min: f32,
+        max: f32,
+        value: f32,
+        track_height: f32,
+        thumb_radius: f32,
+        track_color: Color,
+        active_track_color: Color,
+        thumb_color: Color,
+        style: NodeStyle,
+        on_change: Option<String>,
+    },
+    Switch {
+        id: Option<String>,
+        checked: bool,
+        active_color: Color,
+        inactive_color: Color,
+        thumb_color: Color,
+        style: NodeStyle,
+        on_toggle: Option<String>,
     },
     Window {
         meta: WindowMeta,
@@ -195,15 +265,20 @@ pub struct ComputedBox {
     pub border_width: f32,
     pub border_radius: f32,
     pub shadow: Option<ShadowStyle>,
+    pub custom_shader: Option<CustomShaderStyle>,
     pub text: Option<(String, Color, f32)>,
     pub image: Option<String>,
     pub text_input: Option<ComputedTextInput>,
+    pub slider: Option<ComputedSlider>,
+    pub switch: Option<ComputedSwitch>,
     pub overflow: Overflow,
     pub scroll_offset_y: f32,
     pub on_click: Option<String>,
     pub on_right_click: Option<String>,
     pub on_scroll_up: Option<String>,
     pub on_scroll_down: Option<String>,
+    pub tooltip: Option<String>,
+    pub tooltip_active: bool,
 }
 
 
@@ -300,6 +375,33 @@ impl LayoutEngine {
                 }
                 self.taffy.new_leaf(taffy_style).unwrap()
             }
+
+            UiNode::Shader { style, .. } => {
+                let taffy_style = Self::convert_style(style);
+                self.taffy.new_leaf(taffy_style).unwrap()
+            }
+
+            UiNode::Slider { style, .. } => {
+                let mut taffy_style = Self::convert_style(style);
+                if style.width.is_none() {
+                    taffy_style.size.width = length(160.0);
+                }
+                if style.height.is_none() {
+                    taffy_style.size.height = length(24.0);
+                }
+                self.taffy.new_leaf(taffy_style).unwrap()
+            }
+
+            UiNode::Switch { style, .. } => {
+                let mut taffy_style = Self::convert_style(style);
+                if style.width.is_none() {
+                    taffy_style.size.width = length(44.0);
+                }
+                if style.height.is_none() {
+                    taffy_style.size.height = length(24.0);
+                }
+                self.taffy.new_leaf(taffy_style).unwrap()
+            }
         }
     }
 
@@ -353,14 +455,15 @@ impl LayoutEngine {
         match node {
             UiNode::Box { style, children, .. }
             | UiNode::Window { style, children, .. } => {
-                let (on_c, on_rc, on_su, on_sd) = match node {
-                    UiNode::Box { on_click, on_right_click, on_scroll_up, on_scroll_down, .. } => (
+                let (on_c, on_rc, on_su, on_sd, tip) = match node {
+                    UiNode::Box { on_click, on_right_click, on_scroll_up, on_scroll_down, tooltip, .. } => (
                         on_click.clone(),
                         on_right_click.clone(),
                         on_scroll_up.clone(),
                         on_scroll_down.clone(),
+                        tooltip.clone(),
                     ),
-                    _ => (None, None, None, None),
+                    _ => (None, None, None, None, None),
                 };
 
                 out.push(ComputedBox {
@@ -373,15 +476,20 @@ impl LayoutEngine {
                     border_width: style.border_width,
                     border_radius: style.border_radius,
                     shadow: style.shadow,
+                    custom_shader: style.custom_shader.clone(),
                     text: None,
                     image: None,
                     text_input: None,
+                    slider: None,
+                    switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: style.scroll_offset_y,
                     on_click: on_c,
                     on_right_click: on_rc,
                     on_scroll_up: on_su,
                     on_scroll_down: on_sd,
+                    tooltip: tip,
+                    tooltip_active: false,
                 });
 
                 let child_ids = self.taffy.children(node_id).unwrap();
@@ -406,15 +514,20 @@ impl LayoutEngine {
                     border_width: style.border_width,
                     border_radius: style.border_radius,
                     shadow: style.shadow,
+                    custom_shader: None,
                     text: Some((text.clone(), *color, *font_size)),
                     image: None,
                     text_input: None,
+                    slider: None,
+                    switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
+                    tooltip: None,
+                    tooltip_active: false,
                 });
             }
             UiNode::TextInput {
@@ -427,9 +540,24 @@ impl LayoutEngine {
                 placeholder_color,
                 active,
                 cursor_pos,
+                selection_range,
                 on_change,
                 on_submit,
             } => {
+                let char_w = font_size * 0.62;
+                let line_h = font_size * 1.3;
+                let cursor_chars = text.get(..*cursor_pos).map(|s| s.chars().count()).unwrap_or_else(|| text.chars().count());
+                let cursor_offset_x = cursor_chars as f32 * char_w;
+
+                let selection_rect = selection_range.as_ref().map(|&(s, e)| {
+                    let s_chars = text.get(..s).map(|st| st.chars().count()).unwrap_or(0);
+                    let e_chars = text.get(..e).map(|st| st.chars().count()).unwrap_or_else(|| text.chars().count());
+                    let sel_x = s_chars as f32 * char_w;
+                    let sel_w = ((e_chars.saturating_sub(s_chars)) as f32 * char_w).max(2.0);
+                    let sel_y = ((layout.size.height - line_h) * 0.5).max(0.0);
+                    (sel_x, sel_y, sel_w, line_h)
+                });
+
                 out.push(ComputedBox {
                     x: abs_x,
                     y: abs_y,
@@ -440,6 +568,7 @@ impl LayoutEngine {
                     border_width: style.border_width,
                     border_radius: style.border_radius,
                     shadow: style.shadow,
+                    custom_shader: None,
                     text: None,
                     image: None,
                     text_input: Some(ComputedTextInput {
@@ -451,15 +580,22 @@ impl LayoutEngine {
                         placeholder_color: *placeholder_color,
                         active: *active,
                         cursor_pos: *cursor_pos,
+                        selection_range: *selection_range,
+                        cursor_offset_x,
+                        selection_rect,
                         on_change: on_change.clone(),
                         on_submit: on_submit.clone(),
                     }),
+                    slider: None,
+                    switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
+                    tooltip: None,
+                    tooltip_active: false,
                 });
             }
             UiNode::Image { style, src } => {
@@ -473,15 +609,142 @@ impl LayoutEngine {
                     border_width: style.border_width,
                     border_radius: style.border_radius,
                     shadow: style.shadow,
+                    custom_shader: None,
                     text: None,
                     image: Some(src.clone()),
                     text_input: None,
+                    slider: None,
+                    switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
+                    tooltip: None,
+                    tooltip_active: false,
+                });
+            }
+            UiNode::Shader { style, fragment, uniforms } => {
+                out.push(ComputedBox {
+                    x: abs_x,
+                    y: abs_y,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                    background_color: style.background_color,
+                    border_color: style.border_color,
+                    border_width: style.border_width,
+                    border_radius: style.border_radius,
+                    shadow: style.shadow,
+                    custom_shader: Some(CustomShaderStyle {
+                        fragment: fragment.clone(),
+                        uniforms: uniforms.clone(),
+                    }),
+                    text: None,
+                    image: None,
+                    text_input: None,
+                    slider: None,
+                    switch: None,
+                    overflow: style.overflow,
+                    scroll_offset_y: 0.0,
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                    tooltip_active: false,
+                });
+            }
+            UiNode::Slider {
+                id,
+                min,
+                max,
+                value,
+                track_height,
+                thumb_radius,
+                track_color,
+                active_track_color,
+                thumb_color,
+                style,
+                on_change,
+            } => {
+                out.push(ComputedBox {
+                    x: abs_x,
+                    y: abs_y,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                    background_color: style.background_color,
+                    border_color: style.border_color,
+                    border_width: style.border_width,
+                    border_radius: style.border_radius,
+                    shadow: style.shadow,
+                    custom_shader: None,
+                    text: None,
+                    image: None,
+                    text_input: None,
+                    slider: Some(ComputedSlider {
+                        id: id.clone(),
+                        min: *min,
+                        max: *max,
+                        value: *value,
+                        track_height: *track_height,
+                        thumb_radius: *thumb_radius,
+                        track_color: *track_color,
+                        active_track_color: *active_track_color,
+                        thumb_color: *thumb_color,
+                        on_change: on_change.clone(),
+                    }),
+                    switch: None,
+                    overflow: style.overflow,
+                    scroll_offset_y: 0.0,
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                    tooltip_active: false,
+                });
+            }
+            UiNode::Switch {
+                id,
+                checked,
+                active_color,
+                inactive_color,
+                thumb_color,
+                style,
+                on_toggle,
+            } => {
+                out.push(ComputedBox {
+                    x: abs_x,
+                    y: abs_y,
+                    width: layout.size.width,
+                    height: layout.size.height,
+                    background_color: style.background_color,
+                    border_color: style.border_color,
+                    border_width: style.border_width,
+                    border_radius: style.border_radius,
+                    shadow: style.shadow,
+                    custom_shader: None,
+                    text: None,
+                    image: None,
+                    text_input: None,
+                    slider: None,
+                    switch: Some(ComputedSwitch {
+                        id: id.clone(),
+                        checked: *checked,
+                        active_color: *active_color,
+                        inactive_color: *inactive_color,
+                        thumb_color: *thumb_color,
+                        on_toggle: on_toggle.clone(),
+                    }),
+                    overflow: style.overflow,
+                    scroll_offset_y: 0.0,
+                    on_click: on_toggle.clone(),
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                    tooltip_active: false,
                 });
             }
         }
@@ -512,12 +775,14 @@ mod tests {
                     on_right_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
+                    tooltip: None,
                 }
             ],
             on_click: None,
             on_right_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
+            tooltip: None,
         };
         let computed = engine.compute(&root, 1346.0, 44.0);
         println!("Computed boxes: {:?}", computed);
@@ -550,6 +815,7 @@ mod tests {
                             on_right_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
+                            tooltip: None,
                         },
                         UiNode::Box {
                             style: NodeStyle { flex_grow: 1.0, ..Default::default() },
@@ -558,6 +824,7 @@ mod tests {
                             on_right_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
+                            tooltip: None,
                         },
                         UiNode::Box {
                             style: NodeStyle { width: Some(80.0), height: Some(30.0), ..Default::default() },
@@ -566,6 +833,7 @@ mod tests {
                             on_right_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
+                            tooltip: None,
                         },
                         UiNode::Box {
                             style: NodeStyle { flex_grow: 1.0, ..Default::default() },
@@ -574,6 +842,7 @@ mod tests {
                             on_right_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
+                            tooltip: None,
                         },
                         UiNode::Box {
                             style: NodeStyle { width: Some(120.0), height: Some(30.0), ..Default::default() },
@@ -582,18 +851,21 @@ mod tests {
                             on_right_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
+                            tooltip: None,
                         },
                     ],
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
+                    tooltip: None,
                 }
             ],
             on_click: None,
             on_right_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
+            tooltip: None,
         };
         let computed = engine.compute(&root, 1346.0, 44.0);
         assert_eq!(computed[0].width, 1346.0);
@@ -626,6 +898,7 @@ mod tests {
                     placeholder_color: Color::rgb(150, 150, 150),
                     active: true,
                     cursor_pos: 5,
+                    selection_range: None,
                     style: NodeStyle {
                         width: Some(300.0),
                         height: Some(36.0),
@@ -647,6 +920,7 @@ mod tests {
             on_right_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
+            tooltip: None,
         };
 
         let computed = engine.compute(&root, 400.0, 300.0);
@@ -662,5 +936,28 @@ mod tests {
 
         let img_box = &computed[2];
         assert_eq!(img_box.image.as_deref(), Some("/tmp/icon.png"));
+    }
+
+    #[test]
+    fn test_box_tooltip_property() {
+        let mut engine = LayoutEngine::new();
+        let root = UiNode::Box {
+            style: NodeStyle {
+                width: Some(200.0),
+                height: Some(40.0),
+                ..Default::default()
+            },
+            children: vec![],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: Some("Click to toggle Wi-Fi".to_string()),
+        };
+
+        let computed = engine.compute(&root, 200.0, 40.0);
+        assert_eq!(computed.len(), 1);
+        assert_eq!(computed[0].tooltip.as_deref(), Some("Click to toggle Wi-Fi"));
+        assert!(!computed[0].tooltip_active);
     }
 }

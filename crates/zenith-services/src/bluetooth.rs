@@ -70,21 +70,36 @@ impl BluetoothService {
         })
     }
 
-    /// Retrieve current Bluetooth controller and devices state.
+    /// Retrieve current Bluetooth controller and devices state non-blockingly.
     pub fn status() -> BluetoothStatus {
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
         if guard.last_update.elapsed() > Duration::from_millis(3000) {
-            guard.status = Self::query_system_status();
             guard.last_update = Instant::now();
+            let c_arc = cache_arc.clone();
+            std::thread::spawn(move || {
+                let fresh = Self::query_system_status();
+                if let Ok(mut g) = c_arc.lock() {
+                    g.status = fresh;
+                    g.last_update = Instant::now();
+                }
+            });
         }
         guard.status.clone()
     }
 
+    /// Check if physical bluetooth adapter exists on this machine.
+    pub fn has_hardware() -> bool {
+        std::path::Path::new("/sys/class/bluetooth").exists()
+    }
+
     /// Connect to a Bluetooth device by MAC address.
     pub fn connect(mac: &str) -> Result<(), String> {
+        if !Self::has_hardware() {
+            return Err("No Bluetooth adapter present".to_string());
+        }
         let out = Command::new("bluetoothctl")
-            .args(["connect", mac])
+            .args(["--timeout", "3", "connect", mac])
             .output()
             .map_err(|e| e.to_string())?;
         if out.status.success() {
@@ -96,8 +111,11 @@ impl BluetoothService {
 
     /// Disconnect from a Bluetooth device by MAC address.
     pub fn disconnect(mac: &str) -> Result<(), String> {
+        if !Self::has_hardware() {
+            return Err("No Bluetooth adapter present".to_string());
+        }
         let out = Command::new("bluetoothctl")
-            .args(["disconnect", mac])
+            .args(["--timeout", "3", "disconnect", mac])
             .output()
             .map_err(|e| e.to_string())?;
         if out.status.success() {
@@ -109,24 +127,33 @@ impl BluetoothService {
 
     /// Toggle Bluetooth controller power state.
     pub fn toggle_power() -> bool {
+        if !Self::has_hardware() {
+            return false;
+        }
         let current = Self::status().powered;
         let target = if current { "off" } else { "on" };
-        let _ = Command::new("bluetoothctl").args(["power", target]).status();
+        let _ = Command::new("bluetoothctl")
+            .args(["--timeout", "3", "power", target])
+            .status();
         !current
     }
 
     fn query_system_status() -> BluetoothStatus {
+        if !Self::has_hardware() {
+            return BluetoothStatus::default();
+        }
+
         let mut devices = Vec::new();
         let mut powered = true;
 
-        if let Ok(out) = Command::new("bluetoothctl").arg("show").output() {
+        if let Ok(out) = Command::new("bluetoothctl").args(["--timeout", "2", "show"]).output() {
             let s = String::from_utf8_lossy(&out.stdout);
             if s.contains("Powered: no") {
                 powered = false;
             }
         }
 
-        if let Ok(out) = Command::new("bluetoothctl").arg("devices").output() {
+        if let Ok(out) = Command::new("bluetoothctl").args(["--timeout", "2", "devices"]).output() {
             let s = String::from_utf8_lossy(&out.stdout);
             for line in s.lines() {
                 // Device FC:58:FA:12:34:56 Sony WH-1000XM5
@@ -145,7 +172,7 @@ impl BluetoothService {
         }
 
         // Check which devices are currently connected
-        if let Ok(out) = Command::new("bluetoothctl").args(["devices", "Connected"]).output() {
+        if let Ok(out) = Command::new("bluetoothctl").args(["--timeout", "2", "devices", "Connected"]).output() {
             let s = String::from_utf8_lossy(&out.stdout);
             for line in s.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();

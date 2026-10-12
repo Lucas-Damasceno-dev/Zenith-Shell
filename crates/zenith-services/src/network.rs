@@ -77,13 +77,20 @@ impl NetworkService {
         guard.status.clone()
     }
 
-    /// Scan and return nearby Wi-Fi networks.
+    /// Scan and return nearby Wi-Fi networks non-blockingly.
     pub fn scan_wifi() -> Vec<WifiNetwork> {
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
         if guard.last_scan.elapsed() > Duration::from_millis(5000) {
-            guard.wifi_list = Self::query_system_wifi();
             guard.last_scan = Instant::now();
+            let c_arc = cache_arc.clone();
+            std::thread::spawn(move || {
+                let fresh = Self::query_system_wifi();
+                if let Ok(mut g) = c_arc.lock() {
+                    g.wifi_list = fresh;
+                    g.last_scan = Instant::now();
+                }
+            });
         }
         guard.wifi_list.clone()
     }
@@ -106,6 +113,12 @@ impl NetworkService {
     }
 
     fn query_system_status() -> NetworkStatus {
+        if let Some(dbus_status) = Self::query_dbus_status() {
+            if dbus_status.connected {
+                return dbus_status;
+            }
+        }
+
         // Try nmcli -t -f TYPE,STATE,CONNECTION dev
         if let Ok(output) = Command::new("nmcli")
             .env("LC_ALL", "C")
@@ -134,6 +147,29 @@ impl NetworkService {
         }
 
         NetworkStatus::default()
+    }
+
+    fn query_dbus_status() -> Option<NetworkStatus> {
+        let conn = zbus::blocking::Connection::system().ok()?;
+        let proxy = zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.NetworkManager",
+        ).ok()?;
+
+        let state: u32 = proxy.get_property("State").ok()?;
+        let connected = state >= 50;
+        let conn_type: String = proxy.get_property("PrimaryConnectionType").unwrap_or_else(|_| "ethernet".to_string());
+        let ip = Self::query_local_ip();
+
+        Some(NetworkStatus {
+            connected,
+            connection_type: conn_type,
+            ssid: None,
+            ip_address: ip,
+            signal_percent: if connected { 90 } else { 0 },
+        })
     }
 
     fn query_system_wifi() -> Vec<WifiNetwork> {

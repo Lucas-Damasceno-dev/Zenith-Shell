@@ -2,7 +2,9 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+pub mod kinetic_scroll;
 pub mod spring;
+pub use kinetic_scroll::KineticScrollEngine;
 pub use spring::{SpringAnimation, SpringConfig};
 
 /// Initialize structured logging for the Zenith engine.

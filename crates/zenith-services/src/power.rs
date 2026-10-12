@@ -29,12 +29,13 @@ impl PowerProfileService {
         });
 
         if let Ok(guard) = lock.read() {
-            if guard.1.elapsed() < Duration::from_secs(2) {
+            if guard.1.elapsed() < Duration::from_secs(10) {
                 return guard.0.clone();
             }
         }
 
-        let profile = Self::read_platform_profile()
+        let profile = Self::read_dbus_power_profile()
+            .or_else(Self::read_platform_profile)
             .or_else(Self::read_powerprofilesctl)
             .unwrap_or_else(|| "balanced".to_string());
 
@@ -55,13 +56,49 @@ impl PowerProfileService {
 
         let prof_str = prof.to_string();
         std::thread::spawn(move || {
-            let _ = std::process::Command::new("powerprofilesctl")
-                .args(["set", &prof_str])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let sent_native = if let Ok(conn) = zbus::blocking::Connection::system() {
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "net.hadess.PowerProfiles",
+                    "/net/hadess/PowerProfiles",
+                    "net.hadess.PowerProfiles",
+                ) {
+                    proxy.set_property("ActiveProfile", &prof_str).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !sent_native {
+                let _ = std::process::Command::new("powerprofilesctl")
+                    .args(["set", &prof_str])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
             Self::invalidate_cache();
         });
+    }
+
+    fn read_dbus_power_profile() -> Option<String> {
+        if let Ok(conn) = zbus::blocking::Connection::system() {
+            if let Ok(proxy) = zbus::blocking::Proxy::new(
+                &conn,
+                "net.hadess.PowerProfiles",
+                "/net/hadess/PowerProfiles",
+                "net.hadess.PowerProfiles",
+            ) {
+                if let Ok(prof) = proxy.get_property::<String>("ActiveProfile") {
+                    let trimmed = prof.trim().to_string();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn read_platform_profile() -> Option<String> {

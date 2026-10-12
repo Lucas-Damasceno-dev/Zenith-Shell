@@ -9,6 +9,11 @@
 
 Zenith-Shell is an ultra-high-performance, standalone Wayland desktop shell engine written in **Rust** with **Luau** (embedded Roblox Luau engine via `mlua`) as its declarative configuration and scripting language.
 
+> 📘 **Especificação Normativa v3:** Para o roteiro de evolução arquitetural completo (OpenGL ES 3.0 / EGL, Sinais Reativos em Luau, D-Bus com `zbus` e tipagem estática), consulte [`docs/CORE_ARCHITECTURE_EVOLUTION.md`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/docs/CORE_ARCHITECTURE_EVOLUTION.md).
+
+### Core Principle: Decoupling Engine Base from User Shell
+A arquitetura do Zenith separa categoricamente a **Engine Base** (framework estável e agnóstico de UI) da **Shell de Usuário** (scripts declarativos de widgets). O desenvolvimento foca na maturidade da base em Rust antes da portagem de superfícies cosméticas complexas.
+
 ### Why Replace Quickshell (Qt6 / QML)?
 | Dimension | Quickshell (Qt6 / C++) | Zenith-Shell (Rust / Luau) | Improvement Factor |
 | :--- | :--- | :--- | :--- |

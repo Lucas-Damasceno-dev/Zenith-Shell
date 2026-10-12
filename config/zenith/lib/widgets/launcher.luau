@@ -1,27 +1,20 @@
 --!strict
 -- Zenith UI Kit - Launcher Pill Component (NixOS / End-4 style)
 
+local Pill = Zenith.import("widgets/pill")
+
 local function Launcher(props: { text: string?, on_click: string? }?)
-    local theme = Zenith.Theme()
-    local text = props and props.text or "󱄅"
+    local text = props and props.text or ""
     local on_click = props and props.on_click or "popup:toggle:Launcher"
 
-    return Zenith.Box({
-        direction = "row",
-        padding = { x = 8, y = 3 },
-        gap = 6,
-        border_radius = 12,
-        background = Zenith.rgba(122, 162, 247, 35),
-        border_color = Zenith.rgba(122, 162, 247, 90),
-        border_width = 1,
+    return Pill({
+        icon = text,
+        icon_size = 13,
+        variant = "accent_chip",
+        height = 26,
+        border_radius = 13,
+        padding = { x = 9, y = 2 },
         on_click = on_click,
-        children = {
-            Zenith.Text({
-                text = text,
-                font_size = 12,
-                color = Zenith.hex(theme.primary),
-            })
-        }
     })
 end
 

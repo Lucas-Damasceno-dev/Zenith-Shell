@@ -67,6 +67,12 @@ pub use power::PowerProfileService;
 pub mod image;
 pub use image::{DecodedImage, ImageService};
 
+pub mod icon;
+pub use icon::XdgIconResolver;
+
+pub mod theme_watcher;
+pub use theme_watcher::ThemeWatcher;
+
 /// Snapshot of system memory status.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySnapshot {
@@ -85,7 +91,7 @@ pub struct BatterySnapshot {
 }
 
 /// Snapshot of system audio status via Pipewire/wpctl.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioSnapshot {
     pub volume: u8,
     pub is_muted: bool,
@@ -115,7 +121,44 @@ pub struct ThemePalette {
     pub on_surface: String,
     pub on_primary: String,
     pub outline: String,
+    pub outline_variant: String,
     pub surface_container: String,
+    pub surface_container_high: String,
+    pub surface_container_highest: String,
+    pub surface_container_low: String,
+    pub surface_variant: String,
+    pub on_surface_variant: String,
+    pub secondary: String,
+    pub on_secondary: String,
+    pub tertiary: String,
+    pub on_tertiary: String,
+    pub error: String,
+    // Base16 / Catppuccin semantic palette
+    pub base00: String,
+    pub base01: String,
+    pub base02: String,
+    pub base03: String,
+    pub base04: String,
+    pub base05: String,
+    pub base06: String,
+    pub base07: String,
+    pub base08: String,
+    pub base09: String,
+    pub base0a: String,
+    pub base0b: String,
+    pub base0c: String,
+    pub base0d: String,
+    pub base0e: String,
+    pub base0f: String,
+    // Semantic color aliases
+    pub red: String,
+    pub peach: String,
+    pub yellow: String,
+    pub green: String,
+    pub teal: String,
+    pub blue: String,
+    pub mauve: String,
+    pub lavender: String,
 }
 
 impl Default for ThemePalette {
@@ -127,7 +170,42 @@ impl Default for ThemePalette {
             on_surface: "#dbe3ed".to_string(),
             on_primary: "#ffffff".to_string(),
             outline: "#333d4b".to_string(),
+            outline_variant: "#475263".to_string(),
             surface_container: "#1e2632".to_string(),
+            surface_container_high: "#252f3e".to_string(),
+            surface_container_highest: "#2b3647".to_string(),
+            surface_container_low: "#151b24".to_string(),
+            surface_variant: "#283445".to_string(),
+            on_surface_variant: "#98a6b8".to_string(),
+            secondary: "#b4befe".to_string(),
+            on_secondary: "#11111b".to_string(),
+            tertiary: "#f5c2e7".to_string(),
+            on_tertiary: "#11111b".to_string(),
+            error: "#f38ba8".to_string(),
+            base00: "#11111b".to_string(),
+            base01: "#181825".to_string(),
+            base02: "#313244".to_string(),
+            base03: "#45475a".to_string(),
+            base04: "#6c7086".to_string(),
+            base05: "#cdd6f4".to_string(),
+            base06: "#f5e0dc".to_string(),
+            base07: "#b4befe".to_string(),
+            base08: "#f38ba8".to_string(),
+            base09: "#fab387".to_string(),
+            base0a: "#f9e2af".to_string(),
+            base0b: "#a6e3a1".to_string(),
+            base0c: "#94e2d5".to_string(),
+            base0d: "#89b4fa".to_string(),
+            base0e: "#cba6f7".to_string(),
+            base0f: "#f2cdcd".to_string(),
+            red: "#f38ba8".to_string(),
+            peach: "#fab387".to_string(),
+            yellow: "#f9e2af".to_string(),
+            green: "#a6e3a1".to_string(),
+            teal: "#94e2d5".to_string(),
+            blue: "#89b4fa".to_string(),
+            mauve: "#cba6f7".to_string(),
+            lavender: "#b4befe".to_string(),
         }
     }
 }
@@ -291,62 +369,19 @@ impl SystemService {
         guard.0.clone()
     }
 
-    /// Read audio sink volume and mute state via non-blocking asynchronous cache.
+    /// Read audio sink volume and mute state via non-blocking zero-fork cache.
     pub fn audio_snapshot() -> AudioSnapshot {
         let cache_lock = AUDIO_CACHE.get_or_init(|| {
             RwLock::new((
                 AudioSnapshot { volume: 75, is_muted: false },
-                Instant::now() - Duration::from_secs(10),
+                Instant::now(),
             ))
         });
 
-        static FETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-        let (snap, elapsed) = match cache_lock.read() {
-            Ok(guard) => (guard.0.clone(), guard.1.elapsed()),
-            Err(_) => (AudioSnapshot { volume: 75, is_muted: false }, Duration::from_secs(0)),
-        };
-
-        if elapsed >= Duration::from_millis(1500)
-            && !FETCHING.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            std::thread::spawn(move || {
-                let mut snap = AudioSnapshot {
-                    volume: 75,
-                    is_muted: false,
-                };
-
-                if let Ok(output) = std::process::Command::new("wpctl")
-                    .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-                    .output()
-                {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    for line in text.lines() {
-                        if line.contains("Volume:") {
-                            let is_muted = line.contains("[MUTED]");
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.len() >= 2 {
-                                if let Ok(vol_float) = parts[1].parse::<f32>() {
-                                    let volume = (vol_float * 100.0).round().min(100.0) as u8;
-                                    snap = AudioSnapshot { volume, is_muted };
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(c) = AUDIO_CACHE.get() {
-                    if let Ok(mut guard) = c.write() {
-                        *guard = (snap, Instant::now());
-                    }
-                }
-                FETCHING.store(false, std::sync::atomic::Ordering::SeqCst);
-                audio::AudioService::notify_change();
-            });
+        match cache_lock.read() {
+            Ok(guard) => guard.0.clone(),
+            Err(_) => AudioSnapshot { volume: 75, is_muted: false },
         }
-
-        snap
     }
 
     /// Read active network connection status via kernel sysfs (/sys/class/net) without subprocess forks.
@@ -472,7 +507,7 @@ impl SystemService {
         });
 
         if let Ok(guard) = cache_lock.read() {
-            if guard.1.elapsed() < Duration::from_millis(1500) {
+            if guard.1.elapsed() < Duration::from_millis(15000) {
                 return guard.0.clone();
             }
         }
@@ -481,6 +516,9 @@ impl SystemService {
             dirs_home_path(".cache/quickshell/matugen/colors.json"),
             dirs_home_path(".cache/matugen/colors.json"),
             dirs_home_path(".config/quickshell/colors.json"),
+            Some(PathBuf::from("/home/lucas/.cache/quickshell/matugen/colors.json")),
+            Some(PathBuf::from("/home/lucas/.cache/matugen/colors.json")),
+            Some(PathBuf::from("/home/lucas/.config/quickshell/colors.json")),
         ];
 
         let mut loaded = ThemePalette::default();
@@ -504,6 +542,7 @@ impl SystemService {
 
     fn parse_matugen_json(val: &Value) -> ThemePalette {
         let colors = &val["colors"];
+        let base16 = &val["base16"];
         let mut palette = ThemePalette::default();
 
         let extract_color = |key: &str| -> Option<String> {
@@ -513,13 +552,49 @@ impl SystemService {
                 .map(|s| s.to_string())
         };
 
+        let extract_base16 = |key: &str| -> Option<String> {
+            base16[key]["default"]["color"]
+                .as_str()
+                .or_else(|| base16[key]["dark"]["color"].as_str())
+                .map(|s| s.to_string())
+        };
+
         if let Some(c) = extract_color("background") { palette.background = format!("{}F2", c); }
         if let Some(c) = extract_color("primary") { palette.primary = c; }
         if let Some(c) = extract_color("surface") { palette.surface = format!("{}CC", c); }
         if let Some(c) = extract_color("on_surface") { palette.on_surface = c; }
         if let Some(c) = extract_color("on_primary") { palette.on_primary = c; }
         if let Some(c) = extract_color("outline") { palette.outline = c; }
+        if let Some(c) = extract_color("outline_variant") { palette.outline_variant = c; }
         if let Some(c) = extract_color("surface_container") { palette.surface_container = c; }
+        if let Some(c) = extract_color("surface_container_high") { palette.surface_container_high = c; }
+        if let Some(c) = extract_color("surface_container_highest") { palette.surface_container_highest = c; }
+        if let Some(c) = extract_color("surface_container_low") { palette.surface_container_low = c; }
+        if let Some(c) = extract_color("surface_variant") { palette.surface_variant = c; }
+        if let Some(c) = extract_color("on_surface_variant") { palette.on_surface_variant = c; }
+        if let Some(c) = extract_color("secondary") { palette.secondary = c; }
+        if let Some(c) = extract_color("on_secondary") { palette.on_secondary = c; }
+        if let Some(c) = extract_color("tertiary") { palette.tertiary = c; }
+        if let Some(c) = extract_color("on_tertiary") { palette.on_tertiary = c; }
+        if let Some(c) = extract_color("error") { palette.error = c; }
+
+        // Extract base16 colors if present
+        if let Some(c) = extract_base16("base00") { palette.base00 = c; }
+        if let Some(c) = extract_base16("base01") { palette.base01 = c; }
+        if let Some(c) = extract_base16("base02") { palette.base02 = c; }
+        if let Some(c) = extract_base16("base03") { palette.base03 = c; }
+        if let Some(c) = extract_base16("base04") { palette.base04 = c; }
+        if let Some(c) = extract_base16("base05") { palette.base05 = c; }
+        if let Some(c) = extract_base16("base06") { palette.base06 = c; }
+        if let Some(c) = extract_base16("base07") { palette.base07 = c.clone(); palette.lavender = c; }
+        if let Some(c) = extract_base16("base08") { palette.base08 = c.clone(); palette.red = c; }
+        if let Some(c) = extract_base16("base09") { palette.base09 = c.clone(); palette.peach = c; }
+        if let Some(c) = extract_base16("base0a") { palette.base0a = c.clone(); palette.yellow = c; }
+        if let Some(c) = extract_base16("base0b") { palette.base0b = c.clone(); palette.green = c; }
+        if let Some(c) = extract_base16("base0c") { palette.base0c = c.clone(); palette.teal = c; }
+        if let Some(c) = extract_base16("base0d") { palette.base0d = c.clone(); palette.blue = c; }
+        if let Some(c) = extract_base16("base0e") { palette.base0e = c.clone(); palette.mauve = c; }
+        if let Some(c) = extract_base16("base0f") { palette.base0f = c; }
 
         palette
     }

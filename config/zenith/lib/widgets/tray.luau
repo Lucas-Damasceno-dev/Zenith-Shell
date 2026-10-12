@@ -56,9 +56,12 @@ local function Tray()
         local glyph = resolve_tray_icon(item.id or "", item.icon or "")
         table.insert(tray_children, Zenith.Box({
             direction = "row",
-            padding = { x = 6, y = 2 },
-            border_radius = 6,
-            background = Zenith.rgba(255, 255, 255, 10),
+            align_items = "center",
+            justify_content = "center",
+            height = 20,
+            padding = { x = 5, y = 1 },
+            border_radius = 10,
+            background = Zenith.hex(theme.surface_container_high or theme.surface_container, 90),
             on_click = item.action or ("tray:activate:" .. (item.service or "")),
             children = {
                 Zenith.Text({
@@ -72,11 +75,13 @@ local function Tray()
 
     return Zenith.Box({
         direction = "row",
+        align_items = "center",
+        height = 26,
         gap = 4,
         padding = { x = 6, y = 2 },
-        border_radius = 8,
-        background = Zenith.rgba(26, 27, 38, 120),
-        border_color = Zenith.rgba(255, 255, 255, 15),
+        border_radius = 13,
+        background = Zenith.hex(theme.surface_container, 120),
+        border_color = Zenith.hex(theme.outline_variant or theme.outline, 45),
         border_width = 1,
         children = tray_children,
     })

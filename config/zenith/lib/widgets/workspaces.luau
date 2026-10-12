@@ -118,24 +118,47 @@ local function Workspaces(props: { active: number?, count: number? }?)
 
     table.sort(filtered_workspaces, function(a, b) return a.id < b.id end)
 
+    local ws_default_icons = {
+        [1] = "",
+        [2] = "󰈹",
+        [3] = "󰉋",
+        [4] = "󰨞",
+        [5] = "󰈙",
+        [6] = "󰭹",
+        [7] = "󰎆",
+        [8] = "󰕼",
+        [9] = "",
+        [10] = "󰒓",
+    }
+
     local children = {}
 
     for _, ws in ipairs(filtered_workspaces) do
         local is_active = (ws.id == active_id) or ws.active
         local is_urgent = ws.urgent
         local app_icons = clients_by_ws[ws.id]
+        local default_icon = ws_default_icons[ws.id] or ""
         local label_text: string
+
         if app_icons and #app_icons > 0 then
             label_text = string.format("%d %s", ws.id, table.concat(app_icons, " "))
+        elseif is_active then
+            label_text = string.format("%s %d", default_icon, ws.id)
         else
-            label_text = tostring(ws.id)
+            label_text = string.format("%s", default_icon)
         end
 
         if is_active then
             table.insert(children, Zenith.Box({
-                padding = { x = 9, y = 2 },
-                border_radius = 9,
-                background = Zenith.hex(theme.primary),
+                height = 22,
+                direction = "row",
+                align_items = "center",
+                justify_content = "center",
+                padding = { x = 9, y = 1 },
+                border_radius = 11,
+                background = Zenith.hex(theme.primary, 220),
+                border_color = Zenith.hex(theme.primary, 255),
+                border_width = 1,
                 on_click = string.format("dispatch:workspace:%d", ws.id),
                 children = {
                     Zenith.Text({
@@ -147,9 +170,15 @@ local function Workspaces(props: { active: number?, count: number? }?)
             }))
         elseif is_urgent then
             table.insert(children, Zenith.Box({
-                padding = { x = 8, y = 2 },
-                border_radius = 9,
-                background = Zenith.hex("#e06c75"),
+                height = 22,
+                direction = "row",
+                align_items = "center",
+                justify_content = "center",
+                padding = { x = 8, y = 1 },
+                border_radius = 11,
+                background = Zenith.hex(theme.error or "#f38ba8", 180),
+                border_color = Zenith.hex(theme.error or "#f38ba8"),
+                border_width = 1,
                 on_click = string.format("dispatch:workspace:%d", ws.id),
                 children = {
                     Zenith.Text({
@@ -161,15 +190,21 @@ local function Workspaces(props: { active: number?, count: number? }?)
             }))
         else
             table.insert(children, Zenith.Box({
-                padding = { x = 8, y = 2 },
-                border_radius = 9,
-                background = Zenith.rgba(255, 255, 255, 18),
+                height = 22,
+                direction = "row",
+                align_items = "center",
+                justify_content = "center",
+                padding = { x = 8, y = 1 },
+                border_radius = 11,
+                background = Zenith.hex(theme.surface_container_high or theme.surface_container, 120),
+                border_color = Zenith.hex(theme.outline_variant or theme.outline, 35),
+                border_width = 1,
                 on_click = string.format("dispatch:workspace:%d", ws.id),
                 children = {
                     Zenith.Text({
                         text = label_text,
                         font_size = 11,
-                        color = Zenith.rgba(255, 255, 255, 210),
+                        color = Zenith.hex(theme.on_surface, 210),
                     })
                 }
             }))
@@ -178,12 +213,16 @@ local function Workspaces(props: { active: number?, count: number? }?)
 
     return Zenith.Box({
         direction = "row",
+        align_items = "center",
+        height = 26,
         gap = 4,
-        padding = { x = 5, y = 2 },
-        border_radius = 12,
-        background = Zenith.rgba(255, 255, 255, 10),
-        border_color = Zenith.rgba(255, 255, 255, 18),
+        padding = { x = 4, y = 2 },
+        border_radius = 13,
+        background = Zenith.hex(theme.surface_container, 110),
+        border_color = Zenith.hex(theme.outline_variant or theme.outline, 40),
         border_width = 1,
+        on_scroll_up = "dispatch:workspace:e+1",
+        on_scroll_down = "dispatch:workspace:e-1",
         children = children,
     })
 end

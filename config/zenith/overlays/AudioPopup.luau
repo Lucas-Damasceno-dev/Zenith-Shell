@@ -2,6 +2,7 @@
 -- Zenith-Shell (Engine v2) - Audio & Volume Control Overlay with Output Device Switcher
 
 local theme = Zenith.Theme()
+local UIKit = Zenith.import("ui_kit")
 local audio = Zenith.Services.audio()
 local sinks = Zenith.Services.AudioSinks()
 
@@ -23,8 +24,8 @@ for _, s in ipairs(sinks) do
         align_items = "center",
         padding = { x = 10, y = 6 },
         border_radius = 6,
-        background = s.is_default and Zenith.rgba(124, 77, 255, 40) or Zenith.rgba(255, 255, 255, 8),
-        border_color = s.is_default and Zenith.hex(theme.primary) or Zenith.rgba(255, 255, 255, 12),
+        background = s.is_default and Zenith.hex(theme.primary, 40) or Zenith.hex(theme.surface_container, 80),
+        border_color = s.is_default and Zenith.hex(theme.primary) or Zenith.hex(theme.outline, 30),
         border_width = 1,
         on_click = "audio:set_sink:" .. tostring(s.id),
         children = {
@@ -56,8 +57,8 @@ return Zenith.Window({
     height = 440,
     padding = { x = 14, y = 12 },
     gap = 10,
-    background = Zenith.rgba(18, 20, 26, 230),
-    border_color = Zenith.hex(theme.primary),
+    background = Zenith.hex(theme.surface, 235),
+    border_color = Zenith.hex(theme.outline_variant or theme.outline, 80),
     border_width = 1,
     border_radius = 14,
     shadow = {
@@ -93,6 +94,7 @@ return Zenith.Window({
         Zenith.Box({
             direction = "row",
             gap = 10,
+            align_items = "center",
             padding = { x = 12, y = 10 },
             border_radius = 8,
             background = Zenith.hex(theme.surface),
@@ -105,20 +107,31 @@ return Zenith.Window({
                     color = is_muted and Zenith.hex("#e06c75") or Zenith.hex(theme.on_surface),
                 }),
                 Zenith.Box({ flex_grow = 1 }),
-                Zenith.Box({
-                    padding = { x = 10, y = 4 },
-                    border_radius = 6,
-                    background = is_muted and Zenith.hex("#e06c75") or Zenith.hex(theme.surface_container),
+                UIKit.Button({
+                    label = is_muted and "UNMUTE" or "MUTE",
+                    icon = is_muted and "󰝟" or "󰕾",
+                    variant = is_muted and "danger" or "tonal",
+                    size = "sm",
                     on_click = "audio:toggle_mute",
-                    children = {
-                        Zenith.Text({
-                            text = is_muted and "UNMUTE" or "MUTE",
-                            font_size = 10,
-                            color = is_muted and Zenith.hex("#ffffff") or Zenith.hex(theme.on_surface),
-                        })
-                    }
                 }),
             }
+        }),
+
+        -- Continuous Interactive Hardware Volume Slider
+        Zenith.Slider({
+            id = "audio_volume_slider",
+            min = 0,
+            max = 100,
+            value = vol,
+            track_height = 8,
+            thumb_radius = 10,
+            track_color = Zenith.hex(theme.surface_container_highest or theme.surface_container, 180),
+            active_track_color = is_muted and Zenith.hex("#e06c75") or Zenith.hex(theme.primary),
+            thumb_color = Zenith.hex("#ffffff"),
+            on_change = function(new_val)
+                local v = math.floor(tonumber(new_val) or 0)
+                Zenith.Services.SetVolume(v)
+            end,
         }),
 
         -- Quick step controls (-10%, -5%, +5%, +10%)
@@ -185,20 +198,12 @@ return Zenith.Window({
         }),
 
         -- Pavucontrol launcher button
-        Zenith.Box({
-            padding = { x = 10, y = 6 },
-            border_radius = 6,
-            background = Zenith.hex(theme.surface),
-            border_color = Zenith.hex("#2d3748"),
-            border_width = 1,
+        UIKit.Button({
+            label = "Mixer de Áudio (pavucontrol)",
+            icon = "󰓃",
+            variant = "outlined",
+            size = "md",
             on_click = "cmd:pavucontrol &",
-            children = {
-                Zenith.Text({
-                    text = "󰓃 Open Audio Mixer (pavucontrol)",
-                    font_size = 10,
-                    color = Zenith.hex(theme.on_surface),
-                })
-            }
         }),
     }
 })

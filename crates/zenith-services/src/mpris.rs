@@ -60,7 +60,12 @@ impl MprisService {
 
         let (snap, need_refresh) = {
             let r = cache_arc.read().unwrap();
-            (r.snapshot.clone(), r.last_query.elapsed() >= Duration::from_millis(1500))
+            let threshold = if r.snapshot.is_available {
+                Duration::from_millis(1500)
+            } else {
+                Duration::from_millis(3500)
+            };
+            (r.snapshot.clone(), r.last_query.elapsed() >= threshold)
         };
 
         if need_refresh {
@@ -116,16 +121,29 @@ impl MprisService {
             _ => return Ok(()),
         };
 
-        let mut bus_cmd = Self::build_busctl_cmd();
-        bus_cmd.args([
-            "call",
-            &target_bus,
-            "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.Player",
-            dbus_method,
-        ]);
+        let sent_native = if let Ok(conn) = zbus::blocking::Connection::session() {
+            conn.call_method(
+                Some(target_bus.as_str()),
+                "/org/mpris/MediaPlayer2",
+                Some("org.mpris.MediaPlayer2.Player"),
+                dbus_method,
+                &(),
+            ).is_ok()
+        } else {
+            false
+        };
 
-        let _ = bus_cmd.spawn();
+        if !sent_native {
+            let mut bus_cmd = Self::build_busctl_cmd();
+            bus_cmd.args([
+                "call",
+                &target_bus,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+                dbus_method,
+            ]);
+            let _ = bus_cmd.spawn();
+        }
 
         // Invalidate cache so next read updates immediately
         if let Some(c) = CACHE.get() {
@@ -172,6 +190,21 @@ impl MprisService {
     }
 
     fn find_mpris_players() -> Vec<String> {
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            if let Ok(dbus_proxy) = zbus::blocking::fdo::DBusProxy::new(&conn) {
+                if let Ok(names) = dbus_proxy.list_names() {
+                    let filtered: Vec<String> = names
+                        .into_iter()
+                        .filter(|n| n.starts_with("org.mpris.MediaPlayer2."))
+                        .map(|n| n.to_string())
+                        .collect();
+                    if !filtered.is_empty() {
+                        return filtered;
+                    }
+                }
+            }
+        }
+
         let mut cmd = Self::build_busctl_cmd();
         cmd.args(["list"]);
 
@@ -241,6 +274,19 @@ impl MprisService {
     }
 
     fn get_player_property(bus: &str, prop: &str) -> Option<String> {
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            if let Ok(proxy) = zbus::blocking::Proxy::new(
+                &conn,
+                bus,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            ) {
+                if let Ok(val) = proxy.get_property::<String>(prop) {
+                    return Some(val);
+                }
+            }
+        }
+
         let mut cmd = Self::build_busctl_cmd();
         cmd.args([
             "get-property",

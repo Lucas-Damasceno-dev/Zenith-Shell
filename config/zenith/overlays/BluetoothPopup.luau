@@ -63,8 +63,8 @@ else
             align_items = "center",
             padding = { x = 12, y = 8 },
             border_radius = 8,
-            background = is_conn and Zenith.rgba(124, 77, 255, 35) or Zenith.hex(theme.surface_container),
-            border_color = is_conn and Zenith.hex(theme.primary) or Zenith.rgba(255, 255, 255, 12),
+            background = is_conn and Zenith.hex(theme.primary, 35) or Zenith.hex(theme.surface_container),
+            border_color = is_conn and Zenith.hex(theme.primary) or Zenith.hex(theme.outline, 30),
             border_width = 1,
             on_click = action,
             children = {
@@ -123,8 +123,8 @@ return Zenith.Window({
     height = win_height,
     padding = { x = 16, y = 14 },
     gap = 12,
-    background = Zenith.rgba(18, 20, 26, 230),
-    border_color = Zenith.hex(theme.primary),
+    background = Zenith.hex(theme.surface, 235),
+    border_color = Zenith.hex(theme.outline_variant or theme.outline, 80),
     border_width = 1,
     border_radius = 16,
     on_scroll_up = scroll_up,
@@ -147,20 +147,18 @@ return Zenith.Window({
                     color = Zenith.hex(theme.primary),
                 }),
                 Zenith.Box({ flex_grow = 1 }),
-                -- Power toggle
+                -- Power toggle switch
                 Zenith.Box({
-                    padding = { x = 8, y = 3 },
-                    border_radius = 6,
-                    background = bt.powered and Zenith.rgba(124, 77, 255, 40) or Zenith.rgba(255, 255, 255, 10),
-                    border_color = bt.powered and Zenith.hex(theme.primary) or Zenith.rgba(255, 255, 255, 16),
-                    border_width = 1,
-                    on_click = "bluetooth:toggle",
+                    direction = "row",
+                    align_items = "center",
+                    gap = 6,
                     children = {
-                        Zenith.Text({
-                            text = bt.powered and "POWER ON" or "POWER OFF",
-                            font_size = 9,
-                            color = bt.powered and Zenith.hex(theme.primary) or Zenith.hex(theme.outline),
-                        })
+                        Zenith.Switch({
+                            id = "bt_power_switch",
+                            checked = bt.powered,
+                            active_color = theme.primary,
+                            on_toggle = "bluetooth:toggle",
+                        }),
                     }
                 }),
                 Zenith.Box({ width = 6 }),
