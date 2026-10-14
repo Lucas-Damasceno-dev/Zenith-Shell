@@ -27,3 +27,6 @@ target/
 
 # agy-swarm worker worktrees e regras efêmeras
 .gemini/
+
+# agy-swarm state
+.swarm/
