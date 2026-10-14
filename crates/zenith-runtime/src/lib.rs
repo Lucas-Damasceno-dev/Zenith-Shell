@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use mlua::prelude::*;
@@ -9,10 +10,12 @@ use zenith_layout::{AlignItems, Color, FlexDirection, JustifyContent, NodeStyle,
 
 pub mod async_bridge;
 pub mod reactive;
+pub mod spawner;
 pub mod storage;
 pub mod worker;
 pub use async_bridge::{poll_async_completions, setup_async_bridge};
 pub use reactive::{BoundProperty, EffectId, MountedTree, NodeBinding, ReactiveGraph, SignalId};
+pub use spawner::{build_detached_command, parse_command_line, spawn_detached};
 pub use storage::StorageEngine;
 pub use worker::{TaskCompletion, TaskOutput, WorkerThreadPool};
 
@@ -22,6 +25,7 @@ pub struct LuauRuntime {
     pub reactive: Arc<ReactiveGraph>,
     pub worker_pool: Arc<WorkerThreadPool>,
     pub storage: Arc<StorageEngine>,
+    pub is_idle: Arc<AtomicBool>,
     search_query: Arc<RwLock<String>>,
     selected_index: Arc<RwLock<usize>>,
     current_output: Arc<RwLock<String>>,
@@ -36,6 +40,8 @@ impl LuauRuntime {
     /// Initialize the Luau virtual machine with Zenith standard library bindings.
     pub fn new() -> Result<Self, LuaError> {
         let lua = Lua::new();
+        let is_idle = Arc::new(AtomicBool::new(false));
+        let storage = Arc::new(StorageEngine::new(None));
         let search_query = Arc::new(RwLock::new(String::new()));
         let selected_index = Arc::new(RwLock::new(1usize));
         let current_output = Arc::new(RwLock::new("default".to_string()));
@@ -335,6 +341,15 @@ impl LuauRuntime {
         signals_table.set("Brightness", bright_sig.clone())?;
         signals_table.set("brightness", bright_sig)?;
 
+        let idle_bool = is_idle.clone();
+        let idle_sig = lua.create_function(move |_, ()| {
+            Ok(idle_bool.load(Ordering::Relaxed))
+        })?;
+        signals_table.set("Idle", idle_sig.clone())?;
+        signals_table.set("idle", idle_sig.clone())?;
+        signals_table.set("IsIdle", idle_sig.clone())?;
+        signals_table.set("is_idle", idle_sig)?;
+
         zenith_table.set("Signals", signals_table)?;
 
         // Zenith.Text(props)
@@ -421,7 +436,8 @@ impl LuauRuntime {
             tbl.set("percent", snap.percent)?;
             Ok(tbl)
         })?;
-        services_table.set("memory", memory_fn)?;
+        services_table.set("memory", memory_fn.clone())?;
+        services_table.set("Memory", memory_fn)?;
 
         let battery_fn = lua.create_function(|lua, ()| {
             if let Some(bat) = zenith_services::SystemService::battery_snapshot() {
@@ -448,9 +464,11 @@ impl LuauRuntime {
             let tbl = lua.create_table()?;
             tbl.set("volume", snap.volume)?;
             tbl.set("is_muted", snap.is_muted)?;
+            tbl.set("muted", snap.is_muted)?;
             Ok(tbl)
         })?;
-        services_table.set("audio", audio_fn)?;
+        services_table.set("audio", audio_fn.clone())?;
+        services_table.set("Audio", audio_fn)?;
 
         // Network snapshot
         let network_fn = lua.create_function(|lua, ()| {
@@ -471,7 +489,8 @@ impl LuauRuntime {
             tbl.set("percent", snap.percent)?;
             Ok(tbl)
         })?;
-        services_table.set("cpu", cpu_fn)?;
+        services_table.set("cpu", cpu_fn.clone())?;
+        services_table.set("Cpu", cpu_fn)?;
 
 
         // Theme palette query
@@ -698,10 +717,14 @@ impl LuauRuntime {
             let tbl = lua.create_table()?;
             for (idx, item) in items.into_iter().enumerate() {
                 let item_tbl = lua.create_table()?;
-                item_tbl.set("id", item.id)?;
-                item_tbl.set("title", item.title)?;
-                item_tbl.set("icon", item.icon_name)?;
-                item_tbl.set("service", item.service)?;
+                item_tbl.set("id", item.id.clone())?;
+                item_tbl.set("title", item.title.clone())?;
+                item_tbl.set("icon", item.icon_name.clone())?;
+                item_tbl.set("icon_name", item.icon_name.clone())?;
+                item_tbl.set("service", item.service.clone())?;
+                item_tbl.set("action", format!("tray:activate:{}", item.service))?;
+                item_tbl.set("context_action", format!("tray:context:{}", item.service))?;
+                item_tbl.set("secondary_action", format!("tray:secondary:{}", item.service))?;
                 tbl.set(idx + 1, item_tbl)?;
             }
             Ok(tbl)
@@ -715,6 +738,28 @@ impl LuauRuntime {
         })?;
         services_table.set("TrayActivate", tray_act_fn.clone())?;
         services_table.set("tray_activate", tray_act_fn)?;
+
+        let tray_ctx_fn = lua.create_function(|_, service: String| {
+            zenith_services::TrayService::context_menu(&service);
+            Ok(())
+        })?;
+        services_table.set("TrayContextMenu", tray_ctx_fn.clone())?;
+        services_table.set("tray_context_menu", tray_ctx_fn)?;
+
+        let tray_sec_fn = lua.create_function(|_, service: String| {
+            zenith_services::TrayService::secondary_activate(&service);
+            Ok(())
+        })?;
+        services_table.set("TraySecondaryActivate", tray_sec_fn.clone())?;
+        services_table.set("tray_secondary_activate", tray_sec_fn)?;
+
+        let tray_scroll_fn = lua.create_function(|_, (service, delta, orientation): (String, i32, Option<String>)| {
+            let orient = orientation.unwrap_or_else(|| "vertical".to_string());
+            zenith_services::TrayService::scroll(&service, delta, &orient);
+            Ok(())
+        })?;
+        services_table.set("TrayScroll", tray_scroll_fn.clone())?;
+        services_table.set("tray_scroll", tray_scroll_fn)?;
 
         // Audio Spectrum / CAVA service
         let spectrum_fn = lua.create_function(|lua, count: Option<usize>| {
@@ -962,6 +1007,26 @@ impl LuauRuntime {
         services_table.set("set_brightness", set_brightness_fn.clone())?;
         zenith_table.set("set_brightness", set_brightness_fn)?;
 
+        let invalidate_brightness_fn = lua.create_function(|_, ()| {
+            zenith_services::BrightnessService::invalidate_cache();
+            Ok(())
+        })?;
+        services_table.set("InvalidateBrightnessCache", invalidate_brightness_fn.clone())?;
+        services_table.set("invalidate_brightness_cache", invalidate_brightness_fn.clone())?;
+        services_table.set("RefreshBrightness", invalidate_brightness_fn.clone())?;
+        services_table.set("refresh_brightness", invalidate_brightness_fn)?;
+
+        let step_brightness_fn = lua.create_function(|_, delta: i16| {
+            let cur = zenith_services::BrightnessService::get_brightness().percent as i16;
+            let new_pct = (cur + delta).clamp(0, 100) as u8;
+            zenith_services::BrightnessService::set_brightness(new_pct);
+            Ok(new_pct)
+        })?;
+        services_table.set("StepBrightness", step_brightness_fn.clone())?;
+        services_table.set("step_brightness", step_brightness_fn.clone())?;
+        services_table.set("AdjustBrightness", step_brightness_fn.clone())?;
+        services_table.set("adjust_brightness", step_brightness_fn)?;
+
         // Disk storage service
         let disk_fn = lua.create_function(|lua, ()| {
             let snap = zenith_services::DiskService::get_disk_usage();
@@ -990,6 +1055,65 @@ impl LuauRuntime {
         })?;
         services_table.set("SetPowerProfile", set_power_fn.clone())?;
         services_table.set("set_power_profile", set_power_fn)?;
+
+        let suspend_fn = lua.create_function(|_, ()| {
+            zenith_services::PowerProfileService::suspend();
+            Ok(())
+        })?;
+        services_table.set("Suspend", suspend_fn.clone())?;
+        services_table.set("suspend", suspend_fn)?;
+
+        let reboot_fn = lua.create_function(|_, ()| {
+            zenith_services::PowerProfileService::reboot();
+            Ok(())
+        })?;
+        services_table.set("Reboot", reboot_fn.clone())?;
+        services_table.set("reboot", reboot_fn)?;
+
+        let poweroff_fn = lua.create_function(|_, ()| {
+            zenith_services::PowerProfileService::poweroff();
+            Ok(())
+        })?;
+        services_table.set("PowerOff", poweroff_fn.clone())?;
+        services_table.set("power_off", poweroff_fn)?;
+
+        let set_wifi_fn = lua.create_function(|_, enabled: bool| {
+            let _ = zenith_services::NetworkService::set_wifi_enabled(enabled);
+            Ok(())
+        })?;
+        services_table.set("SetWifiEnabled", set_wifi_fn.clone())?;
+        services_table.set("set_wifi_enabled", set_wifi_fn)?;
+
+        // Idle state service
+        let idle_bool_svc = is_idle.clone();
+        let idle_fn = lua.create_function(move |lua, ()| {
+            let cur = idle_bool_svc.load(Ordering::Relaxed);
+            let tbl = lua.create_table()?;
+            tbl.set("is_idle", cur)?;
+            tbl.set("idle", cur)?;
+            Ok(tbl)
+        })?;
+        services_table.set("Idle", idle_fn.clone())?;
+        services_table.set("idle", idle_fn)?;
+
+        let idle_bool_is = is_idle.clone();
+        let is_idle_fn = lua.create_function(move |_, ()| {
+            Ok(idle_bool_is.load(Ordering::Relaxed))
+        })?;
+        services_table.set("IsIdle", is_idle_fn.clone())?;
+        services_table.set("is_idle", is_idle_fn)?;
+
+        let idle_bool_set = is_idle.clone();
+        let storage_idle = Arc::clone(&storage);
+        let set_idle_fn = lua.create_function(move |_, val: bool| {
+            idle_bool_set.store(val, Ordering::Relaxed);
+            let _ = storage_idle.set("system_idle", serde_json::Value::Bool(val));
+            let _ = storage_idle.set("system_activity", serde_json::Value::Bool(!val));
+            Ok(())
+        })?;
+        services_table.set("SetIdle", set_idle_fn.clone())?;
+        services_table.set("set_idle", set_idle_fn.clone())?;
+        zenith_table.set("set_idle", set_idle_fn)?;
 
         let notify_fn = lua.create_function(|_, (summary, body, app_name): (String, Option<String>, Option<String>)| {
             let id = zenith_services::NotificationService::notify(
@@ -1027,13 +1151,23 @@ impl LuauRuntime {
 
         // Zenith.exec(command)
         let exec_fn = lua.create_function(|_, cmd: String| {
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .spawn();
+            let _ = spawner::spawn_detached(&cmd);
             Ok(())
         })?;
         zenith_table.set("exec", exec_fn)?;
+
+        // Zenith.close() - in-process IPC socket command
+        let close_fn = lua.create_function(|_, ()| {
+            if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+                let sock_path = std::path::PathBuf::from(dir).join("zenith.sock");
+                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock_path) {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"close\n");
+                }
+            }
+            Ok(())
+        })?;
+        zenith_table.set("close", close_fn)?;
 
         // In-memory module cache for Zenith.import
         let modules_cache = lua.create_table()?;
@@ -1099,7 +1233,6 @@ impl LuauRuntime {
         let worker_pool = Arc::new(WorkerThreadPool::new(4));
         setup_async_bridge(&lua, &zenith_table, Arc::clone(&worker_pool))?;
 
-        let storage = Arc::new(StorageEngine::new(None));
         storage::setup_storage_bindings(&lua, &zenith_table, Arc::clone(&storage))?;
 
         lua.globals().set("Zenith", zenith_table)?;
@@ -1112,6 +1245,7 @@ impl LuauRuntime {
             reactive,
             worker_pool,
             storage,
+            is_idle,
             search_query,
             selected_index,
             current_output,
@@ -1195,6 +1329,18 @@ impl LuauRuntime {
     /// Retrieve active current viewport dimensions.
     pub fn get_current_viewport(&self) -> (u32, u32) {
         *self.current_geometry.read().unwrap()
+    }
+
+    /// Updates the global idle state of the runtime and persists in storage.
+    pub fn set_idle(&self, idle: bool) {
+        self.is_idle.store(idle, Ordering::Relaxed);
+        let _ = self.storage.set("system_idle", serde_json::Value::Bool(idle));
+        let _ = self.storage.set("system_activity", serde_json::Value::Bool(!idle));
+    }
+
+    /// Returns `true` if system is currently reported as idle.
+    pub fn is_idle(&self) -> bool {
+        self.is_idle.load(Ordering::Relaxed)
     }
 
     /// Retrieve active search query string from runtime.
@@ -1332,7 +1478,17 @@ impl LuauRuntime {
         if let Ok(callbacks) = self.lua.globals().get::<LuaTable>("__zenith_callbacks") {
             if let Ok(cb) = callbacks.get::<LuaFunction>(key) {
                 cb.call::<()>(arg)?;
+                return Ok(());
             }
+        }
+        if let Some(storage_key) = key.strip_prefix("storage:set:") {
+            let clean_k = storage_key.trim_end_matches(':');
+            let full_action = format!("storage:set:{}:{}", clean_k, arg);
+            return self.trigger_click(&full_action);
+        } else if let Some(storage_key) = key.strip_prefix("storage:toggle:") {
+            let clean_k = storage_key.trim_end_matches(':');
+            let full_action = format!("storage:toggle:{}", clean_k);
+            return self.trigger_click(&full_action);
         }
         Ok(())
     }
@@ -1372,7 +1528,7 @@ impl LuauRuntime {
         } else if let Some(addr) = action.strip_prefix("window:toggle_minimize:") {
             let _ = zenith_services::HyprlandService::toggle_minimize_or_focus(addr);
         } else if let Some(cmd) = action.strip_prefix("cmd:") {
-            let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+            let _ = spawner::spawn_detached(cmd);
         } else if let Some(cmd) = action.strip_prefix("launch:") {
             let _ = zenith_services::LauncherService::launch(cmd);
         } else if let Some(cmd) = action.strip_prefix("media:") {
@@ -1389,6 +1545,20 @@ impl LuauRuntime {
             zenith_services::NotificationService::clear_history();
         } else if let Some(ssid) = action.strip_prefix("wifi:connect:") {
             let _ = zenith_services::NetworkService::connect_wifi(ssid, None);
+        } else if let Some(enabled_str) = action.strip_prefix("wifi:set_enabled:") {
+            let enabled = enabled_str == "true" || enabled_str == "1";
+            let _ = zenith_services::NetworkService::set_wifi_enabled(enabled);
+        } else if action == "wifi:toggle" {
+            let cur = zenith_services::NetworkService::status();
+            let _ = zenith_services::NetworkService::set_wifi_enabled(!cur.connected);
+        } else if let Some(prof) = action.strip_prefix("power:profile:") {
+            zenith_services::PowerProfileService::set_profile(prof);
+        } else if action == "system:suspend" || action == "power:suspend" {
+            zenith_services::PowerProfileService::suspend();
+        } else if action == "system:reboot" || action == "power:reboot" {
+            zenith_services::PowerProfileService::reboot();
+        } else if action == "system:poweroff" || action == "power:poweroff" {
+            zenith_services::PowerProfileService::poweroff();
         } else if action == "bluetooth:toggle" {
             zenith_services::BluetoothService::toggle_power();
         } else if let Some(mac) = action.strip_prefix("bluetooth:connect:") {
@@ -1399,6 +1569,30 @@ impl LuauRuntime {
             zenith_services::TrayService::activate(srv);
         } else if let Some(srv) = action.strip_prefix("tray:context:") {
             zenith_services::TrayService::context_menu(srv);
+        } else if let Some(srv) = action.strip_prefix("tray:secondary:") {
+            zenith_services::TrayService::secondary_activate(srv);
+        } else if let Some(rest) = action.strip_prefix("tray:scroll:") {
+            if let Some((srv, delta_str)) = rest.split_once(':') {
+                if let Ok(delta) = delta_str.parse::<i32>() {
+                    zenith_services::TrayService::scroll(srv, delta, "vertical");
+                }
+            }
+        } else if let Some(pct_str) = action.strip_prefix("brightness:set:") {
+            if let Ok(pct) = pct_str.parse::<u8>() {
+                zenith_services::BrightnessService::set_brightness(pct);
+            }
+        } else if let Some(step_str) = action.strip_prefix("brightness:step:") {
+            if let Ok(delta) = step_str.parse::<i16>() {
+                let cur = zenith_services::BrightnessService::get_brightness().percent as i16;
+                let new_pct = (cur + delta).clamp(0, 100) as u8;
+                zenith_services::BrightnessService::set_brightness(new_pct);
+            }
+        } else if let Some(val_str) = action.strip_prefix("idle:set:") {
+            let val = val_str == "true" || val_str == "1";
+            self.set_idle(val);
+        } else if action == "idle:toggle" {
+            let cur = self.is_idle();
+            self.set_idle(!cur);
         } else if let Some(id_str) = action.strip_prefix("audio:set_sink:") {
             if let Ok(id) = id_str.parse::<u32>() {
                 zenith_services::AudioService::set_default_sink(id);
@@ -1422,12 +1616,40 @@ impl LuauRuntime {
         } else if action == "search:clear" {
             self.set_search_query("");
             self.set_selected_index(1);
+        } else if let Some(key_val) = action.strip_prefix("storage:set:") {
+            if let Some((k, v)) = key_val.split_once(':') {
+                let json_val = if v == "true" {
+                    serde_json::Value::Bool(true)
+                } else if v == "false" {
+                    serde_json::Value::Bool(false)
+                } else if let Ok(num) = v.parse::<i64>() {
+                    serde_json::Value::from(num)
+                } else if let Ok(num) = v.parse::<f64>() {
+                    if (num - num.round()).abs() < 1e-4 {
+                        serde_json::Value::from(num.round() as i64)
+                    } else {
+                        serde_json::Number::from_f64(num).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                    }
+                } else {
+                    serde_json::Value::String(v.to_string())
+                };
+                let _ = self.storage.set(k, json_val);
+            }
+        } else if let Some(k) = action.strip_prefix("storage:toggle:") {
+            let cur = self.storage.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            let _ = self.storage.set(k, serde_json::Value::Bool(!cur));
+        } else if let Some(page_str) = action.strip_prefix("settings:page:") {
+            if let Ok(idx) = page_str.parse::<i64>() {
+                let _ = self.storage.set("settings_active_page", serde_json::Value::from(idx));
+            }
         } else if action.starts_with("click_")
             || action.starts_with("right_click_")
             || action.starts_with("scroll_up_")
             || action.starts_with("scroll_down_")
             || action.starts_with("change_")
             || action.starts_with("submit_")
+            || action.starts_with("switch_toggle_")
+            || action.starts_with("slider_change_")
         {
             if let Ok(callbacks) = self.lua.globals().get::<LuaTable>("__zenith_callbacks") {
                 if let Ok(func) = callbacks.get::<LuaFunction>(action) {
@@ -1435,10 +1657,10 @@ impl LuauRuntime {
                     return Ok(());
                 }
             }
-            let _ = std::process::Command::new("sh").arg("-c").arg(action).spawn();
+            let _ = spawner::spawn_detached(action);
         } else {
             // Check if action corresponds to a shell command directly
-            let _ = std::process::Command::new("sh").arg("-c").arg(action).spawn();
+            let _ = spawner::spawn_detached(action);
         }
         Ok(())
     }
@@ -2134,6 +2356,47 @@ mod tests {
     }
 
     #[test]
+    fn test_all_26_widgets_evaluation() {
+        let runtime = LuauRuntime::new().expect("Failed to create LuauRuntime");
+        let widgets = [
+            "audio", "battery", "cava", "clipboard", "clock",
+            "focused_app", "hardware", "kde_connect", "keyboard", "launcher",
+            "media", "network", "notifications", "overview", "pill",
+            "pomodoro", "privacy", "quick_status", "session", "settings_hub",
+            "tray", "tweaks", "usb", "utility_hub", "weather", "workspaces",
+        ];
+        for widget in &widgets {
+            let script = format!(r#"
+                local W = Zenith.import("widgets/{}")
+                assert(W ~= nil, "Widget module {} returned nil")
+                if type(W) == "function" then
+                    local node = W()
+                    assert(type(node) == "table" or node == nil, "Widget constructor did not return table or nil")
+                end
+                return Zenith.Box({{ children = {{}} }})
+            "#, widget, widget);
+            let res = runtime.eval_ui(&script);
+            assert!(res.is_ok(), "Evaluating widget '{}' failed: {:?}", widget, res.err());
+        }
+    }
+
+    #[test]
+    fn test_all_17_settings_pages_evaluation() {
+        let runtime = LuauRuntime::new().expect("Failed to create LuauRuntime");
+        let path = "config/zenith/overlays/Settings.luau";
+        let parent_path = "../../config/zenith/overlays/Settings.luau";
+        let code = std::fs::read_to_string(path)
+            .or_else(|_| std::fs::read_to_string(parent_path))
+            .expect("Could not read Settings.luau");
+
+        for page in 0..=16 {
+            let _ = runtime.storage.set("settings_active_page", serde_json::Value::from(page));
+            let res = runtime.eval_ui(&code);
+            assert!(res.is_ok(), "Evaluating Settings.luau for page {} failed: {:?}", page, res.err());
+        }
+    }
+
+    #[test]
     fn test_shadow_parsing() {
         let runtime = LuauRuntime::new().expect("Failed to create LuauRuntime");
         let script = r#"
@@ -2622,7 +2885,7 @@ mod tests {
                 match &children[1] {
                     UiNode::Switch { id, checked, .. } => {
                         assert_eq!(id.as_deref(), Some("wifi_toggle"));
-                        assert_eq!(*checked, true);
+                        assert!(*checked);
                     }
                     _ => panic!("Expected Switch node"),
                 }
@@ -2715,5 +2978,116 @@ mod tests {
             }
             _ => panic!("Expected Box node"),
         }
+    }
+
+    #[test]
+    fn test_zenith_ui_kit_matugen_tokens_and_reactive_widgets() {
+        let runtime = LuauRuntime::new().expect("Failed to create runtime");
+        let script = r#"
+            local UIKit = Zenith.import("ui_kit")
+            assert(UIKit.Tokens ~= nil, "UIKit.Tokens should exist")
+            assert(UIKit.Tokens.colors ~= nil, "Tokens.colors should exist")
+            assert(UIKit.Tokens.colors.primary ~= nil, "primary token should exist")
+            assert(UIKit.Tokens.colors.surface ~= nil, "surface token should exist")
+            assert(UIKit.Tokens.typography ~= nil, "Tokens.typography should exist")
+            assert(UIKit.Tokens.shapes ~= nil, "Tokens.shapes should exist")
+
+            -- Test Signals subsystem
+            assert(UIKit.Signals ~= nil, "UIKit.Signals should exist")
+            local sig, setSig = UIKit.Signals.create("Reactive Pill Text")
+            assert(sig() == "Reactive Pill Text", "Signal getter callable")
+            setSig("Updated Pill Text")
+            assert(sig() == "Updated Pill Text", "Signal setter updated")
+
+            -- Test Widgets catalog
+            assert(UIKit.Widgets ~= nil, "UIKit.Widgets should exist")
+            local pill = UIKit.Widgets.Pill({
+                label = sig,
+                icon = "󰌌",
+            })
+            assert(pill ~= nil, "Pill widget with signal created")
+
+            local clock = UIKit.Widgets.Clock({ reactive = true })
+            assert(clock ~= nil, "Reactive clock created")
+
+            local hw = UIKit.Widgets.Hardware({ reactive = true })
+            assert(hw ~= nil, "Reactive hardware monitor created")
+
+            return Zenith.Box({
+                children = { pill, clock, hw }
+            })
+        "#;
+        let node = runtime.eval_ui(script).expect("failed to eval ui tree with UI Kit signals and tokens");
+        match node {
+            UiNode::Box { children, .. } => {
+                assert_eq!(children.len(), 3);
+            }
+            _ => panic!("Expected root Box node"),
+        }
+    }
+
+    #[test]
+    fn test_trigger_click_sanitized_spawner() {
+        let runtime = LuauRuntime::new().unwrap();
+        assert!(runtime.trigger_click("cmd:true").is_ok());
+        assert!(runtime.trigger_click("true").is_ok());
+    }
+
+    #[test]
+    fn test_wave33_luau_bindings_and_services() {
+        let runtime = LuauRuntime::new().expect("Failed to create LuauRuntime");
+        let script = r#"
+            -- Test Backlight / Brightness service & methods
+            local bright = Zenith.Services.Brightness()
+            assert(type(bright) == "table", "Brightness must return table")
+            assert(type(bright.percent) == "number", "Brightness.percent must be number")
+            assert(type(bright.current) == "number", "Brightness.current must be number")
+            assert(type(bright.max) == "number", "Brightness.max must be number")
+            assert(type(bright.device) == "string", "Brightness.device must be string")
+
+            Zenith.Services.SetBrightness(75)
+            Zenith.Services.InvalidateBrightnessCache()
+            Zenith.Services.RefreshBrightness()
+            local stepped = Zenith.Services.StepBrightness(5)
+            assert(type(stepped) == "number", "StepBrightness must return number")
+
+            -- Test Tray service & methods
+            local tray = Zenith.Services.Tray()
+            assert(type(tray) == "table", "Tray must return table")
+            Zenith.Services.TrayActivate("org.kde.StatusNotifierItem-1-1")
+            Zenith.Services.TrayContextMenu("org.kde.StatusNotifierItem-1-1")
+            Zenith.Services.TraySecondaryActivate("org.kde.StatusNotifierItem-1-1")
+            Zenith.Services.TrayScroll("org.kde.StatusNotifierItem-1-1", 1, "vertical")
+
+            -- Test Idle state service & signals
+            local idle_state = Zenith.Services.Idle()
+            assert(type(idle_state) == "table", "Idle must return table")
+            assert(type(idle_state.is_idle) == "boolean", "Idle.is_idle must be boolean")
+            assert(Zenith.Services.IsIdle() == false, "Initial IsIdle must be false")
+
+            Zenith.Services.SetIdle(true)
+            assert(Zenith.Services.IsIdle() == true, "IsIdle should be true after SetIdle(true)")
+            assert(Zenith.Signals.is_idle() == true, "Signals.is_idle should be true")
+
+            Zenith.Services.SetIdle(false)
+            assert(Zenith.Services.IsIdle() == false, "IsIdle should be false after SetIdle(false)")
+            assert(Zenith.Signals.is_idle() == false, "Signals.is_idle should be false")
+
+            return Zenith.Box({ children = {} })
+        "#;
+        let node = runtime.eval_ui(script);
+        assert!(node.is_ok(), "Wave 3.3 bindings test failed: {:?}", node.err());
+
+        // Test trigger_click for tray, brightness, idle
+        assert!(runtime.trigger_click("tray:activate:test").is_ok());
+        assert!(runtime.trigger_click("tray:context:test").is_ok());
+        assert!(runtime.trigger_click("tray:secondary:test").is_ok());
+        assert!(runtime.trigger_click("tray:scroll:test:2").is_ok());
+        assert!(runtime.trigger_click("brightness:set:80").is_ok());
+        assert!(runtime.trigger_click("brightness:step:5").is_ok());
+        assert!(runtime.trigger_click("idle:set:true").is_ok());
+        assert!(runtime.is_idle());
+        assert!(runtime.trigger_click("idle:toggle").is_ok());
+        assert!(!runtime.is_idle());
     }
 }

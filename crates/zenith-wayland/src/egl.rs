@@ -42,6 +42,12 @@ unsafe impl Send for EglSurface {}
 
 impl EglContext {
     /// Initialize EGL 1.5 and OpenGL ES 3.0 context from a native Wayland display pointer.
+    ///
+    /// # Safety
+    ///
+    /// - `wayland_display` must be a valid raw pointer to an active Wayland `wl_display`.
+    /// - The native display pointer must remain valid for the lifetime of the EGL display and context.
+    /// - Must be called on a thread capable of initializing EGL display connections.
     pub unsafe fn new(wayland_display: *mut std::ffi::c_void) -> Result<Self, Box<dyn std::error::Error>> {
         let egl_inst = egl::DynamicInstance::<egl::EGL1_5>::load_required()?;
         let egl = Arc::new(egl_inst);
@@ -103,7 +109,7 @@ impl EglContext {
                 .or_else(|| egl.get_proc_address("eglSwapBuffersWithDamageKHR"));
             if let Some(p) = proc {
                 tracing::info!("Loaded EGL swap buffers with damage extension");
-                Some(unsafe { std::mem::transmute(p) })
+                Some(unsafe { std::mem::transmute::<extern "system" fn(), EglSwapBuffersWithDamageFn>(p) })
             } else {
                 tracing::debug!("EGL swap buffers with damage extension not found, fallback to standard swap");
                 None

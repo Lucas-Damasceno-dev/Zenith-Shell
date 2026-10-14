@@ -3,7 +3,7 @@
 
 local Pill = Zenith.import("widgets/pill")
 
-local function Hardware()
+local function Hardware(props: { reactive: boolean? }?)
     local theme = Zenith.Theme()
     local mem = Zenith.Services.memory()
     local cpu = Zenith.Services.cpu()
@@ -17,7 +17,12 @@ local function Hardware()
     local mem_color = if mem.percent > 85 then Zenith.hex(theme.error or "#f38ba8") else Zenith.hex(theme.primary)
     local disk_color = if disk.percent > 90 then Zenith.hex(theme.error or "#f38ba8") else Zenith.hex(theme.primary)
 
-    local tip = string.format("CPU: %d%% | RAM: %d%% (%d/%d MB) | Disco: %d%% (%d/%d GB)", cpu.percent, mem.percent, mem.used_mb or 0, mem.total_mb or 0, disk.percent, disk.used_gb or 0, disk.total_gb or 0)
+    -- Granular reactive bindings for zero-redundancy hardware metrics
+    local is_reactive = if props and props.reactive ~= nil then props.reactive else true
+    local cpu_binding = if is_reactive and Zenith.Signals and Zenith.Signals.Cpu then Zenith.Signals.Cpu else string.format("%d%%", cpu.percent)
+    local mem_binding = if is_reactive and Zenith.Signals and Zenith.Signals.Memory then Zenith.Signals.Memory else string.format("%d%%", mem.percent)
+
+    local tip = string.format("CPU: %d%% | RAM: %d%% (%d/%d MB) | Disco: %d%% (%d/%d GB)\n• Clique: Monitor btop\n• Botão Direito: Monitor htop", cpu.percent, mem.percent, mem.used_mb or 0, mem.total_mb or 0, disk.percent, disk.used_gb or 0, disk.total_gb or 0)
 
     local hw_children = {
         Zenith.Box({
@@ -26,7 +31,7 @@ local function Hardware()
             gap = 3,
             children = {
                 Zenith.Text({ text = "", font_size = 12, color = cpu_color }),
-                Zenith.Text({ text = string.format("%d%%", cpu.percent), font_size = 11, color = Zenith.hex(theme.on_surface) }),
+                Zenith.Text({ text = cpu_binding, font_size = 11, color = Zenith.hex(theme.on_surface) }),
             }
         }),
         Zenith.Box({
@@ -42,7 +47,7 @@ local function Hardware()
             gap = 3,
             children = {
                 Zenith.Text({ text = "󰘚", font_size = 12, color = mem_color }),
-                Zenith.Text({ text = string.format("%d%%", mem.percent), font_size = 11, color = Zenith.hex(theme.on_surface) }),
+                Zenith.Text({ text = mem_binding, font_size = 11, color = Zenith.hex(theme.on_surface) }),
             }
         }),
     }
@@ -73,6 +78,7 @@ local function Hardware()
         gap = 5,
         tooltip = tip,
         on_click = "cmd:foot -e btop &",
+        on_right_click = "cmd:foot -e htop &",
         children = hw_children,
     })
 end

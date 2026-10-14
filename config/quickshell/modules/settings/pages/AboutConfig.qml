@@ -10,6 +10,16 @@ ColumnLayout {
     spacing: DesignTokens.spacingLG
     Layout.fillWidth: true
 
+    readonly property var deps: [
+        { name: "PipeWire (wpctl)", desc: "Low-latency audio and microphone graph server", status: "Installed" },
+        { name: "NetworkManager (nmcli)", desc: "Wi-Fi, Ethernet, and connection state management", status: "Installed" },
+        { name: "Power Profiles Daemon", desc: "Energy management & battery governor switcher", status: "Installed" },
+        { name: "Grim & Slurp", desc: "Wayland screen pixel grabber and region selector", status: "Installed" },
+        { name: "wf-recorder", desc: "Hardware-accelerated Wayland screen recorder", status: "Installed" },
+        { name: "Swww Daemon", desc: "Animated Wayland wallpaper daemon with transition shaders", status: "Installed" },
+        { name: "Matugen", desc: "Material You cross-app palette generator", status: "Installed" }
+    ]
+
     Rectangle {
         Layout.fillWidth: true
         Layout.preferredHeight: 120
@@ -89,16 +99,6 @@ ColumnLayout {
         title: "System Ecosystem & Dependencies"
         description: "Essential Wayland and Linux userland utilities status."
         iconGlyph: "\uf085"
-
-        readonly property var deps: [
-            { name: "PipeWire (wpctl)", desc: "Low-latency audio and microphone graph server", status: "Installed" },
-            { name: "NetworkManager (nmcli)", desc: "Wi-Fi, Ethernet, and connection state management", status: "Installed" },
-            { name: "Power Profiles Daemon", desc: "Energy management & battery governor switcher", status: "Installed" },
-            { name: "Grim & Slurp", desc: "Wayland screen pixel grabber and region selector", status: "Installed" },
-            { name: "wf-recorder", desc: "Hardware-accelerated Wayland screen recorder", status: "Installed" },
-            { name: "Swww Daemon", desc: "Animated Wayland wallpaper daemon with transition shaders", status: "Installed" },
-            { name: "Matugen", desc: "Material You cross-app palette generator", status: "Installed" }
-        ]
 
         Repeater {
             model: root.deps

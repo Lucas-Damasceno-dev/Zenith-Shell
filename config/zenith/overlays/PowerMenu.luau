@@ -108,9 +108,9 @@ return Zenith.Window({
                         PowerCard({
                             icon = "󰒲",
                             title = "Suspender",
-                            subtitle = "systemctl suspend",
+                            subtitle = "suspend",
                             color = theme.secondary or theme.primary,
-                            action = "cmd:systemctl suspend",
+                            action = "system:suspend",
                         }),
                     }
                 }),
@@ -125,7 +125,7 @@ return Zenith.Window({
                             title = "Reiniciar",
                             subtitle = "reboot",
                             color = theme.yellow or "#e5c07b",
-                            action = "cmd:systemctl reboot",
+                            action = "system:reboot",
                         }),
                         PowerCard({
                             icon = "⏻",
@@ -133,7 +133,7 @@ return Zenith.Window({
                             subtitle = "poweroff",
                             color = theme.error or "#f38ba8",
                             bg_color = Zenith.hex(theme.error or "#f38ba8", 40),
-                            action = "cmd:systemctl poweroff",
+                            action = "system:poweroff",
                         }),
                     }
                 }),

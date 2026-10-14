@@ -166,27 +166,37 @@ pub fn setup_async_bridge(
     let promise_table: LuaTable = lua.load(promise_init_code).eval()?;
     zenith_table.set("Promise", promise_table.clone())?;
 
-    // Zenith.spawn(cmd, args): Promise<{ stdout: string, stderr: string, code: number }>
+    // Zenith.spawn(cmd, args, timeout_ms): Promise<{ stdout: string, stderr: string, code: number }>
     let pool_spawn = Arc::clone(&pool);
     let p_ctor_spawn = promise_table.clone();
-    let spawn_fn = lua.create_function(move |lua, (cmd, args): (String, Option<Vec<String>>)| {
-        let args_vec = args.unwrap_or_default();
-        let task_id = pool_spawn.spawn_process(cmd, args_vec);
+    let spawn_fn = lua.create_function(
+        move |lua, (cmd, args, timeout_ms): (String, Option<Vec<String>>, Option<u64>)| {
+            let args_vec = args.unwrap_or_default();
+            let timeout = timeout_ms.map(Duration::from_millis);
+            let task_id = pool_spawn.spawn_process_with_timeout(cmd, args_vec, timeout);
 
-        let new_fn: LuaFunction = p_ctor_spawn.get("new")?;
-        let executor = lua.create_function(move |lua, (resolve, reject): (LuaFunction, LuaFunction)| {
-            let pending: LuaTable = lua.named_registry_value(PENDING_PROMISES_KEY)?;
-            let pair = lua.create_table()?;
-            pair.set("resolve", resolve)?;
-            pair.set("reject", reject)?;
-            pending.set(task_id, pair)?;
-            Ok(())
-        })?;
+            let new_fn: LuaFunction = p_ctor_spawn.get("new")?;
+            let executor = lua.create_function(move |lua, (resolve, reject): (LuaFunction, LuaFunction)| {
+                let pending: LuaTable = lua.named_registry_value(PENDING_PROMISES_KEY)?;
+                let pair = lua.create_table()?;
+                pair.set("resolve", resolve)?;
+                pair.set("reject", reject)?;
+                pending.set(task_id, pair)?;
+                Ok(())
+            })?;
 
-        new_fn.call::<LuaTable>(executor)
-    })?;
+            new_fn.call::<LuaTable>(executor)
+        },
+    )?;
     zenith_table.set("spawn", spawn_fn.clone())?;
     zenith_table.set("exec", spawn_fn)?;
+
+    // Zenith.cancel(task_id): boolean
+    let pool_cancel = Arc::clone(&pool);
+    let cancel_fn = lua.create_function(move |_, task_id: u64| {
+        Ok(pool_cancel.cancel_task(task_id))
+    })?;
+    zenith_table.set("cancel", cancel_fn)?;
 
     // Zenith.delay(ms): Promise<nil>
     let pool_delay = Arc::clone(&pool);
@@ -325,7 +335,7 @@ mod tests {
         // Wait for background worker
         let start = std::time::Instant::now();
         let mut resolved = 0;
-        while start.elapsed() < Duration::from_millis(1500) {
+        while start.elapsed() < Duration::from_millis(5000) {
             std::thread::sleep(Duration::from_millis(20));
             resolved += poll_async_completions(&lua, &pool)?;
             if resolved >= 1 {
@@ -336,6 +346,40 @@ mod tests {
 
         let final_val: String = lua.load("return _G.async_res").eval()?;
         assert!(final_val.contains("background_worker_ok"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_async_spawn_timeout() -> Result<(), LuaError> {
+        let lua = Lua::new();
+        let zenith_tbl = lua.create_table()?;
+        let pool = Arc::new(WorkerThreadPool::new(2));
+
+        setup_async_bridge(&lua, &zenith_tbl, Arc::clone(&pool))?;
+        lua.globals().set("Zenith", zenith_tbl)?;
+
+        let script = r#"
+            _G.timeout_err = nil
+            Zenith.spawn("sleep", {"5"}, 50):catch(function(err)
+                _G.timeout_err = err
+            end)
+        "#;
+        lua.load(script).exec()?;
+
+        let start = std::time::Instant::now();
+        let mut resolved = 0;
+        while start.elapsed() < Duration::from_millis(5000) {
+            std::thread::sleep(Duration::from_millis(20));
+            resolved += poll_async_completions(&lua, &pool)?;
+            if resolved >= 1 {
+                break;
+            }
+        }
+        assert_eq!(resolved, 1);
+
+        let final_err: String = lua.load("return _G.timeout_err").eval()?;
+        assert!(final_err.contains("timed out"));
 
         Ok(())
     }

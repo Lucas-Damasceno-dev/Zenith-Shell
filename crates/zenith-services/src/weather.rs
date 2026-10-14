@@ -90,20 +90,7 @@ impl WeatherService {
     }
 
     fn fetch_remote() -> Option<WeatherSnapshot> {
-        let text = if let Some(native_text) = Self::fetch_wttr_native() {
-            native_text
-        } else {
-            // Fallback to curl if native socket resolution fails
-            let out = std::process::Command::new("curl")
-                .args(["-s", "--max-time", "3", "wttr.in/?format=%t+%C"])
-                .output()
-                .ok()?;
-            if out.status.success() {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            } else {
-                return None;
-            }
-        };
+        let text = Self::fetch_wttr_native()?;
 
         // Format: "+23°C Clear"
         let parts: Vec<&str> = text.split_whitespace().collect();

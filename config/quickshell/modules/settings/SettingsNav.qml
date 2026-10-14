@@ -15,7 +15,7 @@ Rectangle {
     signal searchUpdated(string query)
     signal closeRequested()
 
-    width: 280
+    width: 300
     Layout.fillHeight: true
     color: ColorScheme.withAlpha(ColorScheme.surfaceVariant, 0.35)
     border.width: 1
@@ -91,14 +91,17 @@ Rectangle {
 
         // --- Categories & Pages List ---
         ScrollView {
+            id: navScroll
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
             ColumnLayout {
-                width: parent.width
+                id: navCol
+                width: navScroll.availableWidth
                 spacing: DesignTokens.spacingLG
 
                 Repeater {
@@ -109,7 +112,8 @@ Rectangle {
                         required property var modelData
                         required property int index
 
-                        width: parent.width
+                        Layout.fillWidth: true
+                        width: navCol.width
                         spacing: DesignTokens.spacingXS
 
                         // Category Label
@@ -135,6 +139,8 @@ Rectangle {
                                 readonly property var pageDef: SettingsRegistry.pages[modelData]
                                 readonly property bool isSelected: root.currentPage === modelData && root.searchQuery.length === 0
 
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 42
                                 width: catCol.width
                                 height: 42
                                 radius: DesignTokens.radiusSM
@@ -152,7 +158,7 @@ Rectangle {
                                     spacing: DesignTokens.spacingMD
 
                                     Text {
-                                        text: navItem.pageDef.icon || "\uf013"
+                                        text: (navItem.pageDef && navItem.pageDef.icon) ? navItem.pageDef.icon : "\uf013"
                                         font.family: Style.fontMono
                                         font.pixelSize: Style.fontSizeMD
                                         color: navItem.isSelected ? ColorScheme.onPrimary : ColorScheme.accent
@@ -166,7 +172,8 @@ Rectangle {
                                         spacing: 1
 
                                         Text {
-                                            text: navItem.pageDef.name || ""
+                                            Layout.fillWidth: true
+                                            text: (navItem.pageDef && navItem.pageDef.name) ? navItem.pageDef.name : ""
                                             font.family: Style.fontUI
                                             font.pixelSize: Style.fontSizeSM
                                             font.weight: navItem.isSelected ? Font.Bold : Font.Medium
@@ -176,7 +183,8 @@ Rectangle {
                                         }
 
                                         Text {
-                                            text: navItem.pageDef.desc || ""
+                                            Layout.fillWidth: true
+                                            text: (navItem.pageDef && navItem.pageDef.desc) ? navItem.pageDef.desc : ""
                                             font.family: Style.fontUI
                                             font.pixelSize: 10
                                             color: navItem.isSelected ? ColorScheme.withAlpha(ColorScheme.onPrimary, 0.80) : ColorScheme.withAlpha(ColorScheme.text, 0.45)

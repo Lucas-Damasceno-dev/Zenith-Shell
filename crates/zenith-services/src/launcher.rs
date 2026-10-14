@@ -83,20 +83,35 @@ impl LauncherService {
         scored.into_iter().take(limit).map(|(_, app)| app.clone()).collect()
     }
 
-    /// Launch application command asynchronously in a detached process.
+    /// Launch application command asynchronously in a detached process (zero intermediate shell forks).
     pub fn launch(exec_cmd: &str) -> std::io::Result<()> {
         let clean_cmd = Self::clean_exec(exec_cmd);
         debug!("Launching application command: {}", clean_cmd);
 
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("{} &", clean_cmd))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        Ok(())
+        let mut parts = clean_cmd.split_whitespace();
+        if let Some(bin) = parts.next() {
+            let args: Vec<&str> = parts.collect();
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match cmd.spawn() {
+                Ok(_) => Ok(()),
+                Err(_) => {
+                    // Fallback to shell only if direct binary lookup fails
+                    std::process::Command::new("sh")
+                        .args(["-c", &format!("{} &", clean_cmd)])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map(|_| ())
+                }
+            }
+        } else {
+            Ok(())
+        }
     }
 
     fn calculate_score(app: &AppEntry, q: &str) -> i32 {
@@ -271,7 +286,7 @@ impl LauncherService {
             }
         }
 
-        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        entries.sort_by_key(|a| a.name.to_lowercase());
         entries
     }
 

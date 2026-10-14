@@ -58,7 +58,7 @@ impl XdgIconResolver {
     fn resolve_uncached(name: &str, size: u32) -> Option<PathBuf> {
         let base_dirs = Self::get_icon_search_paths();
         let size_str = format!("{}x{}", size, size);
-        let size_fallbacks = ["scalable", &size_str, "48x48", "64x64", "32x32", "24x24", "16x16", "128x128", "256x256"];
+        let size_fallbacks = ["scalable", &size_str, "48x48", "64x64", "32x32", "24x24", "22x22", "16x16", "128x128", "256x256", "512x512"];
         let categories = ["apps", "devices", "status", "categories", "actions", "places", "mimetypes"];
         let extensions = ["svg", "png", "xpm"];
 

@@ -14,15 +14,7 @@ use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info};
 use zenith_core::init_logging;
 use zenith_wayland::WaylandApp;
-
-enum ShellCommand {
-    Reload,
-    Toggle(String),
-    Open(String),
-    Close,
-    ToggleInspect,
-    Eval(String, std::sync::mpsc::Sender<String>),
-}
+use zenith_cli::ShellCommand;
 
 enum AppEvent {
     Reload(String),
@@ -59,6 +51,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_help();
             Ok(())
         }
+        "settings" | "config" => {
+            let action = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            match action {
+                "get" => {
+                    if let Some(key) = args.get(3) {
+                        send_socket_command(&format!("settings:get {}", key))
+                    } else {
+                        eprintln!("Usage: zenith settings get <key>");
+                        std::process::exit(1);
+                    }
+                }
+                "set" => {
+                    if let (Some(key), Some(val)) = (args.get(3), args.get(4)) {
+                        send_socket_command(&format!("settings:set {} {}", key, val))
+                    } else {
+                        eprintln!("Usage: zenith settings set <key> <val>");
+                        std::process::exit(1);
+                    }
+                }
+                "list" | "all" => send_socket_command("settings:list"),
+                "sync" => send_socket_command("settings:sync"),
+                "reload" => send_socket_command("settings:reload"),
+                _ => {
+                    eprintln!("Unknown settings action: '{}'. Valid actions: get, set, list, sync, reload.", action);
+                    std::process::exit(1);
+                }
+            }
+        }
         "daemon" | "run" => {
             let custom_cfg = args.iter().skip(2).find(|a| !a.starts_with("--")).map(PathBuf::from);
             run_daemon(custom_cfg, inspect_flag)
@@ -90,49 +110,34 @@ fn print_help() {
     println!("    lock                      Activate screen locker overlay");
     println!("    inspect                   Display live shell telemetry (RSS, heap, popups)");
     println!("    inspect:toggle            Toggle on-screen visual bounding box overlays");
+    println!("    settings get <key>        Get configuration setting value via IPC");
+    println!("    settings set <key> <val>  Set configuration setting and persist atomically");
+    println!("    settings list             List all configuration key-values as JSON");
+    println!("    settings sync             Flush and persist all settings to config.json");
+    println!("    settings reload           Reload settings from config.json into live state");
     println!("    eval <code>               Evaluate arbitrary Luau expression via daemon");
     println!("    repl                      Start interactive live Luau shell session");
     println!("    help                      Show this help message");
 }
 
 fn resolve_socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("zenith.sock")
-    } else {
-        PathBuf::from("/tmp/zenith.sock")
-    }
+    zenith_cli::resolve_socket_path()
 }
 
 fn send_socket_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
     let sock_path = resolve_socket_path();
-    if !sock_path.exists() {
-        eprintln!(
-            "Error: Zenith daemon is not running (socket not found at {}).",
-            sock_path.display()
-        );
-        std::process::exit(1);
-    }
-
-    let mut stream = match UnixStream::connect(&sock_path) {
-        Ok(s) => s,
+    match zenith_cli::send_socket_command_to(&sock_path, cmd) {
+        Ok(resp) => {
+            if !resp.is_empty() {
+                println!("{}", resp);
+            }
+            Ok(())
+        }
         Err(e) => {
-            eprintln!("Failed to connect to Zenith socket: {}", e);
+            eprintln!("{}", e);
             std::process::exit(1);
         }
-    };
-
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(format!("{}\n", cmd).as_bytes())?;
-
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    let _ = reader.read_line(&mut response);
-
-    let trimmed = response.trim();
-    if !trimmed.is_empty() {
-        println!("{}", trimmed);
     }
-    Ok(())
 }
 
 fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -175,13 +180,12 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
 
     // Auto-launch Dock if enabled in configuration
     let home_cfg = std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/zenith/config.json"));
-    let mut config_paths = vec![
-        PathBuf::from("config/zenith/config.json"),
-        PathBuf::from("../../config/zenith/config.json"),
-    ];
+    let mut config_paths = Vec::new();
     if let Some(p) = home_cfg {
         config_paths.push(p);
     }
+    config_paths.push(PathBuf::from("config/zenith/config.json"));
+    config_paths.push(PathBuf::from("../../config/zenith/config.json"));
 
     let dock_enabled = config_paths
         .iter()
@@ -191,7 +195,7 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
                 .and_then(|v| v.get("dock")?.get("enable")?.as_bool())
         })
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if dock_enabled {
         info!("Dock enabled in configuration, launching dock overlay...");
@@ -215,6 +219,8 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             match app_evt {
                 AppEvent::Reload(code) => {
                     info!("Hot-reload triggered, recomputing Luau UI tree...");
+                    zenith_services::LauncherService::reload();
+                    zenith_services::XdgIconResolver::invalidate_cache();
                     let start = std::time::Instant::now();
                     if let Err(e) = app.reload_script(&code) {
                         error!("Luau script error on hot-reload: {}", e);
@@ -225,6 +231,8 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                 }
                 AppEvent::ReloadActiveTrees => {
                     info!("Hot-reload triggered for module/overlay, refreshing Luau module cache and active trees...");
+                    zenith_services::LauncherService::reload();
+                    zenith_services::XdgIconResolver::invalidate_cache();
                     let start = std::time::Instant::now();
                     app.reload_active_trees();
                     let elapsed = start.elapsed();
@@ -263,8 +271,14 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     }
                 }
                 ShellCommand::Toggle(id) => {
-                    info!("IPC command: toggle popup '{}'", id);
-                    app.toggle_popup(&id);
+                    info!("IPC command: toggle popup/mode '{}'", id);
+                    if id == "bar:autohide" {
+                        app.execute_action("bar:toggle_autohide");
+                    } else if id == "dock:autohide" {
+                        app.execute_action("dock:toggle_autohide");
+                    } else {
+                        app.toggle_popup(&id);
+                    }
                     cmd_needs_redraw.store(true, Ordering::Release);
                     let _ = app.request_redraw();
                 }
@@ -292,6 +306,85 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                         Err(e) => format!("ERR: {}\n", e),
                     };
                     let _ = tx.send(res);
+                }
+                ShellCommand::SettingsGet(key, tx) => {
+                    let resp = match app.runtime.storage.get(&key) {
+                        Some(val) => format!("OK: {}\n", val),
+                        None => format!("ERR: setting '{}' not found\n", key),
+                    };
+                    let _ = tx.send(resp);
+                }
+                ShellCommand::SettingsSet(key, val_str, tx) => {
+                    let json_val = if val_str == "true" {
+                        serde_json::Value::Bool(true)
+                    } else if val_str == "false" {
+                        serde_json::Value::Bool(false)
+                    } else if let Ok(num) = val_str.parse::<i64>() {
+                        serde_json::Value::from(num)
+                    } else if let Ok(num) = val_str.parse::<f64>() {
+                        if (num - num.round()).abs() < 1e-4 {
+                            serde_json::Value::from(num.round() as i64)
+                        } else {
+                            serde_json::Number::from_f64(num).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                        }
+                    } else if (val_str.starts_with('{') && val_str.ends_with('}'))
+                        || (val_str.starts_with('[') && val_str.ends_with(']'))
+                    {
+                        serde_json::from_str::<serde_json::Value>(&val_str).unwrap_or(serde_json::Value::String(val_str.clone()))
+                    } else {
+                        serde_json::Value::String(val_str.clone())
+                    };
+
+                    let res = match app.runtime.storage.set(&key, json_val.clone()) {
+                        Ok(_) => {
+                            if key == "barAutoHide" || key == "bar.autoHide" {
+                                app.bar_autohide = json_val.as_bool().unwrap_or(true);
+                            } else if key == "dockAutoHide" || key == "dock.autoHide" {
+                                app.dock_autohide = json_val.as_bool().unwrap_or(true);
+                            }
+                            cmd_needs_redraw.store(true, Ordering::Release);
+                            let _ = app.request_redraw();
+                            format!("OK: setting '{}' set to {}\n", key, json_val)
+                        }
+                        Err(e) => format!("ERR: failed to persist setting '{}': {}\n", key, e),
+                    };
+                    let _ = tx.send(res);
+                }
+                ShellCommand::SettingsList(tx) => {
+                    let all_map = app.runtime.storage.all();
+                    let resp = match serde_json::to_string_pretty(&all_map) {
+                        Ok(json_str) => format!("OK: {}\n", json_str),
+                        Err(_) => "ERR: failed to serialize settings\n".to_string(),
+                    };
+                    let _ = tx.send(resp);
+                }
+                ShellCommand::SettingsSync(tx) => {
+                    let resp = match app.runtime.storage.sync_to_config() {
+                        Ok(_) => "OK: settings synced to config.json\n".to_string(),
+                        Err(e) => format!("ERR: failed to sync settings: {}\n", e),
+                    };
+                    let _ = tx.send(resp);
+                }
+                ShellCommand::SettingsReload(tx) => {
+                    let resp = match app.runtime.storage.reload_from_config() {
+                        Ok(_) => {
+                            app.reload_active_trees();
+                            cmd_needs_redraw.store(true, Ordering::Release);
+                            let _ = app.request_redraw();
+                            "OK: settings reloaded from config.json and UI updated\n".to_string()
+                        }
+                        Err(e) => format!("ERR: failed to reload settings: {}\n", e),
+                    };
+                    let _ = tx.send(resp);
+                }
+                ShellCommand::Lock => {
+                    info!("IPC command: lock screen");
+                    let _ = app.open_popup("lock");
+                    cmd_needs_redraw.store(true, Ordering::Release);
+                    let _ = app.request_redraw();
+                }
+                ShellCommand::Inspect => {
+                    info!("IPC command: inspect telemetry");
                 }
             }
         }
@@ -360,6 +453,49 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     Err(_) => {
                         let _ = stream.write_all(b"ERR: eval timeout\n");
                     }
+                }
+            } else if let Some(stripped) = trimmed.strip_prefix("settings:get ") {
+                let key = stripped.trim().to_string();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = socket_cmd_sender.send(ShellCommand::SettingsGet(key, tx));
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
+                    Err(_) => { let _ = stream.write_all(b"ERR: settings get timeout\n"); }
+                }
+            } else if let Some(stripped) = trimmed.strip_prefix("settings:set ") {
+                let parts: Vec<&str> = stripped.trim().splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    let key = parts[0].to_string();
+                    let val = parts[1].to_string();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let _ = socket_cmd_sender.send(ShellCommand::SettingsSet(key, val, tx));
+                    match rx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
+                        Err(_) => { let _ = stream.write_all(b"ERR: settings set timeout\n"); }
+                    }
+                } else {
+                    let _ = stream.write_all(b"ERR: invalid settings:set format (expected: settings:set <key> <val>)\n");
+                }
+            } else if trimmed == "settings:list" || trimmed == "settings:all" {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = socket_cmd_sender.send(ShellCommand::SettingsList(tx));
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
+                    Err(_) => { let _ = stream.write_all(b"ERR: settings list timeout\n"); }
+                }
+            } else if trimmed == "settings:sync" {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = socket_cmd_sender.send(ShellCommand::SettingsSync(tx));
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
+                    Err(_) => { let _ = stream.write_all(b"ERR: settings sync timeout\n"); }
+                }
+            } else if trimmed == "settings:reload" {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = socket_cmd_sender.send(ShellCommand::SettingsReload(tx));
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
+                    Err(_) => { let _ = stream.write_all(b"ERR: settings reload timeout\n"); }
                 }
             } else {
                 let _ = stream.write_all(b"ERR: unknown command\n");
@@ -517,31 +653,7 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
 }
 
 fn read_self_memory() -> (f64, f64) {
-    let mut vmrss_mb = 0.0;
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<f64>() {
-                        vmrss_mb = kb / 1024.0;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut heap_mb = 0.0;
-    if let Ok(statm) = fs::read_to_string("/proc/self/statm") {
-        let parts: Vec<&str> = statm.split_whitespace().collect();
-        if parts.len() >= 6 {
-            if let Ok(pages) = parts[5].parse::<f64>() {
-                heap_mb = (pages * 4096.0) / (1024.0 * 1024.0);
-            }
-        }
-    }
-
-    (vmrss_mb, heap_mb)
+    zenith_cli::read_self_memory()
 }
 
 fn dirs_config_path() -> Option<PathBuf> {
@@ -593,8 +705,19 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
             || trimmed == "inspect"
             || trimmed == "inspect:toggle"
             || trimmed.starts_with("eval ")
+            || trimmed.starts_with("settings:")
         {
             trimmed.to_string()
+        } else if let Some(stripped) = trimmed.strip_prefix("settings ") {
+            let parts: Vec<&str> = stripped.trim().split_whitespace().collect();
+            match parts.as_slice() {
+                ["get", key] => format!("settings:get {}", key),
+                ["set", key, val] => format!("settings:set {} {}", key, val),
+                ["list"] | ["all"] => "settings:list".to_string(),
+                ["sync"] => "settings:sync".to_string(),
+                ["reload"] => "settings:reload".to_string(),
+                _ => format!("eval {}", trimmed),
+            }
         } else {
             format!("eval {}", trimmed)
         };

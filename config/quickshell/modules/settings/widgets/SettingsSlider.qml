@@ -17,7 +17,7 @@ RowLayout {
     signal valueModified(real nextValue)
 
     spacing: DesignTokens.spacingMD
-    implicitWidth: 220
+    implicitWidth: 260
     implicitHeight: 28
 
     Component.onCompleted: {
@@ -103,7 +103,8 @@ RowLayout {
     }
 
     Rectangle {
-        Layout.preferredWidth: 60
+        id: valueBadge
+        Layout.preferredWidth: Math.max(76, valueText.implicitWidth + DesignTokens.spacingMD * 2)
         Layout.preferredHeight: 24
         Layout.alignment: Qt.AlignVCenter
         radius: DesignTokens.radiusXS
@@ -112,6 +113,7 @@ RowLayout {
         border.color: ColorScheme.withAlpha(ColorScheme.outline, 0.15)
 
         Text {
+            id: valueText
             anchors.centerIn: parent
             text: (root.decimals > 0 ? root.value.toFixed(root.decimals) : Math.round(root.value).toString()) + (root.unit.length > 0 ? " " + root.unit : "")
             font.family: Style.fontMono

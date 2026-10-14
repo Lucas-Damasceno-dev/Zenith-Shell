@@ -32,6 +32,7 @@ impl ShmFallbackRenderer {
         pb.finish()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_boxes(
         canvas: &mut [u8],
         boxes: &[ComputedBox],
@@ -40,6 +41,7 @@ impl ShmFallbackRenderer {
         spring_val: f32,
         font_system: &mut FontSystem,
         swash_cache: &mut SwashCache,
+        damage_rect: Option<crate::render::damage::DamageRect>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let alpha_factor = spring_val.clamp(0.0, 1.0);
         let scale_y = (0.88 + 0.12 * spring_val.clamp(0.0, 1.15)).max(0.0);
@@ -65,6 +67,13 @@ impl ShmFallbackRenderer {
                     continue;
                 }
 
+                let shadow_pad = b.shadow.as_ref().map(|s| s.blur * 2.5).unwrap_or(2.0);
+                if let Some(rect) = damage_rect {
+                    if !rect.intersects_box_with_padding(b, shadow_pad) {
+                        continue;
+                    }
+                }
+
                 let cx = b.x + b.width * 0.5;
                 let cy = b.y;
                 let box_w = b.width * scale_x;
@@ -77,6 +86,10 @@ impl ShmFallbackRenderer {
                 }
                 let box_x = cx - box_w * 0.5;
                 let box_y = cy;
+
+                if box_x + box_w <= 0.0 || box_x >= width as f32 || box_y + box_h <= 0.0 || box_y >= height as f32 {
+                    continue;
+                }
 
                 // Multi-pass drop shadow
                 if let Some(ref shadow) = b.shadow {
@@ -182,13 +195,104 @@ impl ShmFallbackRenderer {
                         pixmap.stroke_path(&path, &focus_paint, &focus_stroke, tiny_skia::Transform::identity(), None);
                     }
                 }
+
+                // Render Zenith.Slider
+                if let Some(ref sl) = b.slider {
+                    let track_h = sl.track_height.max(2.0);
+                    let track_y = box_y + (box_h - track_h) * 0.5;
+                    let norm = ((sl.value - sl.min) / (sl.max - sl.min).max(0.001)).clamp(0.0, 1.0);
+
+                    // Background track
+                    if let Some(track_path) = Self::build_rounded_rect_path(box_x, track_y, box_w, track_h, track_h * 0.5) {
+                        let mut track_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
+                        track_paint.set_color_rgba8(
+                            sl.track_color.r,
+                            sl.track_color.g,
+                            sl.track_color.b,
+                            (sl.track_color.a as f32 * alpha_factor) as u8,
+                        );
+                        pixmap.fill_path(&track_path, &track_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    }
+
+                    // Active filled track
+                    let active_w = box_w * norm;
+                    if active_w > 1.0 {
+                        if let Some(active_path) = Self::build_rounded_rect_path(box_x, track_y, active_w, track_h, track_h * 0.5) {
+                            let mut active_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
+                            active_paint.set_color_rgba8(
+                                sl.active_track_color.r,
+                                sl.active_track_color.g,
+                                sl.active_track_color.b,
+                                (sl.active_track_color.a as f32 * alpha_factor) as u8,
+                            );
+                            pixmap.fill_path(&active_path, &active_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                        }
+                    }
+
+                    // Thumb
+                    let thumb_d = sl.thumb_radius * 2.0;
+                    let thumb_x = (box_x + norm * (box_w - thumb_d)).clamp(box_x, box_x + box_w - thumb_d);
+                    let thumb_y = box_y + (box_h - thumb_d) * 0.5;
+                    if let Some(thumb_path) = Self::build_rounded_rect_path(thumb_x, thumb_y, thumb_d, thumb_d, sl.thumb_radius) {
+                        let mut thumb_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
+                        thumb_paint.set_color_rgba8(
+                            sl.thumb_color.r,
+                            sl.thumb_color.g,
+                            sl.thumb_color.b,
+                            (sl.thumb_color.a as f32 * alpha_factor) as u8,
+                        );
+                        pixmap.fill_path(&thumb_path, &thumb_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    }
+                }
+
+                // Render Zenith.Switch
+                if let Some(ref sw) = b.switch {
+                    let pill_radius = box_h * 0.5;
+                    let bg_color = if sw.checked { sw.active_color } else { sw.inactive_color };
+                    if let Some(pill_path) = Self::build_rounded_rect_path(box_x, box_y, box_w, box_h, pill_radius) {
+                        let mut pill_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
+                        pill_paint.set_color_rgba8(
+                            bg_color.r,
+                            bg_color.g,
+                            bg_color.b,
+                            (bg_color.a as f32 * alpha_factor) as u8,
+                        );
+                        pixmap.fill_path(&pill_path, &pill_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    }
+
+                    // Sliding thumb
+                    let thumb_d = (box_h - 4.0).max(4.0);
+                    let thumb_r = thumb_d * 0.5;
+                    let thumb_y = box_y + 2.0;
+                    let thumb_x = if sw.checked {
+                        box_x + box_w - thumb_d - 2.0
+                    } else {
+                        box_x + 2.0
+                    };
+                    if let Some(thumb_path) = Self::build_rounded_rect_path(thumb_x, thumb_y, thumb_d, thumb_d, thumb_r) {
+                        let mut thumb_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
+                        thumb_paint.set_color_rgba8(
+                            sw.thumb_color.r,
+                            sw.thumb_color.g,
+                            sw.thumb_color.b,
+                            (sw.thumb_color.a as f32 * alpha_factor) as u8,
+                        );
+                        pixmap.fill_path(&thumb_path, &thumb_paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    }
+                }
             }
         }
 
         // Pass 2: cosmic-text glyphs
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 18.0));
         for b in boxes {
             if b.y >= root_max_y - 2.0 {
                 continue;
+            }
+            if let Some(rect) = damage_rect {
+                if !rect.intersects_box_with_padding(b, 4.0) {
+                    continue;
+                }
             }
 
             let text_to_draw: Option<(std::borrow::Cow<'_, str>, zenith_layout::Color, f32)> = if let Some((ref text, color, font_size)) = b.text {
@@ -209,7 +313,7 @@ impl ShmFallbackRenderer {
             if let Some((text, color, font_size)) = text_to_draw {
                 let line_height = font_size * 1.3;
                 let metrics = Metrics::new(font_size, line_height);
-                let mut buffer = Buffer::new(font_system, metrics);
+                buffer.set_metrics(metrics);
                 let is_complex = text.chars().any(|c| c as u32 > 0x0600);
                 let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
                 buffer.set_text(
@@ -245,6 +349,11 @@ impl ShmFallbackRenderer {
                         let px = bx + gx;
                         let py = by + gy;
                         if px >= 0 && px < width as i32 && py >= 0 && (py as f32) < root_max_y {
+                            if let Some(rect) = damage_rect {
+                                if !rect.contains_point(px, py) {
+                                    return;
+                                }
+                            }
                             let idx = (py as usize * width as usize + px as usize) * 4;
                             let alpha = glyph_color.a() as u32;
                             if alpha > 0 && idx + 3 < canvas.len() {
@@ -258,10 +367,10 @@ impl ShmFallbackRenderer {
                                 let fg_r = glyph_color.r() as u32;
                                 let inv_a = 255 - alpha;
 
-                                let out_r = ((fg_r * alpha + bg_r * inv_a + 128) * 257 >> 16) as u8;
-                                let out_g = ((fg_g * alpha + bg_g * inv_a + 128) * 257 >> 16) as u8;
-                                let out_b = ((fg_b * alpha + bg_b * inv_a + 128) * 257 >> 16) as u8;
-                                let out_a = ((alpha * 255 + bg_a * inv_a + 128) * 257 >> 16) as u8;
+                                let out_r = (((fg_r * alpha + bg_r * inv_a + 128) * 257) >> 16) as u8;
+                                let out_g = (((fg_g * alpha + bg_g * inv_a + 128) * 257) >> 16) as u8;
+                                let out_b = (((fg_b * alpha + bg_b * inv_a + 128) * 257) >> 16) as u8;
+                                let out_a = (((alpha * 255 + bg_a * inv_a + 128) * 257) >> 16) as u8;
 
                                 canvas[idx] = out_b;
                                 canvas[idx + 1] = out_g;

@@ -3,21 +3,21 @@
 -- Inspired by Quickshell PillWidget.qml (DesignTokens + Material You)
 
 type PillProps = {
-    icon: string?,
+    icon: any?,
     icon_color: any?,
     icon_size: number?,
     icon_chip: boolean?,
-    label: string?,
+    label: any?,
     label_color: any?,
     label_size: number?,
-    badge: string?,
+    badge: any?,
     badge_color: any?,
     variant: string?,
     height: number?,
     border_radius: number?,
     padding: { x: number, y: number }?,
     gap: number?,
-    tooltip: string?,
+    tooltip: any?,
     on_click: string?,
     on_right_click: string?,
     on_scroll_up: string?,
@@ -72,12 +72,22 @@ local function Pill(props: PillProps?)
 
     local content_children = {}
 
+    local function has_content(val: any): boolean
+        if val == nil then
+            return false
+        end
+        if type(val) == "string" then
+            return #val > 0
+        end
+        return true -- Signals, functions reativas, números
+    end
+
     -- Custom children override
     if p.children and #p.children > 0 then
         content_children = p.children
     else
         -- Icon
-        if p.icon and #p.icon > 0 then
+        if has_content(p.icon) then
             local icol = p.icon_color or icon_default_col
             local isize = p.icon_size or 12
             local icon_text_node = Zenith.Text({
@@ -99,7 +109,7 @@ local function Pill(props: PillProps?)
         end
 
         -- Label
-        if p.label and #p.label > 0 then
+        if has_content(p.label) then
             local lcol = p.label_color or label_default_col
             local lsize = p.label_size or 11
             table.insert(content_children, Zenith.Text({
@@ -110,7 +120,7 @@ local function Pill(props: PillProps?)
         end
 
         -- Badge counter
-        if p.badge and #p.badge > 0 then
+        if has_content(p.badge) then
             local bcol = p.badge_color or theme.primary
             table.insert(content_children, Zenith.Box({
                 padding = { x = 4, y = 1 },

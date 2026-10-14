@@ -2,8 +2,14 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+pub mod clamp;
 pub mod kinetic_scroll;
+pub mod math {
+    pub use crate::clamp::*;
+}
 pub mod spring;
+
+pub use clamp::{clamp, clamp_safe, ClampExt, ClampRange};
 pub use kinetic_scroll::KineticScrollEngine;
 pub use spring::{SpringAnimation, SpringConfig};
 

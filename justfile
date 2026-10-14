@@ -1,5 +1,6 @@
 # Zenith Desktop Shell (Engine v2) — Developer Workflow
 set shell := ["bash", "-c"]
+cargo_bin := `if pkg-config --exists wayland-client >/dev/null 2>&1; then echo "cargo"; else echo "nix develop --command cargo"; fi`
 
 # Default recipe: display available commands
 default:
@@ -47,11 +48,27 @@ inspect:
 
 # Check cargo workspace without building binaries
 check:
-    cargo check --workspace
+    {{cargo_bin}} check --workspace
 
 # Run all workspace unit tests
 test:
-    cargo test --workspace
+    {{cargo_bin}} test --workspace
+
+# Run IPC socket integration tests
+test-ipc:
+    {{cargo_bin}} test -p zenith-tests --test ipc_hot_reload -- --nocapture
+
+# Benchmark Luau hot-reload sub-10ms latency
+bench-reload:
+    {{cargo_bin}} test -p zenith-tests --test bench_hot_reload -- --nocapture
+
+# Run VmRSS memory leak and stability diagnostics
+test-memory:
+    {{cargo_bin}} test -p zenith-tests --test memory_vmrss -- --nocapture
+
+# Run entire QA test suite via nix develop
+qa:
+    nix develop --command cargo test --workspace -- --nocapture
 
 # Build optimized release binary
 build:

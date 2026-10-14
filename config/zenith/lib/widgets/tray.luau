@@ -54,6 +54,7 @@ local function Tray()
     local tray_children = {}
     for _, item in ipairs(valid_items) do
         local glyph = resolve_tray_icon(item.id or "", item.icon or "")
+        local srv = item.service or ""
         table.insert(tray_children, Zenith.Box({
             direction = "row",
             align_items = "center",
@@ -62,7 +63,11 @@ local function Tray()
             padding = { x = 5, y = 1 },
             border_radius = 10,
             background = Zenith.hex(theme.surface_container_high or theme.surface_container, 90),
-            on_click = item.action or ("tray:activate:" .. (item.service or "")),
+            tooltip = (item.title or item.id or "Bandeja") .. "\n• Clique: Ativar\n• Botão Direito: Menu de Contexto",
+            on_click = item.action or ("tray:activate:" .. srv),
+            on_right_click = "tray:context:" .. srv,
+            on_scroll_up = "tray:scroll:" .. srv .. ":1",
+            on_scroll_down = "tray:scroll:" .. srv .. ":-1",
             children = {
                 Zenith.Text({
                     text = glyph,

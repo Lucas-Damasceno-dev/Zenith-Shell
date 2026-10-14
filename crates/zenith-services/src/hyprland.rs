@@ -64,6 +64,8 @@ pub struct ClientItem {
     pub workspace_name: String,
     pub floating: bool,
     pub fullscreen: bool,
+    pub hidden: bool,
+    pub monitor: i64,
     pub pid: i32,
     pub at: (i32, i32),
     pub size: (i32, i32),
@@ -250,10 +252,12 @@ impl HyprlandService {
             }
 
             if !sent {
-                // Fallback to hyprctl command line if direct socket write failed
-                let _ = std::process::Command::new("hyprctl")
-                    .args(["dispatch", dispatcher, arg])
-                    .spawn();
+                // Direct socket rediscovery (zero-subprocess)
+                if let Some(fresh_dir) = resolve_hypr_dir() {
+                    let cmd_sock = fresh_dir.join(".socket.sock");
+                    let cmd = format!("dispatch {} {}", dispatcher, arg);
+                    let _ = send_socket_command(&cmd_sock, &cmd);
+                }
             }
         } else {
             // Forward command to Sway IPC if active
@@ -314,9 +318,12 @@ impl HyprlandService {
             }
 
             if !sent {
-                let _ = std::process::Command::new("hyprctl")
-                    .args(["keyword", key, value])
-                    .spawn();
+                // Direct socket rediscovery (zero-subprocess)
+                if let Some(fresh_dir) = resolve_hypr_dir() {
+                    let cmd_sock = fresh_dir.join(".socket.sock");
+                    let cmd = format!("keyword {} {}", key, value);
+                    let _ = send_socket_command(&cmd_sock, &cmd);
+                }
             }
         }
 
@@ -512,6 +519,8 @@ impl HyprlandService {
                         workspace_name: "1".to_string(),
                         floating: false,
                         fullscreen: false,
+                        hidden: false,
+                        monitor: 0,
                         pid: 1024,
                         at: (0, 0),
                         size: (800, 600),
@@ -525,6 +534,8 @@ impl HyprlandService {
                         workspace_name: "2".to_string(),
                         floating: false,
                         fullscreen: false,
+                        hidden: false,
+                        monitor: 0,
                         pid: 2048,
                         at: (0, 0),
                         size: (1920, 1080),
@@ -538,6 +549,8 @@ impl HyprlandService {
                         workspace_name: "3".to_string(),
                         floating: false,
                         fullscreen: false,
+                        hidden: false,
+                        monitor: 0,
                         pid: 3072,
                         at: (0, 0),
                         size: (1920, 1080),
@@ -764,7 +777,6 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
 
         match event {
             "workspace" | "workspacev2" => {
-                notify_focus_change();
                 let ws_str = if let Some((id_str, _)) = data.split_once(',') {
                     id_str.trim()
                 } else {
@@ -779,13 +791,15 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                         .unwrap_or(1)
                 });
 
-                let mut w = state.write().unwrap();
-                w.active_workspace = ws_id;
-                for item in &mut w.workspaces {
-                    item.active = item.id == ws_id || item.name == ws_str;
+                {
+                    let mut w = state.write().unwrap();
+                    w.active_workspace = ws_id;
+                    for item in &mut w.workspaces {
+                        item.active = item.id == ws_id || item.name == ws_str;
+                    }
+                    ensure_minimum_workspaces(&mut w.workspaces, ws_id, 4);
                 }
-                ensure_minimum_workspaces(&mut w.workspaces, ws_id, 4);
-                drop(w);
+                notify_focus_change();
                 changed = true;
             }
             "focusedmon" => {
@@ -793,10 +807,12 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 if let Some((_, ws_name)) = data.split_once(',') {
                     let ws_name = ws_name.trim();
                     let ws_id = ws_name.parse::<i32>().unwrap_or(1);
-                    let mut w = state.write().unwrap();
-                    w.active_workspace = ws_id;
-                    for item in &mut w.workspaces {
-                        item.active = item.id == ws_id || item.name == ws_name;
+                    {
+                        let mut w = state.write().unwrap();
+                        w.active_workspace = ws_id;
+                        for item in &mut w.workspaces {
+                            item.active = item.id == ws_id || item.name == ws_name;
+                        }
                     }
                     changed = true;
                 }
@@ -870,7 +886,7 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 }
                 changed = true;
             }
-            "openwindow" | "closewindow" | "movewindowv2" | "urgent" => {
+            "openwindow" | "closewindow" | "movewindow" | "movewindowv2" | "fullscreen" | "changefloatingmode" | "pin" | "urgent" => {
                 resync_workspaces(cmd_sock, state);
                 resync_clients(cmd_sock, state);
                 notify_change();
@@ -932,7 +948,17 @@ pub fn parse_clients_json(json_str: &str) -> Vec<ClientItem> {
             let workspace_id = workspace["id"].as_i64().unwrap_or(0) as i32;
             let workspace_name = workspace["name"].as_str().unwrap_or("").to_string();
             let floating = item["floating"].as_bool().unwrap_or(false);
-            let fullscreen = item["fullscreen"].as_bool().unwrap_or(false);
+            let fullscreen = match &item["fullscreen"] {
+                Value::Bool(b) => *b,
+                Value::Number(n) => n.as_i64().is_some_and(|v| v != 0),
+                _ => false,
+            } || match &item["fullscreenClient"] {
+                Value::Bool(b) => *b,
+                Value::Number(n) => n.as_i64().is_some_and(|v| v != 0),
+                _ => false,
+            };
+            let hidden = item["hidden"].as_bool().unwrap_or(false);
+            let monitor = item["monitor"].as_i64().unwrap_or(0);
             let pid = item["pid"].as_i64().unwrap_or(0) as i32;
             let at = (
                 item["at"][0].as_i64().unwrap_or(0) as i32,
@@ -952,6 +978,8 @@ pub fn parse_clients_json(json_str: &str) -> Vec<ClientItem> {
                 workspace_name,
                 floating,
                 fullscreen,
+                hidden,
+                monitor,
                 pid,
                 at,
                 size,

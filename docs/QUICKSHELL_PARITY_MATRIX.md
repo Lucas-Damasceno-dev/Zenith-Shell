@@ -47,6 +47,9 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Brightness Telemetry** | `services/BrightnessService.qml` | ✅ **Implemented** (`brightness.rs`, `/sys/class/backlight`) | **Milestone 12** |
 | **Disk Storage Service** | `services/DiskAnalyzerService.qml` | ✅ **Implemented** (`disk.rs`, libc `statvfs`) | **Milestone 12** |
 | **Power Profile Switching** | Power profiles daemon in QML | ✅ **Implemented** (`power.rs`, `powerprofilesctl`) | **Milestone 12** |
+| **Settings Hub & Center** | `modules/settings/` | ✅ **Implemented** (`overlays/Settings.luau` + `settings_store.luau`) | **Milestone 13** |
+| **Modular Bar Architecture**| `Bar.qml` + `RightBarModules.qml` | ✅ **Implemented** (`bar.luau` + 26 `lib/widgets/*`) | **Milestone 13** |
+| **UI Kit & Design System** | Reusable QML Controls | ✅ **Implemented** (`config/zenith/lib/ui_kit.luau`) | **Milestone 13** |
 
 ---
 

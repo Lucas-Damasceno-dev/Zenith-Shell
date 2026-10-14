@@ -43,6 +43,7 @@ struct CachedState {
 }
 
 static CACHE: OnceLock<Arc<RwLock<CachedState>>> = OnceLock::new();
+static IS_QUERYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// MPRIS2 Media Controller service.
 pub struct MprisService;
@@ -68,7 +69,7 @@ impl MprisService {
             (r.snapshot.clone(), r.last_query.elapsed() >= threshold)
         };
 
-        if need_refresh {
+        if need_refresh && !IS_QUERYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let mut w = cache_arc.write().unwrap();
             w.last_query = Instant::now();
             let c_arc = cache_arc.clone();
@@ -79,6 +80,7 @@ impl MprisService {
                     writer.active_bus_name = bus_name;
                     writer.last_query = Instant::now();
                 }
+                IS_QUERYING.store(false, std::sync::atomic::Ordering::SeqCst);
             });
         }
 
@@ -121,28 +123,14 @@ impl MprisService {
             _ => return Ok(()),
         };
 
-        let sent_native = if let Ok(conn) = zbus::blocking::Connection::session() {
-            conn.call_method(
+        if let Some(conn) = Self::get_session_connection() {
+            let _ = conn.call_method(
                 Some(target_bus.as_str()),
                 "/org/mpris/MediaPlayer2",
                 Some("org.mpris.MediaPlayer2.Player"),
                 dbus_method,
                 &(),
-            ).is_ok()
-        } else {
-            false
-        };
-
-        if !sent_native {
-            let mut bus_cmd = Self::build_busctl_cmd();
-            bus_cmd.args([
-                "call",
-                &target_bus,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-                dbus_method,
-            ]);
-            let _ = bus_cmd.spawn();
+            );
         }
 
         // Invalidate cache so next read updates immediately
@@ -179,51 +167,84 @@ impl MprisService {
         None
     }
 
-    fn build_busctl_cmd() -> std::process::Command {
-        let mut cmd = std::process::Command::new("busctl");
-        if let Some(addr) = Self::resolve_dbus_address_arg() {
-            cmd.arg(addr);
-        } else {
-            cmd.arg("--user");
+    fn get_session_connection() -> Option<zbus::blocking::Connection> {
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            return Some(conn);
         }
-        cmd
+
+        let addr = Self::resolve_dbus_address_arg()?;
+        let path = addr.strip_prefix("--address=")?;
+        zbus::blocking::connection::Builder::address(path)
+            .ok()?
+            .build()
+            .ok()
     }
 
     fn find_mpris_players() -> Vec<String> {
-        if let Ok(conn) = zbus::blocking::Connection::session() {
+        if let Some(conn) = Self::get_session_connection() {
             if let Ok(dbus_proxy) = zbus::blocking::fdo::DBusProxy::new(&conn) {
                 if let Ok(names) = dbus_proxy.list_names() {
-                    let filtered: Vec<String> = names
+                    return names
                         .into_iter()
                         .filter(|n| n.starts_with("org.mpris.MediaPlayer2."))
                         .map(|n| n.to_string())
                         .collect();
-                    if !filtered.is_empty() {
-                        return filtered;
-                    }
                 }
             }
         }
+        Vec::new()
+    }
 
-        let mut cmd = Self::build_busctl_cmd();
-        cmd.args(["list"]);
+    fn extract_metadata_from_map(
+        map: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) -> (String, String, String, String, u64) {
+        let mut artist = String::new();
+        let mut length_secs = 0;
 
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o.stdout,
-            _ => return Vec::new(),
+        let get_str = |key: &str| -> String {
+            if let Some(v) = map.get(key) {
+                if let zbus::zvariant::Value::Str(s) = &**v {
+                    return s.as_str().to_string();
+                }
+            }
+            String::new()
         };
 
-        let text = String::from_utf8_lossy(&output);
-        let mut players = Vec::new();
+        let title = get_str("xesam:title");
+        let album = get_str("xesam:album");
+        let art_url = get_str("mpris:artUrl");
 
-        for line in text.lines() {
-            let first = line.split_whitespace().next().unwrap_or("");
-            if first.starts_with("org.mpris.MediaPlayer2.") {
-                players.push(first.to_string());
+        if let Some(v) = map.get("xesam:artist") {
+            match &**v {
+                zbus::zvariant::Value::Str(s) => {
+                    artist = s.as_str().to_string();
+                }
+                zbus::zvariant::Value::Array(arr) => {
+                    let mut parts = Vec::new();
+                    for item in arr.iter() {
+                        if let zbus::zvariant::Value::Str(s) = item {
+                            parts.push(s.as_str().to_string());
+                        }
+                    }
+                    artist = parts.join(", ");
+                }
+                _ => {}
             }
         }
 
-        players
+        if let Some(v) = map.get("mpris:length") {
+            match &**v {
+                zbus::zvariant::Value::U64(micro) => {
+                    length_secs = micro / 1_000_000;
+                }
+                zbus::zvariant::Value::I64(micro) => {
+                    length_secs = (micro.max(&0) / 1_000_000) as u64;
+                }
+                _ => {}
+            }
+        }
+
+        (title, artist, album, art_url, length_secs)
     }
 
     fn query_active_player() -> (MediaSnapshot, Option<String>) {
@@ -232,13 +253,28 @@ impl MprisService {
             return (MediaSnapshot::default(), None);
         }
 
+        let conn = match Self::get_session_connection() {
+            Some(c) => c,
+            None => return (MediaSnapshot::default(), None),
+        };
+
         let mut first_match = None;
         for player_bus in players {
-            let status = Self::get_player_property(&player_bus, "PlaybackStatus")
-                .unwrap_or_else(|| "Stopped".to_string());
+            let proxy = match zbus::blocking::Proxy::new(
+                &conn,
+                player_bus.clone(),
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            ) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
 
-            let metadata_str = Self::get_player_property(&player_bus, "Metadata").unwrap_or_default();
-            let (title, artist, album, art_url, length) = Self::parse_metadata(&metadata_str);
+            let status = proxy.get_property::<String>("PlaybackStatus").unwrap_or_else(|_| "Stopped".to_string());
+            let metadata: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+                proxy.get_property("Metadata").unwrap_or_default();
+
+            let (title, artist, album, art_url, length) = Self::extract_metadata_from_map(&metadata);
 
             let short_name = player_bus
                 .trim_start_matches("org.mpris.MediaPlayer2.")
@@ -273,43 +309,16 @@ impl MprisService {
         (MediaSnapshot::default(), None)
     }
 
+    #[allow(dead_code)]
     fn get_player_property(bus: &str, prop: &str) -> Option<String> {
-        if let Ok(conn) = zbus::blocking::Connection::session() {
-            if let Ok(proxy) = zbus::blocking::Proxy::new(
-                &conn,
-                bus,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-            ) {
-                if let Ok(val) = proxy.get_property::<String>(prop) {
-                    return Some(val);
-                }
-            }
-        }
-
-        let mut cmd = Self::build_busctl_cmd();
-        cmd.args([
-            "get-property",
+        let conn = Self::get_session_connection()?;
+        let proxy = zbus::blocking::Proxy::new(
+            &conn,
             bus,
             "/org/mpris/MediaPlayer2",
             "org.mpris.MediaPlayer2.Player",
-            prop,
-        ]);
-
-        let output = cmd.output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let trimmed = raw.trim();
-
-        // If string response formatted as `s "Content"`
-        if trimmed.starts_with("s \"") && trimmed.ends_with('\"') {
-            return Some(trimmed[3..trimmed.len() - 1].to_string());
-        }
-
-        Some(trimmed.to_string())
+        ).ok()?;
+        proxy.get_property::<String>(prop).ok()
     }
 
     pub fn parse_metadata(raw: &str) -> (String, String, String, String, u64) {

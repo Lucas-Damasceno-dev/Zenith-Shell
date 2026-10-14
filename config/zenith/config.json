@@ -1,68 +1,125 @@
 {
-  "quick": {
-    "wallpaperPath": "",
-    "layoutPreset": "default",
-    "accentColor": "#fcbc00",
-    "colorScheme": "tonal_spot",
-    "darkMode": true,
-    "barAutoHide": false,
-    "barCompactMode": false,
-    "reducedMotion": false,
-    "privacyMode": false,
-    "focusMode": false,
-    "lowPowerMode": false
+  "advanced": {
+    "compositorBlur": true,
+    "debugOverlays": false,
+    "jsgcThresholdMb": 128,
+    "logLevel": "info",
+    "lowPowerThreshold": 20,
+    "memoryMonitoring": true,
+    "memoryWarningNotification": true
+  },
+  "ai": {
+    "apiKey": "",
+    "model": "gemini-2.5-flash",
+    "provider": "gemini",
+    "systemPrompt": "You are a concise, helpful desktop assistant.",
+    "temperature": 0.7,
+    "voiceLanguage": "auto",
+    "voiceProvider": "whisper",
+    "voiceSearchEnabled": false
   },
   "appearance": {
-    "globalStyle": "material",
-    "colorInvert": false,
     "accentColor": "#fcbc00",
-    "fontUI": "Inter",
+    "blurOpacity": 0.85,
+    "colorInvert": false,
     "fontMono": "JetBrainsMono Nerd Font",
     "fontSizeScale": 1,
-    "radiusScale": 1,
-    "blurOpacity": 0.85,
+    "fontUI": "Inter",
     "glassEffect": true,
+    "globalStyle": "material",
     "motionProfile": "snappy",
-    "springStiffness": 4,
-    "springDamping": 0.7
+    "radiusScale": 1,
+    "springDamping": 0.7,
+    "springStiffness": 4
+  },
+  "autostart": {
+    "entries": [
+      {
+        "command": "hypridle",
+        "desc": "Idle management daemon",
+        "enabled": true,
+        "id": "hypridle",
+        "name": "Hypridle"
+      },
+      {
+        "command": "swww-daemon",
+        "desc": "Wallpaper animation daemon",
+        "enabled": true,
+        "id": "swww",
+        "name": "Swww Daemon"
+      },
+      {
+        "command": "playerctld daemon",
+        "desc": "MPRIS media tracking",
+        "enabled": true,
+        "id": "mpris",
+        "name": "Playerctl Daemon"
+      },
+      {
+        "command": "/usr/lib/polkit-kde-authentication-agent-1",
+        "desc": "Privilege escalation agent",
+        "enabled": true,
+        "id": "polkit",
+        "name": "Polkit Agent"
+      }
+    ]
   },
   "bar": {
-    "position": "top",
-    "height": 44,
-    "compactHeight": 36,
-    "autoHide": false,
+    "autoHide": true,
     "autoHideDelayMs": 300,
-    "compactMode": false,
     "borderless": false,
+    "compactHeight": 36,
+    "compactMode": false,
     "cornerStyle": "floating",
     "customRounding": 16,
     "floatStyleShadow": true,
+    "height": 44,
+    "position": "top",
     "showCenterClock": true,
     "showCenterMedia": true,
-    "showCenterWeather": true,
     "showCenterNotifications": true,
     "showCenterUtilityHub": true,
-    "showSystemTray": true,
-    "showHardwareMonitors": true,
+    "showCenterWeather": true,
     "showClipboardTile": true,
+    "showHardwareMonitors": true,
     "showPrivacyIndicator": true,
     "showSessionButton": true,
-    "trayMonochromeIcons": true,
-    "trayFilterPassive": true
+    "showSystemTray": true,
+    "trayFilterPassive": true,
+    "trayMonochromeIcons": true
+  },
+  "compositor": {
+    "activeBorderColor": "#7aa2f7",
+    "animationSpeed": "snappy",
+    "borderSize": 2,
+    "cursorSensitivity": 1,
+    "gapsIn": 5,
+    "gapsOut": 10,
+    "inactiveBorderColor": "#1f2335",
+    "layout": "dwindle",
+    "touchpadNaturalScroll": true,
+    "touchpadTapToClick": true
+  },
+  "dashboard": {
+    "enable": true,
+    "greetingText": "Welcome back",
+    "showHeader": true,
+    "showMediaSection": true,
+    "showPowerButtons": true,
+    "showQuickNotes": true,
+    "showSystemSection": true,
+    "showWeatherSection": true,
+    "widthRatio": 0.45
   },
   "dock": {
+    "autoHide": true,
     "enable": true,
-    "position": "bottom",
+    "enableBlurGlass": true,
     "height": 52,
-    "iconSize": 36,
     "hoverRegionHeight": 6,
     "hoverToReveal": true,
-    "enableBlurGlass": true,
+    "iconSize": 36,
     "monochromeIcons": false,
-    "showMpris": true,
-    "showScratchpad": true,
-    "showTrash": true,
-    "showRecentFiles": false,
     "pinnedApps": [
       "firefox.desktop",
       "foot.desktop",
@@ -70,188 +127,274 @@
       "thunar.desktop",
       "spotify.desktop"
     ],
-    "autoHide": false
+    "position": "bottom",
+    "showMpris": true,
+    "showRecentFiles": false,
+    "showScratchpad": true,
+    "showTrash": true
   },
-  "wallpaper": {
-    "backend": "swww",
-    "wallpaperPath": "",
-    "slideshow": false,
-    "slideshowIntervalMin": 30,
-    "effects": "none",
-    "pauseAnimationOnBattery": true,
-    "hideWhenFullscreen": true,
-    "parallax": false,
-    "blurRadius": 0,
-    "dimOpacity": 0
+  "modules": {
+    "audioSpectrum": false,
+    "bar": true,
+    "cheatsheet": true,
+    "dashboard": true,
+    "dock": true,
+    "hotcorners": false,
+    "launcher": true,
+    "mascot": false,
+    "mediaControls": true,
+    "notifications": true,
+    "osd": true,
+    "overview": true,
+    "quickNotes": true,
+    "sessionScreen": true,
+    "systemMonitor": true
+  },
+  "panels": {
+    "exposeScale": 0.85,
+    "hotCornerBottomLeft": "launcher",
+    "hotCornerBottomRight": "session",
+    "hotCornerDwellMs": 150,
+    "hotCornerTopLeft": "overview",
+    "hotCornerTopRight": "dashboard",
+    "hotCornersEnable": false,
+    "overviewBlur": true,
+    "overviewColumns": 4,
+    "overviewDim": 0.4,
+    "overviewRows": 2,
+    "workspaceStripEnable": false,
+    "workspaceStripSide": "right",
+    "workspaceStripWidth": 420
+  },
+  "quick": {
+    "accent": "lavender",
+    "accentColor": "#fcbc00",
+    "barAutoHide": true,
+    "barCompactMode": false,
+    "colorScheme": "tonal_spot",
+    "counter": 42,
+    "darkMode": true,
+    "focusMode": false,
+    "k_0": {
+      "index": 0,
+      "status": "active"
+    },
+    "k_10": {
+      "index": 10,
+      "status": "active"
+    },
+    "k_11": {
+      "index": 11,
+      "status": "active"
+    },
+    "k_12": {
+      "index": 12,
+      "status": "active"
+    },
+    "k_14": {
+      "index": 14,
+      "status": "active"
+    },
+    "k_16": {
+      "index": 16,
+      "status": "active"
+    },
+    "k_17": {
+      "index": 17,
+      "status": "active"
+    },
+    "k_19": {
+      "index": 19,
+      "status": "active"
+    },
+    "k_2": {
+      "index": 2,
+      "status": "active"
+    },
+    "k_20": {
+      "index": 20,
+      "status": "active"
+    },
+    "k_22": {
+      "index": 22,
+      "status": "active"
+    },
+    "k_23": {
+      "index": 23,
+      "status": "active"
+    },
+    "k_24": {
+      "index": 24,
+      "status": "active"
+    },
+    "k_25": {
+      "index": 25,
+      "status": "active"
+    },
+    "k_26": {
+      "index": 26,
+      "status": "active"
+    },
+    "k_28": {
+      "index": 28,
+      "status": "active"
+    },
+    "k_29": {
+      "index": 29,
+      "status": "active"
+    },
+    "k_3": {
+      "index": 3,
+      "status": "active"
+    },
+    "k_31": {
+      "index": 31,
+      "status": "active"
+    },
+    "k_33": {
+      "index": 33,
+      "status": "active"
+    },
+    "k_35": {
+      "index": 35,
+      "status": "active"
+    },
+    "k_37": {
+      "index": 37,
+      "status": "active"
+    },
+    "k_38": {
+      "index": 38,
+      "status": "active"
+    },
+    "k_39": {
+      "index": 39,
+      "status": "active"
+    },
+    "k_4": {
+      "index": 4,
+      "status": "active"
+    },
+    "k_41": {
+      "index": 41,
+      "status": "active"
+    },
+    "k_42": {
+      "index": 42,
+      "status": "active"
+    },
+    "k_43": {
+      "index": 43,
+      "status": "active"
+    },
+    "k_44": {
+      "index": 44,
+      "status": "active"
+    },
+    "k_45": {
+      "index": 45,
+      "status": "active"
+    },
+    "k_5": {
+      "index": 5,
+      "status": "active"
+    },
+    "k_6": {
+      "index": 6,
+      "status": "active"
+    },
+    "k_7": {
+      "index": 7,
+      "status": "active"
+    },
+    "k_8": {
+      "index": 8,
+      "status": "active"
+    },
+    "layoutPreset": "default",
+    "lowPowerMode": false,
+    "privacyMode": false,
+    "reducedMotion": false,
+    "repl_test": 99,
+    "settings_active_page": 16,
+    "system_activity": false,
+    "system_idle": false,
+    "theme": "catppuccin",
+    "wallpaperPath": ""
+  },
+  "services": {
+    "appBrowser": "firefox",
+    "appEditor": "codium",
+    "appFileManager": "thunar",
+    "appTaskManager": "btop",
+    "appTerminal": "foot",
+    "calendarExternalSync": false,
+    "calendarUpcomingDays": 7,
+    "mediaFilterDuplicates": true,
+    "mediaPreferredPlayer": "",
+    "mediaSpectrumEnabled": false,
+    "weatherCity": "",
+    "weatherProvider": "open-meteo",
+    "weatherRefreshMin": 30,
+    "weatherUnits": "metric"
   },
   "system": {
     "audioPreferredSink": "",
     "audioPreferredSource": "",
-    "audioVolumeStep": 0.05,
     "audioProtection": true,
-    "batteryChargeLimit": 80,
-    "batteryNotifyFull": true,
-    "batteryLowThreshold": 20,
-    "batteryCriticalThreshold": 5,
-    "batteryPowerProfile": "balanced",
+    "audioVolumeStep": 0.05,
     "batteryAutoSuspend": false,
-    "suspendTimeoutMin": 15,
-    "screenOffTimeoutMin": 5,
-    "nightLightEnabled": false,
-    "nightLightValue": 3500,
+    "batteryChargeLimit": 80,
+    "batteryCriticalThreshold": 5,
+    "batteryLowThreshold": 20,
+    "batteryNotifyFull": true,
+    "batteryPowerProfile": "balanced",
+    "dateFormat": "ddd, dd/MM",
     "grayscaleValue": 0,
     "hyprlockBlur": 8,
     "hyprlockDim": 0.2,
     "hyprlockGraceSec": 5,
     "hyprlockShowClock": true,
-    "timeFormat": "24h",
-    "dateFormat": "ddd, dd/MM",
-    "secondPrecision": false,
+    "nightLightEnabled": false,
+    "nightLightValue": 3500,
+    "pomodoroBreakMin": 5,
     "pomodoroFocusMin": 25,
-    "pomodoroBreakMin": 5
-  },
-  "panels": {
-    "overviewColumns": 4,
-    "overviewRows": 2,
-    "overviewBlur": true,
-    "overviewDim": 0.4,
-    "exposeScale": 0.85,
-    "hotCornersEnable": false,
-    "hotCornerTopLeft": "overview",
-    "hotCornerTopRight": "dashboard",
-    "hotCornerBottomLeft": "launcher",
-    "hotCornerBottomRight": "session",
-    "hotCornerDwellMs": 150,
-    "workspaceStripEnable": false,
-    "workspaceStripSide": "right",
-    "workspaceStripWidth": 420
+    "screenOffTimeoutMin": 5,
+    "secondPrecision": false,
+    "suspendTimeoutMin": 15,
+    "timeFormat": "24h"
   },
   "tools": {
-    "screenRecordFps": 60,
-    "screenRecordVideoCodec": "libx264",
+    "crosshairColor": "#00ffcc",
+    "crosshairEnable": false,
+    "crosshairSize": 16,
+    "lensProvider": "google",
+    "ocrLanguage": "eng",
     "screenRecordAudioCodec": "aac",
-    "screenRecordContainer": "mkv",
-    "screenRecordQualityPreset": "balanced",
     "screenRecordAudioSource": "both",
+    "screenRecordContainer": "mkv",
+    "screenRecordDiscordCompress": false,
+    "screenRecordFps": 60,
+    "screenRecordQualityPreset": "balanced",
     "screenRecordSavePath": "",
     "screenRecordShowOsd": true,
-    "screenRecordDiscordCompress": false,
+    "screenRecordVideoCodec": "libx264",
+    "screenshotCopyThumb": true,
+    "screenshotDelaySec": 0,
     "screenshotFormat": "png",
     "screenshotMode": "full",
-    "screenshotDelaySec": 0,
-    "screenshotSavePath": "",
-    "screenshotCopyThumb": true,
-    "ocrLanguage": "eng",
-    "lensProvider": "google",
-    "crosshairEnable": false,
-    "crosshairColor": "#00ffcc",
-    "crosshairSize": 16
+    "screenshotSavePath": ""
   },
-  "services": {
-    "weatherProvider": "open-meteo",
-    "weatherCity": "",
-    "weatherUnits": "metric",
-    "weatherRefreshMin": 30,
-    "mediaPreferredPlayer": "",
-    "mediaFilterDuplicates": true,
-    "mediaSpectrumEnabled": false,
-    "calendarExternalSync": false,
-    "calendarUpcomingDays": 7,
-    "appTerminal": "foot",
-    "appBrowser": "firefox",
-    "appFileManager": "thunar",
-    "appEditor": "codium",
-    "appTaskManager": "btop"
-  },
-  "compositor": {
-    "layout": "dwindle",
-    "gapsIn": 5,
-    "gapsOut": 10,
-    "borderSize": 2,
-    "activeBorderColor": "#7aa2f7",
-    "inactiveBorderColor": "#1f2335",
-    "cursorSensitivity": 1,
-    "touchpadNaturalScroll": true,
-    "touchpadTapToClick": true,
-    "animationSpeed": "snappy"
-  },
-  "ai": {
-    "provider": "gemini",
-    "model": "gemini-2.5-flash",
-    "apiKey": "",
-    "systemPrompt": "You are a concise, helpful desktop assistant.",
-    "temperature": 0.7,
-    "voiceSearchEnabled": false,
-    "voiceProvider": "whisper",
-    "voiceLanguage": "auto"
-  },
-  "dashboard": {
-    "enable": true,
-    "showHeader": true,
-    "showPowerButtons": true,
-    "greetingText": "Welcome back",
-    "widthRatio": 0.45,
-    "showWeatherSection": true,
-    "showMediaSection": true,
-    "showSystemSection": true,
-    "showQuickNotes": true
-  },
-  "autostart": {
-    "entries": [
-      {
-        "id": "hypridle",
-        "name": "Hypridle",
-        "command": "hypridle",
-        "enabled": true,
-        "desc": "Idle management daemon"
-      },
-      {
-        "id": "swww",
-        "name": "Swww Daemon",
-        "command": "swww-daemon",
-        "enabled": true,
-        "desc": "Wallpaper animation daemon"
-      },
-      {
-        "id": "mpris",
-        "name": "Playerctl Daemon",
-        "command": "playerctld daemon",
-        "enabled": true,
-        "desc": "MPRIS media tracking"
-      },
-      {
-        "id": "polkit",
-        "name": "Polkit Agent",
-        "command": "/usr/lib/polkit-kde-authentication-agent-1",
-        "enabled": true,
-        "desc": "Privilege escalation agent"
-      }
-    ]
-  },
-  "modules": {
-    "bar": true,
-    "dock": true,
-    "launcher": true,
-    "overview": true,
-    "dashboard": true,
-    "hotcorners": false,
-    "cheatsheet": true,
-    "notifications": true,
-    "osd": true,
-    "mediaControls": true,
-    "audioSpectrum": false,
-    "sessionScreen": true,
-    "quickNotes": true,
-    "systemMonitor": true,
-    "mascot": false
-  },
-  "advanced": {
-    "jsgcThresholdMb": 128,
-    "lowPowerThreshold": 20,
-    "memoryMonitoring": true,
-    "memoryWarningNotification": true,
-    "compositorBlur": true,
-    "logLevel": "info",
-    "debugOverlays": false
+  "wallpaper": {
+    "backend": "swww",
+    "blurRadius": 0,
+    "dimOpacity": 0,
+    "effects": "none",
+    "hideWhenFullscreen": true,
+    "parallax": false,
+    "pauseAnimationOnBattery": true,
+    "slideshow": false,
+    "slideshowIntervalMin": 30,
+    "wallpaperPath": ""
   }
 }

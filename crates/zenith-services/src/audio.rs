@@ -1,6 +1,11 @@
 //! PipeWire / WirePlumber audio sink & source manager for Zenith Shell.
+//!
+//! Queries audio devices directly from Linux kernel `/proc/asound/pcm` and `/proc/asound/cards`
+//! with zero subprocess forks on telemetry read paths.
 
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
 
 /// Representation of an audio output sink or input source.
@@ -12,6 +17,7 @@ pub struct AudioDevice {
 }
 
 static SINKS_CACHE: std::sync::OnceLock<std::sync::Mutex<(Vec<AudioDevice>, std::time::Instant)>> = std::sync::OnceLock::new();
+static SELECTED_SINK_ID: AtomicU32 = AtomicU32::new(0);
 
 pub struct AudioService;
 
@@ -24,55 +30,66 @@ impl AudioService {
         }
     }
 
-    /// List all audio output sinks via `wpctl status` with 400ms in-memory caching.
-    pub fn list_sinks() -> Vec<AudioDevice> {
-        let cache = SINKS_CACHE.get_or_init(|| {
-            std::sync::Mutex::new((Vec::new(), std::time::Instant::now() - std::time::Duration::from_secs(10)))
-        });
-
-        {
-            let guard = cache.lock().unwrap();
-            if guard.1.elapsed() < std::time::Duration::from_millis(400) && !guard.0.is_empty() {
-                return guard.0.clone();
+    /// Read sound card descriptors from `/proc/asound/cards`.
+    fn read_kernel_sound_cards() -> HashMap<String, String> {
+        let mut cards = HashMap::new();
+        if let Ok(content) = std::fs::read_to_string("/proc/asound/cards") {
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(first) = parts.first() {
+                    if first.chars().all(|c| c.is_ascii_digit()) {
+                        let num = first.to_string();
+                        if let Some((_, rest)) = line.split_once("]:") {
+                            cards.insert(num, rest.trim().to_string());
+                        }
+                    }
+                }
             }
         }
+        cards
+    }
 
+    /// Discover audio playback hardware devices directly from Linux kernel `/proc/asound/pcm` and `/proc/asound/cards` (zero subprocesses).
+    pub fn query_kernel_audio_sinks() -> Vec<AudioDevice> {
         let mut sinks = Vec::new();
+        let cards = Self::read_kernel_sound_cards();
+        let selected_id = SELECTED_SINK_ID.load(Ordering::SeqCst);
 
-        if let Ok(out) = Command::new("wpctl").arg("status").output() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let mut in_sinks = false;
+        if let Ok(content) = std::fs::read_to_string("/proc/asound/pcm") {
+            for line in content.lines() {
+                if line.contains("playback") {
+                    if let Some((id_part, rest)) = line.split_once(':') {
+                        let clean_id = id_part.trim().replace('-', "");
+                        let id = clean_id.parse::<u32>().unwrap_or(0);
+                        let card_num = clean_id.chars().take(2).collect::<String>().trim_start_matches('0').to_string();
+                        let card_key = if card_num.is_empty() { "0" } else { &card_num };
+                        let pcm_name = rest
+                            .split(':')
+                            .next()
+                            .unwrap_or("Audio Device")
+                            .trim();
 
-            for line in s.lines() {
-                if line.contains("Sinks:") {
-                    in_sinks = true;
-                    continue;
-                } else if in_sinks && (line.contains("Sources:") || line.contains("Filters:") || line.contains("Streams:")) {
-                    break;
-                }
-
-                if in_sinks {
-                    let trimmed = line.trim_start_matches(['│', '├', '└', '─', ' ']);
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let is_default = trimmed.starts_with('*');
-                    let clean = trimmed.trim_start_matches('*').trim();
-
-                    // Pattern: "47. Fone de Ouvido ... [vol: 0.45]"
-                    if let Some((id_str, rest)) = clean.split_once('.') {
-                        if let Ok(id) = id_str.trim().parse::<u32>() {
-                            let name_part = if let Some((name, _)) = rest.split_once('[') {
-                                name.trim().to_string()
+                        let full_name = if let Some(card_desc) = cards.get(card_key) {
+                            if !card_desc.is_empty() && card_desc != pcm_name {
+                                format!("{} - {}", card_desc, pcm_name)
                             } else {
-                                rest.trim().to_string()
-                            };
-                            sinks.push(AudioDevice {
-                                id,
-                                name: name_part,
-                                is_default,
-                            });
-                        }
+                                pcm_name.to_string()
+                            }
+                        } else {
+                            pcm_name.to_string()
+                        };
+
+                        let is_default = if selected_id > 0 {
+                            id == selected_id
+                        } else {
+                            sinks.is_empty()
+                        };
+
+                        sinks.push(AudioDevice {
+                            id,
+                            name: full_name,
+                            is_default,
+                        });
                     }
                 }
             }
@@ -83,16 +100,33 @@ impl AudioService {
                 AudioDevice {
                     id: 47,
                     name: "Headphones / Jack Audio".to_string(),
-                    is_default: true,
+                    is_default: selected_id == 0 || selected_id == 47,
                 },
                 AudioDevice {
                     id: 48,
                     name: "Speakers / Line Out".to_string(),
-                    is_default: false,
+                    is_default: selected_id == 48,
                 },
             ];
         }
 
+        sinks
+    }
+
+    /// List all audio output sinks via native zero-fork kernel telemetry (`/proc/asound/pcm`) with 1000ms cache.
+    pub fn list_sinks() -> Vec<AudioDevice> {
+        let cache = SINKS_CACHE.get_or_init(|| {
+            std::sync::Mutex::new((Vec::new(), std::time::Instant::now() - std::time::Duration::from_secs(10)))
+        });
+
+        {
+            let guard = cache.lock().unwrap();
+            if guard.1.elapsed() < std::time::Duration::from_millis(1000) && !guard.0.is_empty() {
+                return guard.0.clone();
+            }
+        }
+
+        let sinks = Self::query_kernel_audio_sinks();
         let mut guard = cache.lock().unwrap();
         *guard = (sinks.clone(), std::time::Instant::now());
         sinks
@@ -167,7 +201,9 @@ impl AudioService {
 
     /// Set default audio output sink by ID via `wpctl set-default <id>`.
     pub fn set_default_sink(id: u32) {
+        SELECTED_SINK_ID.store(id, Ordering::SeqCst);
         Self::invalidate_sinks_cache();
+        Self::notify_change();
         std::thread::spawn(move || {
             let _ = Command::new("wpctl")
                 .args(["set-default", &id.to_string()])
@@ -176,7 +212,6 @@ impl AudioService {
             crate::invalidate_audio_cache();
             Self::notify_change();
         });
-        Self::notify_change();
     }
 }
 

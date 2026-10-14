@@ -83,14 +83,17 @@ Item {
 
         // --- Main Content: Search Results OR Active Page Loader ---
         ScrollView {
+            id: contentScroll
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
+            contentWidth: availableWidth
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
             ColumnLayout {
-                width: parent.width - DesignTokens.spacingLG
+                id: pageContentCol
+                width: contentScroll.availableWidth - DesignTokens.spacingLG
                 spacing: DesignTokens.spacingLG
 
                 // --- SEARCH RESULTS LIST ---

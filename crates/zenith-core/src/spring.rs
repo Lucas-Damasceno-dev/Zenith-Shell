@@ -47,6 +47,43 @@ impl SpringConfig {
             precision: 0.001,
         }
     }
+
+    /// Critically damped configuration where oscillation is eliminated and settling occurs in minimal time:
+    /// damping = 2.0 * sqrt(stiffness * mass)
+    pub fn critically_damped(stiffness: f32) -> Self {
+        let mass = 1.0;
+        let damping = 2.0 * (stiffness * mass).sqrt();
+        Self {
+            stiffness,
+            damping,
+            mass,
+            precision: 0.001,
+        }
+    }
+
+    /// Over-damped configuration where system exponentially decays to rest without oscillating:
+    /// damping = factor * 2.0 * sqrt(stiffness * mass), where factor > 1.0
+    pub fn overdamped(stiffness: f32, factor: f32) -> Self {
+        let mass = 1.0;
+        let critical = 2.0 * (stiffness * mass).sqrt();
+        let damping = critical * factor.max(1.05);
+        Self {
+            stiffness,
+            damping,
+            mass,
+            precision: 0.001,
+        }
+    }
+
+    /// Standard preset for critical damping (zero overshoot, rapid settling).
+    pub fn critical() -> Self {
+        Self::critically_damped(170.0)
+    }
+
+    /// Standard preset for over-damped motion (heavy friction, no overshoot).
+    pub fn over_damped() -> Self {
+        Self::overdamped(170.0, 1.5)
+    }
 }
 
 /// Damped harmonic oscillator tracking value, velocity, and target.
@@ -82,7 +119,8 @@ impl SpringAnimation {
             && self.velocity.abs() < self.config.precision
     }
 
-    /// Step simulation forward by `dt` seconds using semi-implicit Euler integration.
+    /// Step simulation forward by `dt` seconds using 4th-order Runge-Kutta (RK4) integration.
+    /// Handles sub-pixel micro-values (< 0.001) ensuring stable rest without infinite oscillation.
     pub fn step(&mut self, dt: f32) -> f32 {
         if self.is_settled() {
             self.current = self.target;
@@ -90,14 +128,52 @@ impl SpringAnimation {
             return self.current;
         }
 
-        let displacement = self.current - self.target;
-        let spring_force = -self.config.stiffness * displacement;
-        let damping_force = -self.config.damping * self.velocity;
-        let acceleration = (spring_force + damping_force) / self.config.mass.max(0.001);
+        let k = self.config.stiffness;
+        let c = self.config.damping;
+        let m = self.config.mass.max(0.0001);
 
-        self.velocity += acceleration * dt;
-        self.current += self.velocity * dt;
+        let acceleration = |disp: f32, vel: f32| -> f32 {
+            let spring_force = -k * disp;
+            let damping_force = -c * vel;
+            (spring_force + damping_force) / m
+        };
 
+        // RK4 integration for 2nd order harmonic oscillator ODE:
+        // x represents displacement from target
+        let x0 = self.current - self.target;
+        let v0 = self.velocity;
+
+        // Stage 1 (k1)
+        let a1 = acceleration(x0, v0);
+        let dx1 = v0;
+
+        // Stage 2 (k2, midpoint)
+        let dt_half = dt * 0.5;
+        let x2 = x0 + dx1 * dt_half;
+        let v2 = v0 + a1 * dt_half;
+        let a2 = acceleration(x2, v2);
+        let dx2 = v2;
+
+        // Stage 3 (k3, midpoint)
+        let x3 = x0 + dx2 * dt_half;
+        let v3 = v0 + a2 * dt_half;
+        let a3 = acceleration(x3, v3);
+        let dx3 = v3;
+
+        // Stage 4 (k4, endpoint)
+        let x4 = x0 + dx3 * dt;
+        let v4 = v0 + a3 * dt;
+        let a4 = acceleration(x4, v4);
+        let dx4 = v4;
+
+        // Weighted increments
+        let delta_x = (dx1 + 2.0 * dx2 + 2.0 * dx3 + dx4) * (dt / 6.0);
+        let delta_v = (a1 + 2.0 * a2 + 2.0 * a3 + a4) * (dt / 6.0);
+
+        self.current += delta_x;
+        self.velocity += delta_v;
+
+        // Rest threshold snapping: stable stop for sub-pixel residual values
         if self.is_settled() {
             self.current = self.target;
             self.velocity = 0.0;
@@ -131,5 +207,72 @@ mod tests {
         assert_eq!(spring.target, 50.0);
         spring.step(0.016);
         assert!(spring.current > 0.0);
+    }
+
+    #[test]
+    fn test_spring_subpixel_micro_values_settle() {
+        // Micro-displacement sub-pixel (<0.001) should settle to absolute rest without infinite oscillation
+        let mut spring = SpringAnimation::new(50.0004, 50.0);
+        assert!(spring.is_settled());
+        spring.step(0.016);
+        assert_eq!(spring.current, 50.0);
+        assert_eq!(spring.velocity, 0.0);
+        assert!(spring.is_settled());
+
+        // Negative sub-pixel micro-displacement
+        let mut spring_neg = SpringAnimation::new(49.9996, 50.0);
+        assert!(spring_neg.is_settled());
+        spring_neg.step(0.016);
+        assert_eq!(spring_neg.current, 50.0);
+        assert_eq!(spring_neg.velocity, 0.0);
+        assert!(spring_neg.is_settled());
+    }
+
+    #[test]
+    fn test_spring_critically_damped_absolute_rest() {
+        // Critical damping: fastest approach to target with zero or negligible overshoot
+        let mut spring = SpringAnimation::new(0.0, 100.0)
+            .with_config(SpringConfig::critically_damped(160.0));
+        let dt = 1.0 / 60.0;
+        let mut max_observed = 0.0f32;
+
+        for _ in 0..150 {
+            spring.step(dt);
+            if spring.current > max_observed {
+                max_observed = spring.current;
+            }
+            if spring.is_settled() {
+                break;
+            }
+        }
+
+        assert!(spring.is_settled());
+        assert_eq!(spring.current, 100.0);
+        assert_eq!(spring.velocity, 0.0);
+        // Critical damping should not significantly overshoot the target
+        assert!(max_observed <= 100.01);
+    }
+
+    #[test]
+    fn test_spring_overdamped_absolute_rest() {
+        // Over-damped: heavy damping, strictly no overshoot, settles to absolute rest
+        let mut spring = SpringAnimation::new(0.0, 100.0)
+            .with_config(SpringConfig::overdamped(160.0, 1.4));
+        let dt = 1.0 / 60.0;
+        let mut prev = 0.0f32;
+
+        for _ in 0..300 {
+            spring.step(dt);
+            // Monotonically non-decreasing towards target
+            assert!(spring.current >= prev - 0.0001);
+            prev = spring.current;
+            if spring.is_settled() {
+                break;
+            }
+        }
+
+        assert!(spring.is_settled());
+        assert_eq!(spring.current, 100.0);
+        assert_eq!(spring.velocity, 0.0);
     }
 }

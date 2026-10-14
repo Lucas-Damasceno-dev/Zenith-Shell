@@ -1,0 +1,20 @@
+[package]
+name = "zenith-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "zenith_tests"
+path = "src/lib.rs"
+
+[dependencies]
+zenith-core = { path = "../crates/zenith-core" }
+zenith-services = { path = "../crates/zenith-services" }
+zenith-wayland = { path = "../crates/zenith-wayland" }
+zenith-runtime = { path = "../crates/zenith-runtime" }
+zenith-layout = { path = "../crates/zenith-layout" }
+zenith-cli = { path = "../crates/zenith-cli" }
+tempfile = "3"
+serde_json = "1.0"

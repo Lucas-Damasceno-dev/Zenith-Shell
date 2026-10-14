@@ -12,7 +12,7 @@ RowLayout {
 
     signal choiceSelected(var value)
 
-    spacing: 4
+    spacing: DesignTokens.spacingSM
     implicitHeight: 32
 
     Component.onCompleted: {
@@ -48,7 +48,7 @@ RowLayout {
             readonly property bool isSelected: String(root.currentValue) === String(optVal)
 
             Layout.preferredHeight: 28
-            implicitWidth: chipText.implicitWidth + DesignTokens.spacingMD * 2
+            implicitWidth: Math.max(56, chipText.implicitWidth + DesignTokens.spacingLG * 2)
             radius: DesignTokens.radiusSM
             color: isSelected ? ColorScheme.accent : ColorScheme.withAlpha(ColorScheme.surfaceVariant, 0.40)
             border.width: 1

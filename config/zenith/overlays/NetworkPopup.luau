@@ -148,7 +148,7 @@ return Zenith.Window({
                             checked = net.connected,
                             active_color = theme.primary,
                             on_toggle = function(checked)
-                                Zenith.exec("nmcli radio wifi " .. (if checked then "on" else "off"))
+                                Zenith.Services.SetWifiEnabled(checked)
                             end,
                         }),
                     }

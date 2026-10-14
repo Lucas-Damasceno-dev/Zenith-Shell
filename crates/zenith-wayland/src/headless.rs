@@ -63,6 +63,7 @@ impl HeadlessEngine {
             1.0,
             &mut self.font_system,
             &mut self.swash_cache,
+            None,
         )?;
 
         Ok(buffer)

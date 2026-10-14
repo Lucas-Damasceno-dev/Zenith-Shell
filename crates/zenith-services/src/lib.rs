@@ -25,7 +25,7 @@ pub mod notifications;
 pub use notifications::{NotificationItem, NotificationService};
 
 pub mod tray;
-pub use tray::{TrayItem, TrayService};
+pub use tray::{StatusNotifierItemProxy, StatusNotifierWatcherProxy, TrayItem, TrayService};
 
 pub mod cava;
 pub use cava::CavaService;
@@ -62,7 +62,7 @@ pub mod disk;
 pub use disk::{DiskService, DiskSnapshot};
 
 pub mod power;
-pub use power::PowerProfileService;
+pub use power::{PowerProfileService, PowerService};
 
 pub mod image;
 pub use image::{DecodedImage, ImageService};

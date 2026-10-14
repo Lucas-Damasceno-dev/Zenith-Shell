@@ -2,7 +2,10 @@
 -- Zenith-Shell (Engine v2) - Calendar & Agenda Overlay
 
 local theme = Zenith.Theme()
+local Store = Zenith.import("settings_store")
 local time_str, date_str = Zenith.Services.time()
+local pomodoro_active = Store.get("pomodoroActive") or false
+local pomodoro_focus = Store.get("pomodoroFocus") or 25
 
 local current_date = (Zenith.Services.date and Zenith.Services.date()) or { year = 2026, month = 10, day = 8, weekday = 4 }
 
@@ -93,7 +96,7 @@ end
 return Zenith.Window({
     direction = "column",
     width = 340,
-    height = 330,
+    height = 390,
     padding = { x = 16, y = 14 },
     gap = 8,
     background = Zenith.hex(theme.surface, 235),
@@ -129,8 +132,11 @@ return Zenith.Window({
             }
         }),
 
-        -- Time badge
+        -- Month Navigation & Time Row
         Zenith.Box({
+            direction = "row",
+            align_items = "center",
+            justify_content = "space-between",
             padding = { x = 10, y = 6 },
             border_radius = 8,
             background = Zenith.hex(theme.surface),
@@ -138,10 +144,23 @@ return Zenith.Window({
             border_width = 1,
             children = {
                 Zenith.Text({
-                    text = " Local Time: " .. time_str,
+                    text = " " .. time_str,
                     font_size = 12,
                     color = Zenith.hex(theme.on_surface),
-                })
+                }),
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    gap = 8,
+                    children = {
+                        Zenith.Text({
+                            text = string.format("%04d-%02d", current_date.year, current_date.month),
+                            font_size = 11,
+                            font_weight = "bold",
+                            color = Zenith.hex(theme.primary),
+                        }),
+                    }
+                }),
             }
         }),
 
@@ -157,6 +176,53 @@ return Zenith.Window({
             direction = "column",
             gap = 4,
             children = grid_rows,
+        }),
+
+        -- Pomodoro Productivity Focus Switch Row
+        Zenith.Box({
+            direction = "row",
+            align_items = "center",
+            justify_content = "space-between",
+            padding = { x = 10, y = 6 },
+            border_radius = 8,
+            background = Zenith.hex(theme.surface_container, 80),
+            border_color = Zenith.hex(theme.outline, 30),
+            border_width = 1,
+            children = {
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    gap = 8,
+                    children = {
+                        Zenith.Text({
+                            text = "󰔛",
+                            font_size = 14,
+                            color = pomodoro_active and Zenith.hex(theme.primary) or Zenith.hex(theme.outline),
+                        }),
+                        Zenith.Box({
+                            direction = "column",
+                            children = {
+                                Zenith.Text({
+                                    text = "Pomodoro Timer (" .. tostring(pomodoro_focus) .. "m)",
+                                    font_size = 11,
+                                    color = Zenith.hex(theme.on_surface),
+                                }),
+                                Zenith.Text({
+                                    text = pomodoro_active and "Sessão de foco ativa" or "Temporizador inativo",
+                                    font_size = 9,
+                                    color = pomodoro_active and Zenith.hex(theme.primary) or Zenith.hex(theme.outline),
+                                }),
+                            }
+                        }),
+                    }
+                }),
+                Zenith.Switch({
+                    id = "switch_calendar_pomodoro",
+                    checked = pomodoro_active,
+                    active_color = theme.primary,
+                    on_toggle = "storage:toggle:pomodoroActive",
+                }),
+            }
         }),
     }
 })

@@ -3,7 +3,13 @@
 -- Parity 1:1 with Quickshell dock, Hyprland client tracking, spring physics and focus:<address>.
 
 local theme = Zenith.Theme()
+local Store = Zenith.import("settings_store")
 local clients = Zenith.Services.Clients()
+
+local dock_h = Store.get("dockHeight") or 56
+local show_mpris = Store.get("dockShowMpris") ~= false
+local show_trash = Store.get("dockShowTrash") or false
+local blur_glass = Store.get("dockBlurGlass") ~= false
 
 -- Pinned applications (Terminal, Navegador, Editor de Código, Gerenciador de Arquivos, Spotify, Discord)
 local pinned_apps = {
@@ -41,10 +47,10 @@ end
 local function DockItem(icon: string, name: string, is_running: boolean, client: any?, exec: string?)
     local click_action = ""
     if is_running and client and client.address then
-        -- Focus window directly via Hyprland address
-        click_action = "focus:" .. client.address
+        -- Focus or toggle minimize window directly via Hyprland address
+        click_action = "window:toggle_minimize:" .. client.address
     else
-        click_action = "cmd:" .. (exec or name) .. " &"
+        click_action = "launch:" .. (exec or name)
     end
 
     local bg = is_running and Zenith.hex(theme.surface_container_high or theme.surface_container, 130) or Zenith.rgba(255, 255, 255, 0)
@@ -204,6 +210,60 @@ table.insert(dock_children, Zenith.Box({
     }
 }))
 
+-- 5. Optional Media Pill shortcut if enabled in Settings
+if show_mpris then
+    table.insert(dock_children, Zenith.Box({
+        direction = "column",
+        align_items = "center",
+        justify_content = "center",
+        padding = { x = 11, y = 4 },
+        border_radius = 14,
+        background = Zenith.hex(theme.surface_container_high or theme.surface_container, 80),
+        tooltip = "Controles de Mídia",
+        on_click = "popup:toggle:MediaPopup",
+        children = {
+            Zenith.Text({
+                text = "󰎆",
+                font_size = 18,
+                color = Zenith.hex(theme.primary),
+            }),
+            Zenith.Text({
+                text = " ",
+                font_size = 6,
+                color = Zenith.rgba(0, 0, 0, 0),
+            }),
+        }
+    }))
+end
+
+-- 6. Optional Trash shortcut if enabled in Settings
+if show_trash then
+    table.insert(dock_children, Zenith.Box({
+        direction = "column",
+        align_items = "center",
+        justify_content = "center",
+        padding = { x = 11, y = 4 },
+        border_radius = 14,
+        background = Zenith.hex(theme.surface_container_high or theme.surface_container, 80),
+        tooltip = "Lixeira",
+        on_click = "launch:thunar trash:///",
+        children = {
+            Zenith.Text({
+                text = "󰩹",
+                font_size = 18,
+                color = Zenith.hex(theme.outline),
+            }),
+            Zenith.Text({
+                text = " ",
+                font_size = 6,
+                color = Zenith.rgba(0, 0, 0, 0),
+            }),
+        }
+    }))
+end
+
+local dock_bg = if blur_glass then Zenith.hex(theme.surface, 215) else Zenith.hex(theme.surface, 250)
+
 -- Root Dock Container: Bottom centered with 12px margin and glassmorphic pill
 return Zenith.Box({
     direction = "row",
@@ -214,11 +274,11 @@ return Zenith.Box({
         Zenith.Box({
             direction = "row",
             align_items = "center",
-            height = 56,
+            height = dock_h,
             padding = { x = 14, y = 5 },
             gap = 6,
             border_radius = 24,
-            background = Zenith.hex(theme.surface, 215),
+            background = dock_bg,
             border_color = Zenith.hex(theme.outline_variant or theme.outline, 45),
             border_width = 1,
             shadow = {

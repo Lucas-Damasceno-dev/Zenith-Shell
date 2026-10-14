@@ -2569,6 +2569,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith-tests"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "zenith-cli",
+ "zenith-core",
+ "zenith-layout",
+ "zenith-runtime",
+ "zenith-services",
+ "zenith-wayland",
+]
+
+[[package]]
 name = "zenith-wayland"
 version = "0.1.0"
 dependencies = [

@@ -31,6 +31,12 @@ pub struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
+    /// Initializes a new dynamic VRAM glyph texture atlas.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `gl` is current on the calling thread.
+    /// - `gl` commands must be valid to execute on the calling thread.
     pub unsafe fn new(gl: Arc<glow::Context>) -> Result<Self, Box<dyn std::error::Error>> {
         let texture = gl.create_texture()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));

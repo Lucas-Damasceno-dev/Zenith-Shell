@@ -273,6 +273,7 @@ pub struct ComputedBox {
     pub switch: Option<ComputedSwitch>,
     pub overflow: Overflow,
     pub scroll_offset_y: f32,
+    pub clip_rect: Option<[f32; 4]>,
     pub on_click: Option<String>,
     pub on_right_click: Option<String>,
     pub on_scroll_up: Option<String>,
@@ -281,10 +282,37 @@ pub struct ComputedBox {
     pub tooltip_active: bool,
 }
 
+/// Updates scroll_offset_y recursively in any UiNode with Overflow::Scroll
+pub fn update_scroll_offset_in_tree(root: &mut UiNode, delta: f32) -> bool {
+    match root {
+        UiNode::Box { style, children, .. } | UiNode::Window { style, children, .. } => {
+            if style.overflow == Overflow::Scroll {
+                style.scroll_offset_y = (style.scroll_offset_y + delta).max(0.0);
+                return true;
+            }
+            for child in children {
+                if update_scroll_offset_in_tree(child, delta) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
 
-/// Engine to calculate layout positions for an entire UI tree.
+
+#[derive(Debug, Clone)]
+struct LayoutNodeCache {
+    node_id: NodeId,
+    style: Style,
+    children: Vec<LayoutNodeCache>,
+}
+
+/// Engine to calculate layout positions for an entire UI tree with incremental Taffy node recycling.
 pub struct LayoutEngine {
     taffy: TaffyTree<()>,
+    cached_root: Option<LayoutNodeCache>,
 }
 
 impl Default for LayoutEngine {
@@ -297,23 +325,46 @@ impl LayoutEngine {
     pub fn new() -> Self {
         Self {
             taffy: TaffyTree::new(),
+            cached_root: None,
         }
     }
 
-    /// Compute absolute bounding boxes for a UI tree given available viewport bounds.
-    pub fn compute(&mut self, root: &UiNode, viewport_width: f32, viewport_height: f32) -> Vec<ComputedBox> {
+    /// Number of active nodes in the internal Taffy tree.
+    pub fn node_count(&self) -> usize {
+        self.taffy.total_node_count()
+    }
+
+    /// Root NodeId currently cached, if any.
+    pub fn root_node_id(&self) -> Option<NodeId> {
+        self.cached_root.as_ref().map(|c| c.node_id)
+    }
+
+    /// Clears cached layout tree and resets the Taffy tree.
+    pub fn clear(&mut self) {
+        self.cached_root = None;
         self.taffy.clear();
-        let root_node = self.build_taffy_node(root);
+    }
+
+    /// Compute absolute bounding boxes for a UI tree given available viewport bounds.
+    /// Recycles existing Taffy nodes across incremental mutations instead of clearing the tree.
+    pub fn compute(&mut self, root: &UiNode, viewport_width: f32, viewport_height: f32) -> Vec<ComputedBox> {
+        let old_cache = self.cached_root.take();
+        let mut root_cache = self.sync_node(root, old_cache);
 
         // Ensure root container expands to viewport bounds if not explicitly sized
-        if let Ok(mut root_style) = self.taffy.style(root_node).cloned() {
-            if root_style.size.width == auto() {
-                root_style.size.width = length(viewport_width);
-            }
-            if root_style.size.height == auto() {
-                root_style.size.height = length(viewport_height);
-            }
-            let _ = self.taffy.set_style(root_node, root_style);
+        let mut root_style = root_cache.style.clone();
+        let mut style_mutated = false;
+        if root_style.size.width == auto() {
+            root_style.size.width = length(viewport_width);
+            style_mutated = true;
+        }
+        if root_style.size.height == auto() {
+            root_style.size.height = length(viewport_height);
+            style_mutated = true;
+        }
+        if style_mutated {
+            let _ = self.taffy.set_style(root_cache.node_id, root_style.clone());
+            root_cache.style = root_style;
         }
 
         let available_space = Size {
@@ -321,24 +372,28 @@ impl LayoutEngine {
             height: AvailableSpace::Definite(viewport_height),
         };
 
-        if let Err(e) = self.taffy.compute_layout(root_node, available_space) {
+        if let Err(e) = self.taffy.compute_layout(root_cache.node_id, available_space) {
             tracing::error!("Failed to compute Taffy layout: {:?}", e);
+            self.cached_root = Some(root_cache);
             return Vec::new();
         }
 
-        let mut computed = Vec::new();
-        self.collect_computed(root, root_node, 0.0, 0.0, &mut computed);
+        let mut computed = Vec::with_capacity(32);
+        self.collect_computed(root, root_cache.node_id, 0.0, 0.0, None, &mut computed);
+        self.cached_root = Some(root_cache);
         computed
     }
 
-    fn build_taffy_node(&mut self, node: &UiNode) -> NodeId {
-        match node {
-            UiNode::Box { style, children, .. } | UiNode::Window { style, children, .. } => {
-                let child_nodes: Vec<NodeId> = children.iter().map(|c| self.build_taffy_node(c)).collect();
-                let taffy_style = Self::convert_style(style);
-                self.taffy.new_with_children(taffy_style, &child_nodes).unwrap()
-            }
+    fn remove_cache_tree(&mut self, cache: LayoutNodeCache) {
+        for child in cache.children {
+            self.remove_cache_tree(child);
+        }
+        let _ = self.taffy.remove(cache.node_id);
+    }
 
+    fn compute_taffy_style(node: &UiNode) -> Style {
+        match node {
+            UiNode::Box { style, .. } | UiNode::Window { style, .. } => Self::convert_style(style),
             UiNode::Text { style, text, font_size, .. } => {
                 let mut taffy_style = Self::convert_style(style);
                 if style.width.is_none() {
@@ -349,9 +404,8 @@ impl LayoutEngine {
                 if style.height.is_none() {
                     taffy_style.size.height = length(*font_size * 1.2);
                 }
-                self.taffy.new_leaf(taffy_style).unwrap()
+                taffy_style
             }
-
             UiNode::TextInput { style, text, placeholder, font_size, .. } => {
                 let mut taffy_style = Self::convert_style(style);
                 if style.width.is_none() {
@@ -362,9 +416,8 @@ impl LayoutEngine {
                 if style.height.is_none() {
                     taffy_style.size.height = length((*font_size * 1.8).max(34.0));
                 }
-                self.taffy.new_leaf(taffy_style).unwrap()
+                taffy_style
             }
-
             UiNode::Image { style, .. } => {
                 let mut taffy_style = Self::convert_style(style);
                 if style.width.is_none() {
@@ -373,34 +426,95 @@ impl LayoutEngine {
                 if style.height.is_none() {
                     taffy_style.size.height = length(24.0);
                 }
-                self.taffy.new_leaf(taffy_style).unwrap()
+                taffy_style
             }
-
-            UiNode::Shader { style, .. } => {
-                let taffy_style = Self::convert_style(style);
-                self.taffy.new_leaf(taffy_style).unwrap()
-            }
-
+            UiNode::Shader { style, .. } => Self::convert_style(style),
             UiNode::Slider { style, .. } => {
                 let mut taffy_style = Self::convert_style(style);
-                if style.width.is_none() {
-                    taffy_style.size.width = length(160.0);
-                }
-                if style.height.is_none() {
-                    taffy_style.size.height = length(24.0);
-                }
-                self.taffy.new_leaf(taffy_style).unwrap()
+                let w = style.width.unwrap_or(160.0);
+                let h = style.height.unwrap_or(24.0);
+                taffy_style.size.width = length(w);
+                taffy_style.size.height = length(h);
+                taffy_style.min_size.width = length(w);
+                taffy_style.min_size.height = length(h);
+                taffy_style.flex_shrink = 0.0;
+                taffy_style
             }
-
             UiNode::Switch { style, .. } => {
                 let mut taffy_style = Self::convert_style(style);
-                if style.width.is_none() {
-                    taffy_style.size.width = length(44.0);
+                let w = style.width.unwrap_or(44.0);
+                let h = style.height.unwrap_or(24.0);
+                taffy_style.size.width = length(w);
+                taffy_style.size.height = length(h);
+                taffy_style.min_size.width = length(w);
+                taffy_style.min_size.height = length(h);
+                taffy_style.flex_shrink = 0.0;
+                taffy_style
+            }
+        }
+    }
+
+    fn sync_node(&mut self, node: &UiNode, cached: Option<LayoutNodeCache>) -> LayoutNodeCache {
+        let desired_style = Self::compute_taffy_style(node);
+        let ui_children = match node {
+            UiNode::Box { children, .. } | UiNode::Window { children, .. } => children.as_slice(),
+            _ => &[],
+        };
+
+        match cached {
+            Some(mut cache) => {
+                // Recycle existing NodeId! Update style only if changed.
+                if cache.style != desired_style {
+                    let _ = self.taffy.set_style(cache.node_id, desired_style.clone());
+                    cache.style = desired_style;
                 }
-                if style.height.is_none() {
-                    taffy_style.size.height = length(24.0);
+
+                let mut new_children_caches = Vec::with_capacity(ui_children.len());
+                let mut cached_children = cache.children;
+                let mut drain = cached_children.drain(..);
+
+                for ui_child in ui_children {
+                    let cached_child = drain.next();
+                    let child_cache = self.sync_node(ui_child, cached_child);
+                    new_children_caches.push(child_cache);
                 }
-                self.taffy.new_leaf(taffy_style).unwrap()
+
+                // Remove leftover cached child nodes from Taffy
+                for leftover in drain {
+                    self.remove_cache_tree(leftover);
+                }
+
+                // Update child references if children composition changed
+                let new_child_ids: Vec<NodeId> = new_children_caches.iter().map(|c| c.node_id).collect();
+                let current_child_ids = self.taffy.children(cache.node_id).unwrap_or_default();
+                if current_child_ids != new_child_ids {
+                    let _ = self.taffy.set_children(cache.node_id, &new_child_ids);
+                }
+
+                cache.children = new_children_caches;
+                cache
+            }
+            None => {
+                if ui_children.is_empty() {
+                    let node_id = self.taffy.new_leaf(desired_style.clone()).unwrap();
+                    LayoutNodeCache {
+                        node_id,
+                        style: desired_style,
+                        children: Vec::new(),
+                    }
+                } else {
+                    let mut child_caches = Vec::with_capacity(ui_children.len());
+                    for ui_child in ui_children {
+                        child_caches.push(self.sync_node(ui_child, None));
+                    }
+                    let child_ids: Vec<NodeId> = child_caches.iter().map(|c| c.node_id).collect();
+                    let node_id = self.taffy.new_with_children(desired_style.clone(), &child_ids).unwrap();
+                    LayoutNodeCache {
+                        node_id,
+                        style: desired_style,
+                        children: child_caches,
+                    }
+                }
             }
         }
     }
@@ -446,6 +560,7 @@ impl LayoutEngine {
         node_id: NodeId,
         parent_x: f32,
         parent_y: f32,
+        active_clip: Option<[f32; 4]>,
         out: &mut Vec<ComputedBox>,
     ) {
         let layout = self.taffy.layout(node_id).unwrap();
@@ -484,6 +599,7 @@ impl LayoutEngine {
                     switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: style.scroll_offset_y,
+                    clip_rect: active_clip,
                     on_click: on_c,
                     on_right_click: on_rc,
                     on_scroll_up: on_su,
@@ -491,6 +607,22 @@ impl LayoutEngine {
                     tooltip: tip,
                     tooltip_active: false,
                 });
+
+                let my_clip = if style.overflow == Overflow::Scroll || style.overflow == Overflow::Hidden {
+                    let cur = [abs_x, abs_y, layout.size.width, layout.size.height];
+                    match active_clip {
+                        Some([cx, cy, cw, ch]) => {
+                            let x1 = abs_x.max(cx);
+                            let y1 = abs_y.max(cy);
+                            let x2 = (abs_x + layout.size.width).min(cx + cw);
+                            let y2 = (abs_y + layout.size.height).min(cy + ch);
+                            Some([x1, y1, (x2 - x1).max(0.0), (y2 - y1).max(0.0)])
+                        }
+                        None => Some(cur),
+                    }
+                } else {
+                    active_clip
+                };
 
                 let child_ids = self.taffy.children(node_id).unwrap();
                 let scroll_y = if style.overflow == Overflow::Scroll {
@@ -500,7 +632,7 @@ impl LayoutEngine {
                 };
 
                 for (child_node, child_id) in children.iter().zip(child_ids.iter()) {
-                    self.collect_computed(child_node, *child_id, abs_x, abs_y - scroll_y, out);
+                    self.collect_computed(child_node, *child_id, abs_x, abs_y - scroll_y, my_clip, out);
                 }
             }
             UiNode::Text { style, text, color, font_size } => {
@@ -522,6 +654,7 @@ impl LayoutEngine {
                     switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
+                    clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
@@ -590,6 +723,7 @@ impl LayoutEngine {
                     switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
+                    clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
@@ -617,6 +751,7 @@ impl LayoutEngine {
                     switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
+                    clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
@@ -647,6 +782,7 @@ impl LayoutEngine {
                     switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
+                    clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
@@ -697,6 +833,7 @@ impl LayoutEngine {
                     switch: None,
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
+                    clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
                     on_scroll_up: None,
@@ -739,6 +876,7 @@ impl LayoutEngine {
                     }),
                     overflow: style.overflow,
                     scroll_offset_y: 0.0,
+                    clip_rect: active_clip,
                     on_click: on_toggle.clone(),
                     on_right_click: None,
                     on_scroll_up: None,
@@ -959,5 +1097,171 @@ mod tests {
         assert_eq!(computed.len(), 1);
         assert_eq!(computed[0].tooltip.as_deref(), Some("Click to toggle Wi-Fi"));
         assert!(!computed[0].tooltip_active);
+    }
+
+    #[test]
+    fn test_taffy_node_recycling_on_incremental_mutations() {
+        let mut engine = LayoutEngine::new();
+
+        // 1. Initial UI Tree: Root Box with 2 children (Text + Box with child Image)
+        let initial_root = UiNode::Box {
+            style: NodeStyle {
+                width: Some(500.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+            children: vec![
+                UiNode::Text {
+                    text: "Initial Title".to_string(),
+                    font_size: 16.0,
+                    color: Color::rgb(255, 255, 255),
+                    style: NodeStyle::default(),
+                },
+                UiNode::Box {
+                    style: NodeStyle {
+                        width: Some(200.0),
+                        height: Some(50.0),
+                        ..Default::default()
+                    },
+                    children: vec![
+                        UiNode::Image {
+                            src: "/path/to/icon.png".to_string(),
+                            style: NodeStyle::default(),
+                        }
+                    ],
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                },
+            ],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+
+        let boxes1 = engine.compute(&initial_root, 500.0, 300.0);
+        assert_eq!(boxes1.len(), 4);
+        let root_id_1 = engine.root_node_id().expect("root node exists");
+        let initial_count = engine.node_count();
+        assert_eq!(initial_count, 4);
+
+        // 2. Incremental Mutation: change text and width of the child box (preserving topology)
+        let mutated_root = UiNode::Box {
+            style: NodeStyle {
+                width: Some(500.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+            children: vec![
+                UiNode::Text {
+                    text: "Updated Title".to_string(),
+                    font_size: 16.0,
+                    color: Color::rgb(200, 200, 200),
+                    style: NodeStyle::default(),
+                },
+                UiNode::Box {
+                    style: NodeStyle {
+                        width: Some(220.0), // width mutated
+                        height: Some(50.0),
+                        background_color: Color::rgb(10, 20, 30),
+                        ..Default::default()
+                    },
+                    children: vec![
+                        UiNode::Image {
+                            src: "/path/to/icon.png".to_string(),
+                            style: NodeStyle::default(),
+                        }
+                    ],
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                },
+            ],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+
+        let boxes2 = engine.compute(&mutated_root, 500.0, 300.0);
+        assert_eq!(boxes2.len(), 4);
+        // Root NodeId must be recycled across frame computations!
+        assert_eq!(engine.root_node_id(), Some(root_id_1));
+        // Node count must remain identical (zero node allocations/leakages)
+        assert_eq!(engine.node_count(), initial_count);
+        // Mutated width must be reflected in computed box
+        assert_eq!(boxes2[2].width, 220.0);
+
+        // 3. Child addition: add an extra box
+        let expanded_root = UiNode::Box {
+            style: NodeStyle {
+                width: Some(500.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+            children: vec![
+                UiNode::Text {
+                    text: "Updated Title".to_string(),
+                    font_size: 16.0,
+                    color: Color::rgb(200, 200, 200),
+                    style: NodeStyle::default(),
+                },
+                UiNode::Box {
+                    style: NodeStyle {
+                        width: Some(220.0),
+                        height: Some(50.0),
+                        ..Default::default()
+                    },
+                    children: vec![
+                        UiNode::Image {
+                            src: "/path/to/icon.png".to_string(),
+                            style: NodeStyle::default(),
+                        }
+                    ],
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                },
+                UiNode::Box {
+                    style: NodeStyle {
+                        width: Some(80.0),
+                        height: Some(40.0),
+                        ..Default::default()
+                    },
+                    children: vec![],
+                    on_click: None,
+                    on_right_click: None,
+                    on_scroll_up: None,
+                    on_scroll_down: None,
+                    tooltip: None,
+                },
+            ],
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+
+        let boxes3 = engine.compute(&expanded_root, 500.0, 300.0);
+        assert_eq!(boxes3.len(), 5);
+        assert_eq!(engine.root_node_id(), Some(root_id_1));
+        assert_eq!(engine.node_count(), initial_count + 1);
+
+        // 4. Child removal: remove the last child, shrinking back
+        let shrunk_root = mutated_root;
+        let boxes4 = engine.compute(&shrunk_root, 500.0, 300.0);
+        assert_eq!(boxes4.len(), 4);
+        assert_eq!(engine.root_node_id(), Some(root_id_1));
+        assert_eq!(engine.node_count(), initial_count);
     }
 }

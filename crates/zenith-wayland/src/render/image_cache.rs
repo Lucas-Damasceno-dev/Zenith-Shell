@@ -59,6 +59,12 @@ pub struct ImageCache {
 }
 
 impl ImageCache {
+    /// Creates a new texture cache and initializes the image rendering pipeline.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `gl` is current on the calling thread.
+    /// - `gl` commands must remain valid throughout execution.
     pub unsafe fn new(gl: Arc<glow::Context>) -> Result<Self, Box<dyn std::error::Error>> {
         let program = super::primitives::SdfRectShader::compile_program(&gl, IMAGE_VS, IMAGE_FS)?;
 
@@ -171,6 +177,12 @@ impl ImageCache {
         }
     }
 
+    /// Draws a cached texture into the target viewport at the specified rectangle.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `self.gl` is current on the calling thread.
+    /// - `texture` must be a valid, live OpenGL texture handle within this context.
     pub unsafe fn draw(
         &self,
         texture: glow::NativeTexture,

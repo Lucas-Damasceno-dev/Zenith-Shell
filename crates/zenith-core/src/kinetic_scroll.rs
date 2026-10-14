@@ -79,29 +79,75 @@ impl KineticScrollEngine {
 
         // Check if currently outside bounds (overscroll rubber-band)
         if self.offset < self.min_offset {
+            // Sub-pixel threshold: if difference is < 0.001, snap directly to rest
+            if (self.min_offset - self.offset) < 0.001 {
+                self.offset = self.min_offset;
+                self.velocity = 0.0;
+                self.in_overscroll = false;
+                self.spring.current = self.min_offset;
+                self.spring.target = self.min_offset;
+                self.spring.velocity = 0.0;
+                return self.offset;
+            }
+
             self.in_overscroll = true;
             self.spring.current = self.offset;
             self.spring.target = self.min_offset;
             self.offset = self.spring.step(dt);
             self.velocity *= 0.5f32.powf(fps_ratio);
+
+            if self.spring.is_settled() || (self.min_offset - self.offset).abs() < 0.001 {
+                self.offset = self.min_offset;
+                self.velocity = 0.0;
+                self.in_overscroll = false;
+                self.spring.current = self.min_offset;
+                self.spring.velocity = 0.0;
+            }
         } else if self.offset > self.max_offset {
+            // Sub-pixel threshold: if difference is < 0.001, snap directly to rest
+            if (self.offset - self.max_offset) < 0.001 {
+                self.offset = self.max_offset;
+                self.velocity = 0.0;
+                self.in_overscroll = false;
+                self.spring.current = self.max_offset;
+                self.spring.target = self.max_offset;
+                self.spring.velocity = 0.0;
+                return self.offset;
+            }
+
             self.in_overscroll = true;
             self.spring.current = self.offset;
             self.spring.target = self.max_offset;
             self.offset = self.spring.step(dt);
             self.velocity *= 0.5f32.powf(fps_ratio);
+
+            if self.spring.is_settled() || (self.offset - self.max_offset).abs() < 0.001 {
+                self.offset = self.max_offset;
+                self.velocity = 0.0;
+                self.in_overscroll = false;
+                self.spring.current = self.max_offset;
+                self.spring.velocity = 0.0;
+            }
         } else {
             self.in_overscroll = false;
-            if self.velocity.abs() > 0.05 {
+            // Within bounds: treat sub-pixel velocity (< 0.001) as settled rest
+            if self.velocity.abs() >= 0.001 {
                 self.offset += self.velocity * dt;
                 let decay = self.friction.powf(fps_ratio);
                 self.velocity *= decay;
 
-                if self.velocity.abs() <= 0.05 {
+                if self.velocity.abs() < 0.001 {
                     self.velocity = 0.0;
                 }
             } else {
                 self.velocity = 0.0;
+            }
+
+            // Snap micro-boundary offsets
+            if (self.offset - self.min_offset).abs() < 0.001 {
+                self.offset = self.min_offset;
+            } else if (self.offset - self.max_offset).abs() < 0.001 {
+                self.offset = self.max_offset;
             }
         }
 
@@ -110,8 +156,8 @@ impl KineticScrollEngine {
 
     /// Returns `true` if motion has settled to rest within bounds.
     pub fn is_settled(&self) -> bool {
-        self.velocity.abs() < 0.05
-            && (self.offset >= self.min_offset && self.offset <= self.max_offset)
+        self.velocity.abs() < 0.001
+            && (self.offset >= self.min_offset - 0.001 && self.offset <= self.max_offset + 0.001)
             && (!self.in_overscroll || self.spring.is_settled())
     }
 
@@ -170,6 +216,32 @@ mod tests {
         }
 
         assert!((engine.offset - 500.0).abs() < 1.0);
+        assert!(engine.is_settled());
+    }
+
+    #[test]
+    fn test_kinetic_scroll_subpixel_micro_values_settle() {
+        let mut engine = KineticScrollEngine::new(0.0, 500.0);
+
+        // Micro-overscroll (<0.001 below min)
+        engine.offset = -0.0004;
+        engine.step(0.016);
+        assert_eq!(engine.offset, 0.0);
+        assert_eq!(engine.velocity, 0.0);
+        assert!(engine.is_settled());
+
+        // Micro-overscroll (<0.001 above max)
+        engine.offset = 500.0006;
+        engine.step(0.016);
+        assert_eq!(engine.offset, 500.0);
+        assert_eq!(engine.velocity, 0.0);
+        assert!(engine.is_settled());
+
+        // Micro-velocity (<0.001) within bounds
+        engine.offset = 250.0;
+        engine.velocity = 0.0005;
+        engine.step(0.016);
+        assert_eq!(engine.velocity, 0.0);
         assert!(engine.is_settled());
     }
 }

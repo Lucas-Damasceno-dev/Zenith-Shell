@@ -2,10 +2,11 @@
 -- Zenith-Shell (Engine v2) - Notification Center Overlay (Desktop Notifications & History & DND)
 
 local theme = Zenith.Theme()
+local Store = Zenith.import("settings_store")
 local UIKit = Zenith.import("ui_kit")
 local notifs = Zenith.Services.Notifications()
 local history = Zenith.Services.NotificationHistory()
-local is_dnd = Zenith.Services.IsDND()
+local is_dnd = Zenith.Services.IsDND() or (Store.get("dndEnabled") == true)
 
 local total_notifs = #notifs
 local max_visible = 5
@@ -221,13 +222,28 @@ return Zenith.Window({
                     color = Zenith.hex(theme.primary),
                 }),
                 Zenith.Box({ flex_grow = 1 }),
-                -- DND Button
-                UIKit.Button({
-                    label = is_dnd and "DND" or "DND",
-                    icon = is_dnd and "󰂛" or "󰂚",
-                    variant = is_dnd and "danger" or "tonal",
-                    size = "sm",
-                    on_click = "notification:toggle_dnd",
+                -- DND Interactive Switch
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    gap = 4,
+                    padding = { x = 6, y = 2 },
+                    border_radius = 6,
+                    background = is_dnd and Zenith.rgba(243, 139, 168, 35) or Zenith.hex(theme.surface_container),
+                    children = {
+                        Zenith.Text({
+                            text = is_dnd and "󰂛 DND" or "󰂚 DND",
+                            font_size = 10,
+                            font_weight = "bold",
+                            color = is_dnd and Zenith.hex(theme.error or "#f38ba8") or Zenith.hex(theme.outline),
+                        }),
+                        Zenith.Switch({
+                            id = "switch_dnd_notif",
+                            checked = is_dnd,
+                            active_color = theme.error or "#f38ba8",
+                            on_toggle = "notification:toggle_dnd",
+                        }),
+                    }
                 }),
                 Zenith.Box({ width = 6 }),
                 -- Clear All Button

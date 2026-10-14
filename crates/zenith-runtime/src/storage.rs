@@ -13,30 +13,263 @@ use mlua::prelude::*;
 use serde_json::Value as JsonValue;
 use tracing::{error, info};
 
-/// Local storage engine handling key-value state persistence.
+/// Local storage engine handling key-value state persistence with bidirectional config.json sync.
 pub struct StorageEngine {
     file_path: PathBuf,
+    config_path: Option<PathBuf>,
     cache: Arc<RwLock<HashMap<String, JsonValue>>>,
 }
 
 impl StorageEngine {
+    /// Resolves canonical path for central config.json (~/.config/zenith/config.json or project config).
+    pub fn resolve_config_path() -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join(".config/zenith/config.json"));
+        }
+        candidates.push(PathBuf::from("config/zenith/config.json"));
+        candidates.push(PathBuf::from("../../config/zenith/config.json"));
+
+        candidates.into_iter().find(|p| p.exists())
+    }
+
+    /// Recursively flattens and maps config.json sections into cache.
+    fn load_from_config(config_path: &std::path::Path, data: &mut HashMap<String, JsonValue>) {
+        if let Ok(content) = fs::read_to_string(config_path) {
+            if let Ok(JsonValue::Object(map)) = serde_json::from_str::<JsonValue>(&content) {
+                for (section_name, section_val) in map {
+                    if let JsonValue::Object(inner_map) = section_val {
+                        for (inner_k, inner_v) in inner_map {
+                            let dotted = format!("{}.{}", section_name, inner_k);
+                            data.insert(dotted, inner_v.clone());
+
+                            let flat_key = Self::canonical_flat_key(&section_name, &inner_k);
+                            data.insert(flat_key, inner_v);
+                        }
+                    } else {
+                        data.insert(section_name, section_val);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Maps section and key to canonical flat settings key.
+    fn canonical_flat_key(section: &str, key: &str) -> String {
+        match (section, key) {
+            ("quick", "accentColor") | ("appearance", "accentColor") => "accentColor".to_string(),
+            ("quick", "layoutPreset") => "layoutPreset".to_string(),
+            ("quick", "colorScheme") => "colorScheme".to_string(),
+            ("quick", "darkMode") => "darkMode".to_string(),
+            ("quick", "barAutoHide") | ("bar", "autoHide") => "barAutoHide".to_string(),
+            ("quick", "barCompactMode") | ("bar", "compactMode") => "barCompactMode".to_string(),
+            ("quick", "reducedMotion") => "reducedMotion".to_string(),
+            ("quick", "privacyMode") => "privacyMode".to_string(),
+            ("quick", "focusMode") => "focusMode".to_string(),
+            ("quick", "lowPowerMode") => "lowPowerMode".to_string(),
+            ("bar", "height") => "barHeight".to_string(),
+            ("bar", "customRounding") => "barRadius".to_string(),
+            ("dock", "enable") => "dockEnabled".to_string(),
+            ("dock", "height") => "dockHeight".to_string(),
+            ("dock", "autoHide") => "dockAutoHide".to_string(),
+            ("dock", "enableBlurGlass") => "dockBlurGlass".to_string(),
+            ("dock", "showMpris") => "dockShowMpris".to_string(),
+            ("dock", "showTrash") => "dockShowTrash".to_string(),
+            ("wallpaper", "backend") => "wallpaperBackend".to_string(),
+            ("wallpaper", "slideshow") => "wallpaperSlideshow".to_string(),
+            ("system", "audioVolumeStep") => "audioVolumeStep".to_string(),
+            ("system", "audioProtection") => "audioProtection".to_string(),
+            ("system", "batteryChargeLimit") => "batteryChargeLimit".to_string(),
+            ("system", "batteryPowerProfile") => "batteryPowerProfile".to_string(),
+            ("system", "batteryLowThreshold") => "batteryLowThreshold".to_string(),
+            ("system", "batteryCriticalThreshold") => "batteryCriticalThreshold".to_string(),
+            ("system", "batteryNotifyFull") => "batteryNotifyFull".to_string(),
+            ("system", "nightLightEnabled") => "nightLightEnabled".to_string(),
+            ("system", "nightLightValue") => "nightLightTemp".to_string(),
+            ("system", "grayscaleValue") => "grayscaleIntensity".to_string(),
+            ("system", "hyprlockBlur") => "hyprlockBlur".to_string(),
+            ("compositor", "layout") => "hyprLayout".to_string(),
+            ("compositor", "gapsIn") => "gapsIn".to_string(),
+            ("compositor", "gapsOut") => "gapsOut".to_string(),
+            ("compositor", "borderSize") => "borderSize".to_string(),
+            ("tools", "ocrLanguage") => "toolsOcrLang".to_string(),
+            ("tools", "crosshairEnable") => "toolsCrosshair".to_string(),
+            ("services", "weatherProvider") => "weatherProvider".to_string(),
+            ("services", "weatherUnits") => "weatherUnits".to_string(),
+            ("services", "appTerminal") => "appTerminal".to_string(),
+            ("services", "appBrowser") => "appBrowser".to_string(),
+            ("services", "appFileManager") => "appFileManager".to_string(),
+            ("services", "appEditor") => "appEditor".to_string(),
+            ("ai", "provider") => "aiProvider".to_string(),
+            ("ai", "model") => "aiModel".to_string(),
+            ("ai", "temperature") => "aiTemperature".to_string(),
+            ("appearance", "springStiffness") => "springStiffness".to_string(),
+            ("appearance", "springDamping") => "springDamping".to_string(),
+            _ => key.to_string(),
+        }
+    }
+
+    /// Maps flat key back to (section, key) target locations in config.json.
+    fn flat_key_to_sections(key: &str) -> Vec<(&'static str, &'static str)> {
+        match key {
+            "accentColor" => vec![("quick", "accentColor"), ("appearance", "accentColor")],
+            "layoutPreset" => vec![("quick", "layoutPreset")],
+            "colorScheme" => vec![("quick", "colorScheme")],
+            "darkMode" => vec![("quick", "darkMode")],
+            "barAutoHide" => vec![("quick", "barAutoHide"), ("bar", "autoHide")],
+            "barCompactMode" => vec![("quick", "barCompactMode"), ("bar", "compactMode")],
+            "reducedMotion" => vec![("quick", "reducedMotion")],
+            "privacyMode" => vec![("quick", "privacyMode")],
+            "focusMode" => vec![("quick", "focusMode")],
+            "lowPowerMode" => vec![("quick", "lowPowerMode")],
+            "barHeight" => vec![("bar", "height")],
+            "barRadius" => vec![("bar", "customRounding")],
+            "dockEnabled" => vec![("dock", "enable")],
+            "dockHeight" => vec![("dock", "height")],
+            "dockAutoHide" => vec![("dock", "autoHide")],
+            "dockBlurGlass" => vec![("dock", "enableBlurGlass")],
+            "dockShowMpris" => vec![("dock", "showMpris")],
+            "dockShowTrash" => vec![("dock", "showTrash")],
+            "wallpaperBackend" => vec![("wallpaper", "backend")],
+            "wallpaperSlideshow" => vec![("wallpaper", "slideshow")],
+            "audioVolumeStep" => vec![("system", "audioVolumeStep")],
+            "audioProtection" => vec![("system", "audioProtection")],
+            "batteryChargeLimit" => vec![("system", "batteryChargeLimit")],
+            "batteryPowerProfile" => vec![("system", "batteryPowerProfile")],
+            "batteryLowThreshold" => vec![("system", "batteryLowThreshold")],
+            "batteryCriticalThreshold" => vec![("system", "batteryCriticalThreshold")],
+            "batteryNotifyFull" => vec![("system", "batteryNotifyFull")],
+            "nightLightEnabled" => vec![("system", "nightLightEnabled")],
+            "nightLightTemp" => vec![("system", "nightLightValue")],
+            "grayscaleIntensity" => vec![("system", "grayscaleValue")],
+            "hyprlockBlur" => vec![("system", "hyprlockBlur")],
+            "hyprLayout" => vec![("compositor", "layout")],
+            "gapsIn" => vec![("compositor", "gapsIn")],
+            "gapsOut" => vec![("compositor", "gapsOut")],
+            "borderSize" => vec![("compositor", "borderSize")],
+            "toolsOcrLang" => vec![("tools", "ocrLanguage")],
+            "toolsCrosshair" => vec![("tools", "crosshairEnable")],
+            "weatherProvider" => vec![("services", "weatherProvider")],
+            "weatherUnits" => vec![("services", "weatherUnits")],
+            "appTerminal" => vec![("services", "appTerminal")],
+            "appBrowser" => vec![("services", "appBrowser")],
+            "appFileManager" => vec![("services", "appFileManager")],
+            "appEditor" => vec![("services", "appEditor")],
+            "aiProvider" => vec![("ai", "provider")],
+            "aiModel" => vec![("ai", "model")],
+            "aiTemperature" => vec![("ai", "temperature")],
+            "springStiffness" => vec![("appearance", "springStiffness")],
+            "springDamping" => vec![("appearance", "springDamping")],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Atomically syncs a single modified key into config.json.
+    fn sync_key_to_config(config_path: &std::path::Path, key: &str, val: &JsonValue) -> Result<(), std::io::Error> {
+        if !config_path.exists() {
+            return Ok(());
+        }
+        let content = fs::read_to_string(config_path)?;
+        let mut root: JsonValue = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+
+        if let JsonValue::Object(ref mut root_map) = root {
+            if let Some((section, inner_k)) = key.split_once('.') {
+                if let Some(JsonValue::Object(ref mut sec_map)) = root_map.get_mut(section) {
+                    sec_map.insert(inner_k.to_string(), val.clone());
+                }
+            } else {
+                let targets = Self::flat_key_to_sections(key);
+                if !targets.is_empty() {
+                    for (sec, target_k) in targets {
+                        if let Some(JsonValue::Object(ref mut sec_map)) = root_map.get_mut(sec) {
+                            sec_map.insert(target_k.to_string(), val.clone());
+                        }
+                    }
+                } else {
+                    let mut found = false;
+                    for sec_val in root_map.values_mut() {
+                        if let JsonValue::Object(ref mut sec_map) = sec_val {
+                            if sec_map.contains_key(key) {
+                                sec_map.insert(key.to_string(), val.clone());
+                                found = true;
+                            }
+                        }
+                    }
+                    if !found {
+                        if let Some(JsonValue::Object(ref mut quick_map)) = root_map.get_mut("quick") {
+                            quick_map.insert(key.to_string(), val.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = config_path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
+        let json_str = serde_json::to_string_pretty(&root)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        {
+            let mut file = File::create(&temp_path)?;
+            file.write_all(json_str.as_bytes())?;
+        }
+        fs::rename(&temp_path, config_path)?;
+        Ok(())
+    }
+
     /// Initialize storage engine from default or explicit file path.
     pub fn new(custom_path: Option<PathBuf>) -> Self {
         let file_path = custom_path.unwrap_or_else(Self::default_storage_path);
+        let config_path = Self::resolve_config_path();
         let mut initial_data = HashMap::new();
 
+        // 1. Load defaults and schema values from config.json
+        if let Some(ref cp) = config_path {
+            Self::load_from_config(cp, &mut initial_data);
+        }
+
+        // 2. Layer local state storage overrides from storage.json
         if file_path.exists() {
             if let Ok(content) = fs::read_to_string(&file_path) {
                 if let Ok(parsed) = serde_json::from_str::<HashMap<String, JsonValue>>(&content) {
-                    initial_data = parsed;
+                    for (k, v) in parsed {
+                        initial_data.insert(k, v);
+                    }
                 }
             }
         }
 
         Self {
             file_path,
+            config_path,
             cache: Arc::new(RwLock::new(initial_data)),
         }
+    }
+
+    /// Sets explicit config path (for testing and isolation).
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.config_path = path;
+        let mut new_data = HashMap::new();
+        if let Some(ref cp) = self.config_path {
+            Self::load_from_config(cp, &mut new_data);
+        }
+        if self.file_path.exists() {
+            if let Ok(content) = fs::read_to_string(&self.file_path) {
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, JsonValue>>(&content) {
+                    for (k, v) in parsed {
+                        new_data.insert(k, v);
+                    }
+                }
+            }
+        }
+        *self.cache.write().unwrap() = new_data;
+        self
     }
 
     /// Resolves the canonical file path ($XDG_STATE_HOME/zenith/storage.json).
@@ -56,13 +289,64 @@ impl StorageEngine {
         self.cache.read().unwrap().get(key).cloned()
     }
 
-    /// Sets a value for key and persists atomically to disk.
+    /// Sets a value for key and persists asynchronously to disk (both storage.json & config.json).
     pub fn set(&self, key: &str, val: JsonValue) -> Result<(), std::io::Error> {
         {
             let mut writer = self.cache.write().unwrap();
-            writer.insert(key.to_string(), val);
+            writer.insert(key.to_string(), val.clone());
+            if let Some((section, inner_k)) = key.split_once('.') {
+                let flat_k = Self::canonical_flat_key(section, inner_k);
+                if flat_k != key {
+                    writer.insert(flat_k.clone(), val.clone());
+                    for (s, k) in Self::flat_key_to_sections(&flat_k) {
+                        let dot_k = format!("{}.{}", s, k);
+                        writer.insert(dot_k, val.clone());
+                    }
+                }
+            } else {
+                for (s, k) in Self::flat_key_to_sections(key) {
+                    let dot_k = format!("{}.{}", s, k);
+                    writer.insert(dot_k, val.clone());
+                }
+            }
         }
-        self.flush_atomic()
+        let cache_clone = self.cache.clone();
+        let path_clone = self.file_path.clone();
+        let config_path_clone = self.config_path.clone();
+        let key_str = key.to_string();
+        let val_clone = val;
+
+        std::thread::spawn(move || {
+            let _ = Self::flush_to_path(&cache_clone, &path_clone);
+            if let Some(ref cp) = config_path_clone {
+                let _ = Self::sync_key_to_config(cp, &key_str, &val_clone);
+            }
+        });
+        Ok(())
+    }
+
+    /// Reloads current values from central config.json into cache.
+    pub fn reload_from_config(&self) -> Result<(), std::io::Error> {
+        if let Some(ref cp) = self.config_path {
+            let mut new_data = HashMap::new();
+            Self::load_from_config(cp, &mut new_data);
+            let mut writer = self.cache.write().unwrap();
+            for (k, v) in new_data {
+                writer.insert(k, v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Forces immediate bidirectional flush of all cache keys to config.json.
+    pub fn sync_to_config(&self) -> Result<(), std::io::Error> {
+        if let Some(ref cp) = self.config_path {
+            let reader = self.cache.read().unwrap();
+            for (k, v) in reader.iter() {
+                let _ = Self::sync_key_to_config(cp, k, v);
+            }
+        }
+        Ok(())
     }
 
     /// Checks if a key exists.
@@ -77,7 +361,11 @@ impl StorageEngine {
             writer.remove(key).is_some()
         };
         if removed {
-            self.flush_atomic()?;
+            let cache_clone = self.cache.clone();
+            let path_clone = self.file_path.clone();
+            std::thread::spawn(move || {
+                let _ = Self::flush_to_path(&cache_clone, &path_clone);
+            });
         }
         Ok(removed)
     }
@@ -88,7 +376,12 @@ impl StorageEngine {
             let mut writer = self.cache.write().unwrap();
             writer.clear();
         }
-        self.flush_atomic()
+        let cache_clone = self.cache.clone();
+        let path_clone = self.file_path.clone();
+        std::thread::spawn(move || {
+            let _ = Self::flush_to_path(&cache_clone, &path_clone);
+        });
+        Ok(())
     }
 
     /// Returns a copy of all stored key-value pairs.
@@ -96,15 +389,24 @@ impl StorageEngine {
         self.cache.read().unwrap().clone()
     }
 
+    /// Explicitly flushes the cache to disk.
+    pub fn flush(&self) -> Result<(), std::io::Error> {
+        Self::flush_to_path(&self.cache, &self.file_path)
+    }
+
     /// Atomically flushes the cache to disk via temporary file rename.
-    fn flush_atomic(&self) -> Result<(), std::io::Error> {
-        if let Some(parent) = self.file_path.parent() {
+    fn flush_to_path(cache: &Arc<RwLock<HashMap<String, JsonValue>>>, file_path: &std::path::Path) -> Result<(), std::io::Error> {
+        if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let temp_path = self.file_path.with_extension("tmp");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = file_path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
         let json_str = {
-            let reader = self.cache.read().unwrap();
+            let reader = cache.read().unwrap();
             serde_json::to_string_pretty(&*reader)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
         };
@@ -112,10 +414,9 @@ impl StorageEngine {
         {
             let mut file = File::create(&temp_path)?;
             file.write_all(json_str.as_bytes())?;
-            file.sync_all()?;
         }
 
-        fs::rename(&temp_path, &self.file_path)?;
+        fs::rename(&temp_path, file_path)?;
         Ok(())
     }
 }
@@ -143,10 +444,8 @@ pub fn lua_to_json(val: LuaValue) -> JsonValue {
                 JsonValue::Array(vec)
             } else {
                 let mut map = serde_json::Map::new();
-                for pair in tbl.pairs::<String, LuaValue>() {
-                    if let Ok((k, v)) = pair {
-                        map.insert(k, lua_to_json(v));
-                    }
+                for (k, v) in tbl.pairs::<String, LuaValue>().flatten() {
+                    map.insert(k, lua_to_json(v));
                 }
                 JsonValue::Object(map)
             }
@@ -253,6 +552,22 @@ pub fn setup_storage_bindings(
     })?;
     storage_table.set("all", all_fn)?;
 
+    // Zenith.Storage.sync_to_config()
+    let eng_sync = Arc::clone(&engine);
+    let sync_fn = lua.create_function(move |_, ()| {
+        let _ = eng_sync.sync_to_config();
+        Ok(())
+    })?;
+    storage_table.set("sync_to_config", sync_fn)?;
+
+    // Zenith.Storage.reload_from_config()
+    let eng_reload = Arc::clone(&engine);
+    let reload_fn = lua.create_function(move |_, ()| {
+        let _ = eng_reload.reload_from_config();
+        Ok(())
+    })?;
+    storage_table.set("reload_from_config", reload_fn)?;
+
     zenith_table.set("Storage", storage_table.clone())?;
     zenith_table.set("storage", storage_table)?;
 
@@ -269,15 +584,16 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("zenith_test_storage_{}", std::process::id()));
         let file_path = temp_dir.join("storage.json");
 
-        let engine = StorageEngine::new(Some(file_path.clone()));
+        let engine = StorageEngine::new(Some(file_path.clone())).with_config_path(None);
         assert!(!engine.has("theme"));
 
         engine.set("theme", JsonValue::String("catppuccin".into())).unwrap();
         assert!(engine.has("theme"));
         assert_eq!(engine.get("theme").unwrap(), JsonValue::String("catppuccin".into()));
 
+        engine.flush().unwrap();
         // Persistence check via new instance
-        let loaded_engine = StorageEngine::new(Some(file_path.clone()));
+        let loaded_engine = StorageEngine::new(Some(file_path.clone())).with_config_path(None);
         assert_eq!(loaded_engine.get("theme").unwrap(), JsonValue::String("catppuccin".into()));
 
         assert!(loaded_engine.remove("theme").unwrap());
@@ -291,7 +607,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("zenith_test_lua_storage_{}", std::process::id()));
         let file_path = temp_dir.join("storage.json");
 
-        let engine = Arc::new(StorageEngine::new(Some(file_path)));
+        let engine = Arc::new(StorageEngine::new(Some(file_path)).with_config_path(None));
         let lua = Lua::new();
         let zenith_tbl = lua.create_table()?;
 
@@ -314,5 +630,54 @@ mod tests {
 
         let _ = fs::remove_dir_all(temp_dir);
         Ok(())
+    }
+
+    #[test]
+    fn test_storage_bidirectional_config_json_sync() {
+        let temp_dir = std::env::temp_dir().join(format!("zenith_test_cfg_sync_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let storage_file = temp_dir.join("storage.json");
+        let config_file = temp_dir.join("config.json");
+
+        let initial_cfg = serde_json::json!({
+            "quick": {
+                "accentColor": "#fcbc00",
+                "darkMode": true,
+                "barAutoHide": true
+            },
+            "appearance": {
+                "accentColor": "#fcbc00",
+                "springStiffness": 4.0
+            },
+            "bar": {
+                "height": 44,
+                "autoHide": true
+            }
+        });
+        fs::write(&config_file, serde_json::to_string_pretty(&initial_cfg).unwrap()).unwrap();
+
+        // 1. StorageEngine initializes and absorbs config.json values
+        let engine = StorageEngine::new(Some(storage_file.clone()))
+            .with_config_path(Some(config_file.clone()));
+
+        assert_eq!(engine.get("accentColor").unwrap(), JsonValue::String("#fcbc00".into()));
+        assert_eq!(engine.get("quick.accentColor").unwrap(), JsonValue::String("#fcbc00".into()));
+        assert_eq!(engine.get("barHeight").unwrap(), JsonValue::from(44));
+        assert_eq!(engine.get("barAutoHide").unwrap(), JsonValue::Bool(true));
+
+        // 2. Modify value in storage and sync back to config.json
+        engine.set("accentColor", JsonValue::String("#7aa2f7".into())).unwrap();
+        engine.set("barHeight", JsonValue::from(48)).unwrap();
+        engine.sync_to_config().unwrap();
+
+        // 3. Inspect modified config.json on disk
+        let disk_content = fs::read_to_string(&config_file).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&disk_content).unwrap();
+
+        assert_eq!(parsed["quick"]["accentColor"], "#7aa2f7");
+        assert_eq!(parsed["appearance"]["accentColor"], "#7aa2f7");
+        assert_eq!(parsed["bar"]["height"], 48);
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

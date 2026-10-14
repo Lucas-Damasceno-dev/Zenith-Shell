@@ -94,7 +94,7 @@ just test
 * [x] **Hardware Telemetry:** `lib/widgets/hardware.luau` (CPU, RAM, Bateria)
 * [x] **Media Pill:** `lib/widgets/media.luau` (MPRIS status)
 * [x] **Status Tray:** `lib/widgets/tray.luau` (SNI integration)
-* [ ] **Quick Status:** Sincronizar switches de modo (DND, GameMode, VPN)
+* [x] **Quick Status:** Sincronizar switches de modo (DND, GameMode, VPN) (`lib/widgets/quick_status.luau` + modular status cluster)
 
 ### 🌊 Onda 2: Popups e Centrais Essenciais (`overlays/`)
 * [x] **AudioPopup:** Roteamento PipeWire, seletor de sinks e sliders de volume (`overlays/AudioPopup.luau`)
@@ -103,7 +103,7 @@ just test
 * [x] **CalendarPopup:** Visualização mensal e eventos (`overlays/CalendarPopup.luau`)
 * [x] **OSD HUD:** Volume, brilho e microfone em tempo real (`overlays/OSD.luau`)
 * [ ] **ControlCenterPopup:** Migrar central combinada (`overlays/ControlCenterPopup.qml` ➔ `overlays/ControlCenter.luau`)
-* [ ] **BatteryPopup:** Detalhes de saúde, perfis de energia (power-profiles-daemon)
+* [x] **BatteryPopup:** Detalhes de saúde, perfis de energia (power-profiles-daemon) (`overlays/BatteryPopup.luau`)
 
 ### 🌊 Onda 3: Superfícies de Input e Navegação
 * [x] **App Launcher:** Fuzzy search XDG, keyboard grab, cursor navigation (`overlays/Launcher.luau`)
@@ -119,7 +119,7 @@ just test
 * [x] **Notification Center:** Daemon D-Bus completo com histórico (`overlays/NotificationCenter.luau`)
 
 ### 🌊 Onda 5: Utilitários & Ferramentas do Sistema
-* [ ] **Settings Center:** Configuração do ecossistema (`overlays/SettingsCenterPopup.qml`)
+* [x] **Settings Center:** Configuração do ecossistema (`overlays/Settings.luau` + `lib/settings_store.luau`)
 * [ ] **System Monitor Popup:** Gráficos de processo, CPU, GPU e I/O (`overlays/SystemMonitorPopup.qml`)
 * [ ] **Scratchpad Drawer:** Gaveta lateral para janelas especiais Hyprland (`overlays/ScratchpadDrawer.qml`)
 * [ ] **ScreenDraw Overlay:** Desenho e anotações sobre a tela (`overlays/ScreenDrawOverlay.qml`)

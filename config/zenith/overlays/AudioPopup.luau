@@ -203,7 +203,7 @@ return Zenith.Window({
             icon = "󰓃",
             variant = "outlined",
             size = "md",
-            on_click = "cmd:pavucontrol &",
+            on_click = "launch:pavucontrol",
         }),
     }
 })

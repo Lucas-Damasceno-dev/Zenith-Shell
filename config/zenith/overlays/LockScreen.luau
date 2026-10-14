@@ -216,7 +216,7 @@ return Zenith.Window({
                             padding = { x = 12, y = 8 },
                             border_radius = 10,
                             background = Zenith.rgba(255, 255, 255, 10),
-                            on_click = "cmd:systemctl suspend",
+                            on_click = "system:suspend",
                             children = {
                                 Zenith.Text({ text = "󰒲 Sleep", font_size = 11, color = Zenith.rgba(255, 255, 255, 200) }),
                             }
@@ -225,7 +225,7 @@ return Zenith.Window({
                             padding = { x = 12, y = 8 },
                             border_radius = 10,
                             background = Zenith.rgba(255, 255, 255, 10),
-                            on_click = "cmd:systemctl reboot",
+                            on_click = "system:reboot",
                             children = {
                                 Zenith.Text({ text = "󰑐 Reboot", font_size = 11, color = Zenith.rgba(255, 255, 255, 200) }),
                             }
@@ -236,7 +236,7 @@ return Zenith.Window({
                             background = Zenith.rgba(224, 108, 117, 30),
                             border_color = Zenith.hex("#e06c75"),
                             border_width = 1,
-                            on_click = "cmd:systemctl poweroff",
+                            on_click = "system:poweroff",
                             children = {
                                 Zenith.Text({ text = "󰐥 Power Off", font_size = 11, color = Zenith.hex("#e06c75") }),
                             }

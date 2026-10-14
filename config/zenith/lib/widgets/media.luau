@@ -49,10 +49,13 @@ local function MediaWidget()
         height = 26,
         border_radius = 13,
         padding = { x = if screen_w < 1440 then 8 else 10, y = 2 },
-        gap = 5,
         background = Zenith.hex(theme.surface_container_high or theme.surface_container, 140),
         border_color = Zenith.hex(theme.primary, 90),
+        tooltip = "Reprodutor de Mídia • " .. label .. "\n• Clique: Painel MPRIS\n• Botão Direito: Próxima Faixa\n• Scroll: Alternar Faixas",
         on_click = "popup:toggle:MediaPopup",
+        on_right_click = "media:next",
+        on_scroll_up = "media:next",
+        on_scroll_down = "media:previous",
         children = {
             Zenith.Text({
                 text = status_icon,

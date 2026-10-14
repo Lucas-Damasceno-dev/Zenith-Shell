@@ -39,11 +39,11 @@ if bar_filled_width < 4 and filled_pct > 0 then
     bar_filled_width = 4
 end
 
--- Auto-dismiss popup after 2000ms
+-- Auto-dismiss popup after 2000ms via native Zero-Subprocess socket
 if Zenith.delay then
     Zenith.delay(2000):andThen(function()
-        if Zenith.exec then
-            Zenith.exec("zenith close")
+        if Zenith.close then
+            Zenith.close()
         end
     end)
 end

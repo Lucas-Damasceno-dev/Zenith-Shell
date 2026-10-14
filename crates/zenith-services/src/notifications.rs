@@ -77,6 +77,7 @@ impl NotificationService {
     }
 
     /// Create or insert a notification programmatically.
+    // Preserves the D-Bus freedesktop notifications parameter mapping and public API compatibility.
     #[allow(clippy::too_many_arguments)]
     pub fn notify(
         app_name: String,
@@ -241,6 +242,8 @@ struct NotificationServer {
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl NotificationServer {
+    // D-Bus org.freedesktop.Notifications.Notify specification requires 8 arguments.
+    #[allow(clippy::too_many_arguments)]
     fn notify(
         &mut self,
         app_name: String,

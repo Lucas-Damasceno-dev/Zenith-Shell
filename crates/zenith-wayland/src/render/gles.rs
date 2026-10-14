@@ -68,6 +68,8 @@ pub struct GlesRenderer {
     loc_text_resolution: glow::UniformLocation,
     loc_text_atlas: glow::UniformLocation,
     loc_text_color: glow::UniformLocation,
+    glyph_scratch: Vec<f32>,
+    text_buffer: Buffer,
     pub inspect_mode: bool,
     pub frame_counter: u32,
     pub last_fps_instant: std::time::Instant,
@@ -75,6 +77,12 @@ pub struct GlesRenderer {
 }
 
 impl GlesRenderer {
+    /// Initialize GLES renderer, compiling shaders and allocating vertex buffers.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `gl` is current on the calling thread.
+    /// - `gl` commands must remain valid throughout execution.
     pub unsafe fn new(gl: Arc<glow::Context>) -> Result<Self, Box<dyn std::error::Error>> {
         let sdf_shader = SdfRectShader::new(gl.clone())?;
         let atlas = GlyphAtlas::new(gl.clone())?;
@@ -101,6 +109,8 @@ impl GlesRenderer {
         gl.bind_vertex_array(None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
+        let text_buffer = Buffer::new_empty(Metrics::new(14.0, 18.0));
+
         Ok(Self {
             gl,
             sdf_shader,
@@ -113,6 +123,8 @@ impl GlesRenderer {
             loc_text_resolution,
             loc_text_atlas,
             loc_text_color,
+            glyph_scratch: Vec::with_capacity(512),
+            text_buffer,
             inspect_mode: false,
             frame_counter: 0,
             last_fps_instant: std::time::Instant::now(),
@@ -121,6 +133,7 @@ impl GlesRenderer {
     }
 
     /// Renders the computed layout boxes directly onto the bound EGL surface framebuffer.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_boxes(
         &mut self,
         boxes: &[ComputedBox],
@@ -154,9 +167,12 @@ impl GlesRenderer {
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
             if let Some(rect) = damage_rect {
-                let (sx, sy, sw, sh) = rect.to_gl_scissor(height as i32);
-                self.gl.enable(glow::SCISSOR_TEST);
-                self.gl.scissor(sx, sy, sw, sh);
+                if let Some((sx, sy, sw, sh)) = rect.to_gl_scissor_valid(width as i32, height as i32) {
+                    self.gl.enable(glow::SCISSOR_TEST);
+                    self.gl.scissor(sx, sy, sw, sh);
+                } else {
+                    self.gl.disable(glow::SCISSOR_TEST);
+                }
             } else {
                 self.gl.disable(glow::SCISSOR_TEST);
             }
@@ -171,6 +187,11 @@ impl GlesRenderer {
             for (i, b) in boxes.iter().enumerate() {
                 if b.width <= 0.0 || b.height <= 0.0 {
                     continue;
+                }
+                if let Some([cx, cy, cw, ch]) = b.clip_rect {
+                    if b.y + b.height <= cy || b.y >= cy + ch || b.x + b.width <= cx || b.x >= cx + cw {
+                        continue;
+                    }
                 }
                 if i > 0 && b.y >= root_max_y - 2.0 {
                     continue;
@@ -204,6 +225,14 @@ impl GlesRenderer {
                 });
 
                 let pad = shadow_spec.map(|(_, _, blur)| blur * 2.5).unwrap_or(2.0);
+                if let Some(rect) = damage_rect {
+                    if !rect.intersects_box_with_padding(b, pad) {
+                        continue;
+                    }
+                }
+                if box_x + box_w <= 0.0 || box_x >= width as f32 || box_y + box_h <= 0.0 || box_y >= height as f32 {
+                    continue;
+                }
                 let (ox, oy) = shadow_spec.map(|(_, off, _)| off).unwrap_or((0.0, 0.0));
                 let quad_rect = (
                     box_x + ox.min(0.0) - pad,
@@ -233,17 +262,24 @@ impl GlesRenderer {
                     )
                 };
 
-                self.sdf_shader.draw(
-                    res,
-                    quad_rect,
-                    (box_x, box_y, box_w, box_h),
-                    b.border_radius,
-                    bg,
-                    border,
-                    border_width,
-                    shadow_spec,
-                    alpha_factor,
-                );
+                let has_visible_geometry = b.background_color.a > 0
+                    || (border.3 > 0.0 && border_width > 0.0)
+                    || shadow_spec.is_some()
+                    || self.inspect_mode;
+
+                if has_visible_geometry {
+                    self.sdf_shader.draw(
+                        res,
+                        quad_rect,
+                        (box_x, box_y, box_w, box_h),
+                        b.border_radius,
+                        bg,
+                        border,
+                        border_width,
+                        shadow_spec,
+                        alpha_factor,
+                    );
+                }
 
                 // Focus outline for active TextInput
                 if let Some(ref input) = b.text_input {
@@ -387,6 +423,16 @@ impl GlesRenderer {
                     if i > 0 && b.y >= root_max_y - 2.0 {
                         continue;
                     }
+                    if let Some(rect) = damage_rect {
+                        if !rect.intersects_box_with_padding(b, 2.0) {
+                            continue;
+                        }
+                    }
+                    if let Some([cx, cy, cw, ch]) = b.clip_rect {
+                        if b.y + b.height <= cy || b.y >= cy + ch || b.x + b.width <= cx || b.x >= cx + cw {
+                            continue;
+                        }
+                    }
                     let cx = b.x + b.width * 0.5;
                     let cy = b.y;
                     let box_w = b.width * scale_x;
@@ -417,12 +463,23 @@ impl GlesRenderer {
                             b.y + b.height + 8.0
                         };
 
+                        let pad = 20.0f32;
+                        if let Some(rect) = damage_rect {
+                            if !rect.intersects_rect(
+                                (tip_x - pad) as i32,
+                                (tip_y - pad) as i32,
+                                (tip_w + pad * 2.0) as i32,
+                                (tip_h + pad * 2.0) as i32,
+                            ) {
+                                continue;
+                            }
+                        }
+
                         let shadow_spec = Some((
                             (0.0f32, 0.0f32, 0.0f32, 0.75f32),
                             (0.0f32, 3.0f32),
                             8.0f32,
                         ));
-                        let pad = 20.0f32;
                         let quad_rect = (
                             tip_x - pad,
                             tip_y - pad,
@@ -455,6 +512,11 @@ impl GlesRenderer {
                     if i > 0 && b.y >= root_max_y - 2.0 {
                         continue;
                     }
+                    if let Some(rect) = damage_rect {
+                        if !rect.intersects_box_with_padding(b, 2.0) {
+                            continue;
+                        }
+                    }
                     let cx = b.x + b.width * 0.5;
                     let cy = b.y;
                     let box_w = b.width * scale_x;
@@ -479,6 +541,16 @@ impl GlesRenderer {
                 if b.y >= root_max_y - 2.0 {
                     continue;
                 }
+                if let Some(rect) = damage_rect {
+                    if !rect.intersects_box_with_padding(b, 4.0) {
+                        continue;
+                    }
+                }
+                if let Some([cx, cy, cw, ch]) = b.clip_rect {
+                    if b.y + b.height <= cy || b.y >= cy + ch || b.x + b.width <= cx || b.x >= cx + cw {
+                        continue;
+                    }
+                }
 
                 let text_to_draw: Option<(std::borrow::Cow<'_, str>, zenith_layout::Color, f32)> = if let Some((ref text, color, font_size)) = b.text {
                     Some((std::borrow::Cow::Borrowed(text.as_str()), color, font_size))
@@ -496,16 +568,16 @@ impl GlesRenderer {
                 if let Some((text, color, font_size)) = text_to_draw {
                     let line_height = font_size * 1.3;
                     let metrics = Metrics::new(font_size, line_height);
-                    let mut buffer = Buffer::new(font_system, metrics);
+                    self.text_buffer.set_metrics(metrics);
                     let is_complex = text.chars().any(|c| c as u32 > 0x0600);
                     let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
-                    buffer.set_text(
+                    self.text_buffer.set_text(
                         &text,
                         &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
                         shaping,
                         None,
                     );
-                    buffer.shape_until_scroll(font_system, false);
+                    self.text_buffer.shape_until_scroll(font_system, false);
 
                     let cx = b.x + b.width * 0.5;
                     let cy = b.y;
@@ -517,9 +589,9 @@ impl GlesRenderer {
                     let text_offset_y = ((box_h - line_height) / 2.0).max(0.0);
                     let base_y = box_y + text_offset_y;
 
-                    let mut glyph_vertices: Vec<f32> = Vec::with_capacity(buffer.lines.len() * 32 * 24);
+                    self.glyph_scratch.clear();
 
-                    for run in buffer.layout_runs() {
+                    for run in self.text_buffer.layout_runs() {
                         for glyph in run.glyphs {
                             let physical = glyph.physical((box_x, base_y + run.line_top), 1.0);
                             if let Some(cached) = self.atlas.get_or_insert(font_system, swash_cache, physical.cache_key) {
@@ -531,7 +603,7 @@ impl GlesRenderer {
                                 let gx1 = gx + gw;
                                 let gy1 = gy + gh;
 
-                                glyph_vertices.extend_from_slice(&[
+                                self.glyph_scratch.extend_from_slice(&[
                                     gx,  gy,  cached.u0, cached.v0,
                                     gx1, gy,  cached.u1, cached.v0,
                                     gx,  gy1, cached.u0, cached.v1,
@@ -544,7 +616,7 @@ impl GlesRenderer {
                         }
                     }
 
-                    if !glyph_vertices.is_empty() {
+                    if !self.glyph_scratch.is_empty() {
                         self.gl.use_program(Some(self.text_program));
                         self.gl.bind_vertex_array(Some(self.text_vao));
 
@@ -563,12 +635,12 @@ impl GlesRenderer {
 
                         self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.text_vbo));
                         let slice = std::slice::from_raw_parts(
-                            glyph_vertices.as_ptr() as *const u8,
-                            glyph_vertices.len() * std::mem::size_of::<f32>(),
+                            self.glyph_scratch.as_ptr() as *const u8,
+                            self.glyph_scratch.len() * std::mem::size_of::<f32>(),
                         );
                         self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, slice, glow::DYNAMIC_DRAW);
 
-                        let vertex_count = (glyph_vertices.len() / 4) as i32;
+                        let vertex_count = (self.glyph_scratch.len() / 4) as i32;
                         self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
 
                         self.gl.bind_texture(glow::TEXTURE_2D, None);
@@ -621,24 +693,36 @@ impl GlesRenderer {
                             b.y + b.height + 8.0
                         };
 
+                        let pad = 20.0f32;
+                        if let Some(rect) = damage_rect {
+                            if !rect.intersects_rect(
+                                (tip_x - pad) as i32,
+                                (tip_y - pad) as i32,
+                                (tip_w + pad * 2.0) as i32,
+                                (tip_h + pad * 2.0) as i32,
+                            ) {
+                                continue;
+                            }
+                        }
+
                         let line_height = font_sz * 1.3;
                         let metrics = Metrics::new(font_sz, line_height);
-                        let mut buffer = Buffer::new(font_system, metrics);
-                        buffer.set_text(
+                        self.text_buffer.set_metrics(metrics);
+                        self.text_buffer.set_text(
                             tip_text,
                             &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
                             Shaping::Basic,
                             None,
                         );
-                        buffer.shape_until_scroll(font_system, false);
+                        self.text_buffer.shape_until_scroll(font_system, false);
 
                         let text_offset_y = ((tip_h - line_height) / 2.0).max(0.0);
                         let base_y = tip_y + text_offset_y;
                         let base_x = tip_x + 10.0;
 
-                        let mut glyph_vertices: Vec<f32> = Vec::with_capacity(buffer.lines.len() * 32 * 24);
+                        self.glyph_scratch.clear();
 
-                        for run in buffer.layout_runs() {
+                        for run in self.text_buffer.layout_runs() {
                             for glyph in run.glyphs {
                                 let physical = glyph.physical((base_x, base_y + run.line_top), 1.0);
                                 if let Some(cached) = self.atlas.get_or_insert(font_system, swash_cache, physical.cache_key) {
@@ -650,7 +734,7 @@ impl GlesRenderer {
                                     let gx1 = gx + gw;
                                     let gy1 = gy + gh;
 
-                                    glyph_vertices.extend_from_slice(&[
+                                    self.glyph_scratch.extend_from_slice(&[
                                         gx,  gy,  cached.u0, cached.v0,
                                         gx1, gy,  cached.u1, cached.v0,
                                         gx,  gy1, cached.u0, cached.v1,
@@ -663,7 +747,7 @@ impl GlesRenderer {
                             }
                         }
 
-                        if !glyph_vertices.is_empty() {
+                        if !self.glyph_scratch.is_empty() {
                             self.gl.use_program(Some(self.text_program));
                             self.gl.bind_vertex_array(Some(self.text_vao));
 
@@ -679,12 +763,12 @@ impl GlesRenderer {
 
                             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.text_vbo));
                             let slice = std::slice::from_raw_parts(
-                                glyph_vertices.as_ptr() as *const u8,
-                                glyph_vertices.len() * std::mem::size_of::<f32>(),
+                                self.glyph_scratch.as_ptr() as *const u8,
+                                self.glyph_scratch.len() * std::mem::size_of::<f32>(),
                             );
                             self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, slice, glow::DYNAMIC_DRAW);
 
-                            let vertex_count = (glyph_vertices.len() / 4) as i32;
+                            let vertex_count = (self.glyph_scratch.len() / 4) as i32;
                             self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
 
                             self.gl.bind_texture(glow::TEXTURE_2D, None);

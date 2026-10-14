@@ -101,7 +101,7 @@ impl ClipboardManager {
 
     /// Handles a paste request from an external Wayland client writing into pipe.
     pub fn handle_send_request(&self, mime: &str, mut pipe: WritePipe) {
-        if TEXT_MIME_TYPES.iter().any(|m| *m == mime) {
+        if TEXT_MIME_TYPES.contains(&mime) {
             use std::io::Write;
             if let Ok(lock) = self.ram_buffer.lock() {
                 let _ = pipe.write_all(lock.as_bytes());

@@ -1,164 +1,162 @@
 --!strict
 -- Zenith-Shell (Engine v2) - Declarative Top Bar Configuration
--- Floating glassmorphic desktop bar with 1:1 Quickshell parities & Matugen/Stylix theming
+-- 1:1 Parity with Quickshell Bar.qml & RightBarModules.qml Layout and Organization
 
-local theme = Zenith.Theme()
+local UIKit = Zenith.import("ui_kit")
+local theme = UIKit.Theme.get()
+local Widgets = UIKit.Widgets
 
--- Import reusable UI kit components
-local Launcher = Zenith.import("widgets/launcher")
-local Workspaces = Zenith.import("widgets/workspaces")
-local Clock = Zenith.import("widgets/clock")
-local Hardware = Zenith.import("widgets/hardware")
-local Cava = Zenith.import("widgets/cava")
-local QuickStatus = Zenith.import("widgets/quick_status")
-local Media = Zenith.import("widgets/media")
-local Tray = Zenith.import("widgets/tray")
+-- ── 1. Left Section Modules ──
+local Launcher = Widgets.Launcher
+local Workspaces = Widgets.Workspaces
+local Overview = Widgets.Overview
+local FocusedApp = Widgets.FocusedApp
+
+-- ── 2. Center Section Modules ──
+local Media = Widgets.Media
+local Notifications = Widgets.Notifications
+local Clock = Widgets.Clock
+local Pomodoro = Widgets.Pomodoro
+local Weather = Widgets.Weather
+local UtilityHub = Widgets.UtilityHub
+local SettingsHub = Widgets.SettingsHub
+
+-- ── 3. Right Section Modules ──
+local Privacy = Widgets.Privacy
+local KdeConnect = Widgets.KdeConnect
+local Tray = Widgets.Tray
+local USBStatus = Widgets.Usb
+local Clipboard = Widgets.Clipboard
+local Hardware = Widgets.Hardware
+local Cava = Widgets.Cava
+local Network = Widgets.Network
+local Audio = Widgets.Audio
+local Battery = Widgets.Battery
+local KeyboardLayout = Widgets.Keyboard
+local Tweaks = Widgets.Tweaks
+local Session = Widgets.Session
 
 local screen = Zenith.Services.Screen and Zenith.Services.Screen() or { width = 1366, height = 768 }
 local screen_w = screen.width or 1366
-
 local is_compact = screen_w < 1440
-local is_narrow = screen_w < 1200
-local max_title_len = if is_narrow then 10 elseif is_compact then 18 elseif screen_w < 1920 then 28 else 40
+local is_tight = screen_w < 1280
+local is_very_tight = screen_w < 1024
 
-local active_win = Zenith.Services.ActiveWindow()
-
-local function resolve_app_icon(class: string?): string
-    local s = string.lower(class or "")
-    if s:find("terminal") or s:find("foot") or s:find("kitty") or s:find("alacritty") or s:find("ghostty") or s:find("wezterm") then
-        return ""
-    elseif s:find("firefox") or s:find("chrome") or s:find("brave") or s:find("zen") or s:find("chromium") or s:find("browser") then
-        return "󰈹"
-    elseif s:find("code") or s:find("vscodium") or s:find("cursor") or s:find("zed") or s:find("nvim") or s:find("editor") then
-        return "󰨞"
-    elseif s:find("thunar") or s:find("nautilus") or s:find("dolphin") or s:find("pcmanfm") or s:find("files") then
-        return "󰉋"
-    elseif s:find("discord") or s:find("vesktop") or s:find("telegram") or s:find("slack") or s:find("chat") then
-        return "󰭹"
-    elseif s:find("spotify") or s:find("ncspot") or s:find("music") then
-        return "󰎆"
-    elseif s:find("obs") or s:find("mpv") or s:find("vlc") or s:find("video") then
-        return "󰕼"
-    elseif s:find("steam") or s:find("lutris") or s:find("heroic") or s:find("game") then
-        return ""
-    elseif s:find("gimp") or s:find("inkscape") or s:find("blender") then
-        return "󰽉"
-    elseif s:find("settings") or s:find("control") or s:find("pavucontrol") then
-        return "󰒓"
-    else
-        return ""
-    end
+local function Separator()
+    return Zenith.Box({
+        width = 1,
+        height = 14,
+        background = Zenith.hex(theme.outline_variant or theme.outline, 45),
+        margin = { x = 2, y = 0 },
+        children = {},
+    })
 end
 
-local app_glyph = "󰘔"
-local win_text = "Zenith Shell"
-if active_win and active_win.class and #active_win.class > 0 then
-    app_glyph = resolve_app_icon(active_win.class)
-    local raw_title = active_win.title or active_win.class
-    if #raw_title > max_title_len then
-        win_text = string.sub(raw_title, 1, math.max(max_title_len - 2, 4)) .. ".."
-    else
-        win_text = raw_title
-    end
-end
-
--- 1. LEFT CLUSTER: Launcher (NixOS ) + Dynamic Hyprland Workspaces
+-- ═════════════════════════════════════════════════════════════════
+-- 1. LEFT CLUSTER: Launcher -> Workspaces -> Overview -> FocusedApp
+-- ═════════════════════════════════════════════════════════════════
 local left_cluster_children = {
     Launcher({ text = "" }),
     Workspaces(),
+    Overview(),
+    FocusedApp({ reactive = true }),
 }
 
--- 2. CENTER CLUSTER: Focused App Chip + MPRIS2 Media
+-- ═════════════════════════════════════════════════════════════════
+-- 2. CENTER CLUSTER: Media -> Notifications -> Clock -> Pomodoro -> Weather -> UtilityHub
+-- ═════════════════════════════════════════════════════════════════
 local center_cluster_children = {
-    Zenith.Box({
-        direction = "row",
-        align_items = "center",
-        height = 26,
-        gap = 5,
-        padding = { x = if is_compact then 8 else 10, y = 2 },
-        border_radius = 13,
-        background = Zenith.hex(theme.surface_container, 130),
-        border_color = Zenith.hex(theme.outline_variant or theme.outline, 45),
-        border_width = 1,
-        tooltip = if active_win and active_win.title and #active_win.title > 0 then (active_win.class .. " • " .. active_win.title) else "Janela Ativa",
-        on_click = "cmd:hyprctl dispatch focuswindow current &",
-        children = {
-            Zenith.Text({
-                text = app_glyph,
-                font_size = 12,
-                color = Zenith.hex(theme.primary),
-            }),
-            Zenith.Text({
-                text = win_text,
-                font_size = 11,
-                color = Zenith.hex(theme.on_surface),
-            }),
-        }
-    }),
     Media(),
+    Notifications(),
+    Clock({ reactive = true }),
 }
 
--- 3. RIGHT CLUSTER: Snipping/REC + Hardware (CPU/RAM/Disk) + CAVA + Tray + QuickStatus + Clock
-local right_cluster_children = {
-    Zenith.Box({
-        direction = "row",
-        align_items = "center",
-        justify_content = "center",
-        height = 26,
-        padding = { x = 7, y = 2 },
-        border_radius = 13,
-        background = Zenith.hex(theme.surface_container, 130),
-        border_color = Zenith.hex(theme.outline_variant or theme.outline, 45),
-        border_width = 1,
-        tooltip = "Captura de Tela (Região)",
-        on_click = "screenshot:area",
-        children = {
-            Zenith.Text({
-                text = "󰄀",
-                font_size = 12,
-                color = Zenith.hex(theme.on_surface),
-            }),
-        }
-    }),
-}
-
-if Zenith.Services.IsRecording() then
-    table.insert(right_cluster_children, Zenith.Box({
-        direction = "row",
-        align_items = "center",
-        height = 26,
-        padding = { x = if is_compact then 7 else 9, y = 2 },
-        border_radius = 13,
-        background = Zenith.hex(theme.error or "#f38ba8", 50),
-        border_color = Zenith.hex(theme.error or "#f38ba8", 120),
-        border_width = 1,
-        tooltip = "Gravando Tela • Clique para Interromper",
-        on_click = "record:toggle",
-        children = {
-            Zenith.Text({
-                text = "● REC",
-                font_size = 11,
-                color = Zenith.hex("#ffffff"),
-            }),
-        }
-    }))
+if not is_compact then
+    table.insert(center_cluster_children, Pomodoro())
 end
 
-table.insert(right_cluster_children, Hardware())
+if not is_tight then
+    table.insert(center_cluster_children, Weather())
+    table.insert(center_cluster_children, UtilityHub())
+    table.insert(center_cluster_children, SettingsHub())
+end
 
-local cava_widget = Cava({ bar_count = 8 })
-if cava_widget then
-    table.insert(right_cluster_children, cava_widget)
+-- ═════════════════════════════════════════════════════════════════
+-- 3. RIGHT CLUSTER: Privacy -> SystemCluster -> StatusCluster -> ActionCluster
+-- ═════════════════════════════════════════════════════════════════
+local right_cluster_children = {}
+
+-- Privacy Indicator (Mic, Camera, REC)
+table.insert(right_cluster_children, Privacy())
+
+-- System Cluster (KDE Connect, Tray, USB, Clipboard, Hardware, CAVA)
+local system_cluster_children = {}
+if not is_compact then
+    table.insert(system_cluster_children, KdeConnect())
 end
 
 local tray_widget = Tray()
 if tray_widget then
-    table.insert(right_cluster_children, tray_widget)
+    table.insert(system_cluster_children, tray_widget)
 end
 
-table.insert(right_cluster_children, QuickStatus())
-table.insert(right_cluster_children, Clock())
+if not is_compact then
+    table.insert(system_cluster_children, USBStatus())
+end
 
+if #system_cluster_children > 0 then
+    table.insert(system_cluster_children, Separator())
+end
+
+table.insert(system_cluster_children, Clipboard())
+table.insert(system_cluster_children, Hardware({ reactive = true }))
+
+if not is_tight then
+    local cava_widget = Cava({ bar_count = 6 })
+    if cava_widget then
+        table.insert(system_cluster_children, cava_widget)
+    end
+end
+
+table.insert(right_cluster_children, Zenith.Box({
+    direction = "row",
+    align_items = "center",
+    gap = 4,
+    children = system_cluster_children,
+}))
+
+-- Status Cluster (Network, Audio, Battery, Keyboard Layout)
+local status_cluster_children = {
+    Network(),
+    Audio(),
+    Battery(),
+}
+
+if not is_tight then
+    table.insert(status_cluster_children, KeyboardLayout())
+end
+
+table.insert(right_cluster_children, Zenith.Box({
+    direction = "row",
+    align_items = "center",
+    gap = 4,
+    children = status_cluster_children,
+}))
+
+-- Action Cluster (Tweaks & Session)
+table.insert(right_cluster_children, Zenith.Box({
+    direction = "row",
+    align_items = "center",
+    gap = 4,
+    children = {
+        Tweaks(),
+        Session(),
+    },
+}))
+
+-- ═════════════════════════════════════════════════════════════════
+-- ROOT BAR CONTAINER (Floating Glassmorphic Pill)
+-- ═════════════════════════════════════════════════════════════════
 return Zenith.Box({
     direction = "row",
     height = 42,
@@ -184,7 +182,7 @@ return Zenith.Box({
                 offset_y = 4,
             },
             children = {
-                -- 1. LEFT CLUSTER: Launcher + Dynamic Workspaces
+                -- 1. LEFT CLUSTER: Launcher + Workspaces + Overview + FocusedApp
                 Zenith.Box({
                     direction = "row",
                     align_items = "center",
@@ -192,10 +190,10 @@ return Zenith.Box({
                     children = left_cluster_children,
                 }),
 
-                -- Spacer
+                -- Left Spacer
                 Zenith.Box({ flex_grow = 1 }),
 
-                -- 2. CENTER CLUSTER: Focused App Chip + MPRIS2 Media
+                -- 2. CENTER CLUSTER: Media + Notifications + Clock + Pomodoro + Weather + UtilityHub
                 Zenith.Box({
                     direction = "row",
                     align_items = "center",
@@ -203,10 +201,10 @@ return Zenith.Box({
                     children = center_cluster_children,
                 }),
 
-                -- Spacer
+                -- Right Spacer
                 Zenith.Box({ flex_grow = 1 }),
 
-                -- 3. RIGHT CLUSTER: Snipping + Telemetry (Hardware, CAVA, Tray) + Quick Status + Clock
+                -- 3. RIGHT CLUSTER: Privacy + System + Status + Action
                 Zenith.Box({
                     direction = "row",
                     align_items = "center",

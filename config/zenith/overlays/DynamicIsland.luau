@@ -75,7 +75,7 @@ elseif media.is_available and media.status == "Playing" then
                 direction = "row",
                 align_items = "center",
                 gap = 8,
-                on_click = "cmd:zenith toggle MediaPopup &",
+                on_click = "popup:toggle:MediaPopup",
                 children = {
                     Zenith.Text({
                         text = "󰎆",
@@ -152,7 +152,7 @@ else
         align_items = "center",
         justify_content = "space-between",
         flex_grow = 1,
-        on_click = "cmd:zenith toggle Launcher &",
+        on_click = "popup:toggle:Launcher",
         children = {
             Zenith.Box({
                 direction = "row",

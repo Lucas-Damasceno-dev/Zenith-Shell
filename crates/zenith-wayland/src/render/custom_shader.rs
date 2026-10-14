@@ -36,6 +36,12 @@ pub struct CustomShaderPipeline {
 }
 
 impl CustomShaderPipeline {
+    /// Creates a new custom shader pipeline and allocates quad VAO/VBO.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `gl` is current on the calling thread.
+    /// - `gl` commands must be valid to execute on the calling thread.
     pub unsafe fn new(gl: Arc<glow::Context>) -> Result<Self, Box<dyn std::error::Error>> {
         let vao = gl.create_vertex_array()?;
         let vbo = gl.create_buffer()?;
@@ -60,6 +66,12 @@ impl CustomShaderPipeline {
     }
 
     /// Render a custom GLSL fragment shader over the given bounding quad.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `self.gl` is current on the calling thread.
+    /// - `self.vao`, `self.vbo`, and compiled programs must belong to the current context.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn render(
         &mut self,
         shader: &CustomShaderStyle,
@@ -161,6 +173,18 @@ out vec4 frag_color;
             )
         };
 
+        // Bound cache size to prevent leak across dynamic scripts (VmRSS ceiling < 15MB)
+        if self.program_cache.len() >= 64 {
+            if let Some((first_key, _)) = self.program_cache.iter().next().map(|(k, &p)| (k.clone(), p)) {
+                if let Some(old_prog) = self.program_cache.remove(&first_key) {
+                    self.gl.delete_program(old_prog);
+                }
+            }
+        }
+        if self.failed_shaders.len() >= 64 {
+            self.failed_shaders.clear();
+        }
+
         match self.compile_program(SHADER_QUAD_VS, &full_fs) {
             Ok(prog) => {
                 self.program_cache.insert(fragment_source.to_string(), prog);
@@ -230,7 +254,7 @@ fn bytemuck_cast_slice(floats: &[f32]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
             floats.as_ptr() as *const u8,
-            floats.len() * std::mem::size_of::<f32>(),
+            std::mem::size_of_val(floats),
         )
     }
 }

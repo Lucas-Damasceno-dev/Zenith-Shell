@@ -36,7 +36,6 @@ impl PowerProfileService {
 
         let profile = Self::read_dbus_power_profile()
             .or_else(Self::read_platform_profile)
-            .or_else(Self::read_powerprofilesctl)
             .unwrap_or_else(|| "balanced".to_string());
 
         if let Ok(mut guard) = lock.write() {
@@ -72,11 +71,8 @@ impl PowerProfileService {
             };
 
             if !sent_native {
-                let _ = std::process::Command::new("powerprofilesctl")
-                    .args(["set", &prof_str])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                // Direct kernel sysfs write (zero-subprocess)
+                let _ = fs::write("/sys/firmware/acpi/platform_profile", &prof_str);
             }
             Self::invalidate_cache();
         });
@@ -113,21 +109,95 @@ impl PowerProfileService {
         None
     }
 
-    fn read_powerprofilesctl() -> Option<String> {
-        let output = std::process::Command::new("powerprofilesctl")
-            .args(["get"])
-            .output()
-            .ok()?;
-
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
+    /// Suspend system via logind / systemd D-Bus or kernel /sys/power/state.
+    pub fn suspend() {
+        std::thread::spawn(|| {
+            if let Ok(conn) = zbus::blocking::Connection::system() {
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "org.freedesktop.login1",
+                    "/org/freedesktop/login1",
+                    "org.freedesktop.login1.Manager",
+                ) {
+                    if proxy.call_method("Suspend", &(true,)).is_ok() {
+                        return;
+                    }
+                }
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                ) {
+                    if proxy.call_method("StartUnit", &("suspend.target", "replace")).is_ok() {
+                        return;
+                    }
+                }
             }
-        }
-        None
+            let _ = fs::write("/sys/power/state", "mem");
+        });
+    }
+
+    /// Reboot system via logind / systemd D-Bus or kernel sysrq.
+    pub fn reboot() {
+        std::thread::spawn(|| {
+            if let Ok(conn) = zbus::blocking::Connection::system() {
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "org.freedesktop.login1",
+                    "/org/freedesktop/login1",
+                    "org.freedesktop.login1.Manager",
+                ) {
+                    if proxy.call_method("Reboot", &(true,)).is_ok() {
+                        return;
+                    }
+                }
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                ) {
+                    if proxy.call_method("StartUnit", &("reboot.target", "replace")).is_ok() {
+                        return;
+                    }
+                }
+            }
+            let _ = fs::write("/proc/sysrq-trigger", "b");
+        });
+    }
+
+    /// Power off system via logind / systemd D-Bus or kernel sysrq.
+    pub fn poweroff() {
+        std::thread::spawn(|| {
+            if let Ok(conn) = zbus::blocking::Connection::system() {
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "org.freedesktop.login1",
+                    "/org/freedesktop/login1",
+                    "org.freedesktop.login1.Manager",
+                ) {
+                    if proxy.call_method("PowerOff", &(true,)).is_ok() {
+                        return;
+                    }
+                }
+                if let Ok(proxy) = zbus::blocking::Proxy::new(
+                    &conn,
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                ) {
+                    if proxy.call_method("StartUnit", &("poweroff.target", "replace")).is_ok() {
+                        return;
+                    }
+                }
+            }
+            let _ = fs::write("/proc/sysrq-trigger", "o");
+        });
     }
 }
+
+pub type PowerService = PowerProfileService;
 
 #[cfg(test)]
 mod tests {

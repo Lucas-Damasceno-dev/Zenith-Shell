@@ -5,6 +5,10 @@ edition = "2021"
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "zenith_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zenith"
 path = "src/main.rs"

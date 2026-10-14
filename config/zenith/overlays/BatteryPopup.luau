@@ -3,8 +3,14 @@
 -- 1:1 Parity with Quickshell BatteryPopup (Battery Stats, Health & Power Profiles)
 
 local theme = Zenith.Theme()
+local Store = Zenith.import("settings_store")
 local battery = Zenith.Services.battery()
-local power_profile = (Zenith.Services.PowerProfile and Zenith.Services.PowerProfile()) or "balanced"
+local power_profile = (Zenith.Services.PowerProfile and Zenith.Services.PowerProfile()) or Store.get("batteryPowerProfile") or "balanced"
+
+local caffeine_active = Store.get("batteryCaffeineActive") or false
+local limit_active = Store.get("batteryLimitActive") or false
+local brightness_val = (Zenith.Services.Brightness and Zenith.Services.Brightness().percent) or Store.get("brightness") or 100
+local night_light_val = Store.get("nightLightTemp") or 4000
 
 local bat_pct = 100
 local is_charging = false
@@ -61,7 +67,7 @@ local function ProfileButton(props: {
         border_color = border,
         border_width = 1,
         tooltip = "Definir modo " .. props.name,
-        on_click = "cmd:powerprofilesctl set " .. props.profile_key .. " &",
+        on_click = "power:profile:" .. props.profile_key,
         children = {
             Zenith.Text({
                 text = props.icon,
@@ -85,8 +91,8 @@ end
 
 return Zenith.Window({
     direction = "column",
-    width = 340,
-    height = 360,
+    width = 360,
+    height = 540,
     padding = { x = 16, y = 14 },
     gap = 12,
     background = Zenith.hex(theme.surface, 235),
@@ -203,11 +209,11 @@ return Zenith.Window({
             }
         }),
 
-        -- Profile Buttons: Power Saver, Balanced
+        -- Profile Buttons: Power Saver, Balanced, Performance
         Zenith.Box({
             direction = "row",
             align_items = "center",
-            gap = 8,
+            gap = 6,
             children = {
                 ProfileButton({
                     id = "btn_power_saver",
@@ -221,6 +227,172 @@ return Zenith.Window({
                     icon = "󰓅",
                     profile_key = "balanced",
                 }),
+                ProfileButton({
+                    id = "btn_performance",
+                    name = "Desempenho",
+                    icon = "󰓅",
+                    profile_key = "performance",
+                }),
+            }
+        }),
+
+        -- Screen Filters & Telemetry Section Header
+        Zenith.Box({
+            direction = "row",
+            align_items = "center",
+            children = {
+                Zenith.Text({
+                    text = "CONTROLES DE TELA & BRILHO",
+                    font_size = 10,
+                    font_weight = "bold",
+                    color = Zenith.hex(theme.outline),
+                }),
+            }
+        }),
+
+        -- Brightness Slider Row
+        Zenith.Box({
+            direction = "column",
+            gap = 4,
+            padding = { x = 12, y = 8 },
+            border_radius = 10,
+            background = Zenith.hex(theme.surface_container, 80),
+            border_color = Zenith.hex(theme.outline, 30),
+            border_width = 1,
+            children = {
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    justify_content = "space-between",
+                    children = {
+                        Zenith.Text({
+                            text = "󰃠 Brilho da Tela",
+                            font_size = 11,
+                            color = Zenith.hex(theme.on_surface),
+                        }),
+                        Zenith.Text({
+                            text = string.format("%d%%", math.floor(brightness_val)),
+                            font_size = 10,
+                            font_weight = "bold",
+                            color = Zenith.hex(theme.primary),
+                        }),
+                    }
+                }),
+                Zenith.Slider({
+                    id = "battery_brightness_slider",
+                    min = 5,
+                    max = 100,
+                    value = brightness_val,
+                    track_height = 6,
+                    thumb_radius = 6,
+                    track_color = Zenith.rgba(255, 255, 255, 25),
+                    active_track_color = Zenith.hex(theme.primary),
+                    thumb_color = Zenith.hex("#ffffff"),
+                    on_change = "storage:set:brightness",
+                }),
+            }
+        }),
+
+        -- Interactive Switches: Caffeine & Charge Limit 80%
+        Zenith.Box({
+            direction = "column",
+            gap = 6,
+            children = {
+                -- Caffeine (Inibir suspensão / idle)
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    justify_content = "space-between",
+                    padding = { x = 12, y = 8 },
+                    border_radius = 10,
+                    background = Zenith.hex(theme.surface_container, 80),
+                    border_color = Zenith.hex(theme.outline, 30),
+                    border_width = 1,
+                    children = {
+                        Zenith.Box({
+                            direction = "row",
+                            align_items = "center",
+                            gap = 8,
+                            children = {
+                                Zenith.Text({
+                                    text = "󰅶",
+                                    font_size = 14,
+                                    color = caffeine_active and Zenith.hex(theme.primary) or Zenith.hex(theme.outline),
+                                }),
+                                Zenith.Box({
+                                    direction = "column",
+                                    gap = 2,
+                                    children = {
+                                        Zenith.Text({
+                                            text = "Modo Cafeína (Inibir Espera)",
+                                            font_size = 11,
+                                            color = Zenith.hex(theme.on_surface),
+                                        }),
+                                        Zenith.Text({
+                                            text = "Impede que o sistema entre em suspensão",
+                                            font_size = 9,
+                                            color = Zenith.hex(theme.outline),
+                                        }),
+                                    }
+                                }),
+                            }
+                        }),
+                        Zenith.Switch({
+                            id = "switch_caffeine",
+                            checked = caffeine_active,
+                            active_color = theme.primary,
+                            on_toggle = "storage:toggle:batteryCaffeineActive",
+                        }),
+                    }
+                }),
+
+                -- Battery Charge Limit 80%
+                Zenith.Box({
+                    direction = "row",
+                    align_items = "center",
+                    justify_content = "space-between",
+                    padding = { x = 12, y = 8 },
+                    border_radius = 10,
+                    background = Zenith.hex(theme.surface_container, 80),
+                    border_color = Zenith.hex(theme.outline, 30),
+                    border_width = 1,
+                    children = {
+                        Zenith.Box({
+                            direction = "row",
+                            align_items = "center",
+                            gap = 8,
+                            children = {
+                                Zenith.Text({
+                                    text = "󰂄",
+                                    font_size = 14,
+                                    color = limit_active and Zenith.hex(theme.primary) or Zenith.hex(theme.outline),
+                                }),
+                                Zenith.Box({
+                                    direction = "column",
+                                    gap = 2,
+                                    children = {
+                                        Zenith.Text({
+                                            text = "Limite de Carga (80%)",
+                                            font_size = 11,
+                                            color = Zenith.hex(theme.on_surface),
+                                        }),
+                                        Zenith.Text({
+                                            text = "Prolonga a vida útil e saúde da bateria",
+                                            font_size = 9,
+                                            color = Zenith.hex(theme.outline),
+                                        }),
+                                    }
+                                }),
+                            }
+                        }),
+                        Zenith.Switch({
+                            id = "switch_charge_limit",
+                            checked = limit_active,
+                            active_color = theme.primary,
+                            on_toggle = "storage:toggle:batteryLimitActive",
+                        }),
+                    }
+                }),
             }
         }),
 
@@ -233,7 +405,7 @@ return Zenith.Window({
             background = Zenith.hex(theme.surface_container, 100),
             border_color = Zenith.hex(theme.outline_variant or theme.outline, 35),
             border_width = 1,
-            on_click = "cmd:systemctl suspend &",
+            on_click = "system:suspend",
             children = {
                 Zenith.Text({
                     text = "󰒲",

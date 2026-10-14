@@ -83,7 +83,7 @@ RowLayout {
 
     // Hex input
     SettingsTextField {
-        preferredWidth: 90
+        preferredWidth: 115
         text: root.selectedColor
         onEditingFinished: newHex => {
             if (newHex.indexOf("#") === 0 && (newHex.length === 7 || newHex.length === 9)) {

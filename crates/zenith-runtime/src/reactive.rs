@@ -53,6 +53,12 @@ pub struct ReactiveGraph {
     signal_values: RwLock<HashMap<SignalId, String>>,
 }
 
+impl Default for ReactiveGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReactiveGraph {
     pub fn new() -> Self {
         Self {
@@ -202,13 +208,12 @@ impl ReactiveGraph {
 
     fn update_node_at_path(node: &mut UiNode, path: &[usize], property: &BoundProperty, new_val: &str) {
         if path.is_empty() {
-            match property {
-                BoundProperty::Text => match node {
+            if *property == BoundProperty::Text {
+                match node {
                     UiNode::Text { text, .. } => *text = new_val.to_string(),
                     UiNode::TextInput { text, .. } => *text = new_val.to_string(),
                     _ => {}
-                },
-                _ => {}
+                }
             }
             return;
         }
@@ -222,5 +227,16 @@ impl ReactiveGraph {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reactive_graph_default() {
+        let graph = ReactiveGraph::default();
+        assert!(graph.get_tree("nonexistent").is_none());
     }
 }

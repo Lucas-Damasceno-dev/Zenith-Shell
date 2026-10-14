@@ -103,7 +103,15 @@ pub struct SdfRectShader {
     loc_alpha_factor: glow::UniformLocation,
 }
 
+pub type BoxShadow = ((f32, f32, f32, f32), (f32, f32), f32);
+
 impl SdfRectShader {
+    /// Creates a new SDF rounded rect rendering shader pipeline.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `gl` is current on the calling thread.
+    /// - `gl` commands must remain valid throughout execution.
     pub unsafe fn new(gl: Arc<glow::Context>) -> Result<Self, Box<dyn std::error::Error>> {
         let program = Self::compile_program(&gl, SDF_VERTEX_SHADER, SDF_FRAGMENT_SHADER)?;
 
@@ -168,6 +176,13 @@ impl SdfRectShader {
         })
     }
 
+    /// Draws a rounded rectangle with optional borders and box shadows using SDF evaluation.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `self.gl` is current on the calling thread.
+    /// - `self.program`, `self.vao`, and `self.vbo` must belong to the active context.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn draw(
         &self,
         resolution: (f32, f32),
@@ -177,7 +192,7 @@ impl SdfRectShader {
         bg_color: (f32, f32, f32, f32),
         border_color: (f32, f32, f32, f32),
         border_width: f32,
-        shadow: Option<((f32, f32, f32, f32), (f32, f32), f32)>, // ((r,g,b,a), (ox, oy), blur)
+        shadow: Option<BoxShadow>, // ((r,g,b,a), (ox, oy), blur)
         alpha_factor: f32,
     ) {
         self.gl.use_program(Some(self.program));
@@ -211,6 +226,11 @@ impl SdfRectShader {
         self.gl.use_program(None);
     }
 
+    /// Compiles and links an OpenGL shader program from vertex and fragment GLSL source.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that an active OpenGL ES context associated with `gl` is current on the calling thread.
     pub unsafe fn compile_program(
         gl: &glow::Context,
         vs_src: &str,
@@ -263,7 +283,7 @@ fn bytemuck_slice(slice: &[f32]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
             slice.as_ptr() as *const u8,
-            slice.len() * std::mem::size_of::<f32>(),
+            std::mem::size_of_val(slice),
         )
     }
 }
