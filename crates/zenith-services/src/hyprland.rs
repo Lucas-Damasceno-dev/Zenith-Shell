@@ -517,9 +517,9 @@ impl HyprlandService {
                 let fallback_clients = vec![
                     ClientItem {
                         address: "0x1a2b3c".to_string(),
-                        title: "foot".to_string(),
-                        class: "foot".to_string(),
-                        initial_class: "foot".to_string(),
+                        title: "kitty".to_string(),
+                        class: "kitty".to_string(),
+                        initial_class: "kitty".to_string(),
                         workspace_id: 1,
                         workspace_name: "1".to_string(),
                         floating: false,
