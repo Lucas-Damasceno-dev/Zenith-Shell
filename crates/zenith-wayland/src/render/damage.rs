@@ -269,15 +269,14 @@ pub fn compute_damage_rect(
     }
 }
 
-/// Ring buffer that tracks per-buffer accumulated damage for multi-buffered swapchains (e.g. double buffering).
+/// Ring buffer that tracks per-buffer accumulated damage for multi-buffered swapchains (e.g. double or triple buffering).
 ///
-/// In Wayland EGL or SHM double-buffering (N=2), the buffer being rendered at frame K
-/// was last updated at frame K-2. To ensure zero flicker without full-screen repaints,
+/// In Wayland EGL or SHM multi-buffering (N=4), the buffer being rendered at frame K
+/// was last updated up to K-N frames ago. To ensure zero flicker without full-screen repaints,
 /// the damage applied to the current buffer must be the union of all damage rects
-/// produced since that specific buffer was last drawn (i.e. the current frame's damage
-/// unioned with the preceding N-1 frames' damages).
+/// produced since that specific buffer was last drawn, or queried via `EGL_BUFFER_AGE_EXT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DamageRing<const N: usize = 2> {
+pub struct DamageRing<const N: usize = 4> {
     /// History of frame damages recorded in the ring.
     history: [Option<DamageRect>; N],
     /// Current slot index (0..N).
@@ -308,6 +307,60 @@ impl<const N: usize> DamageRing<N> {
         self.history = [None; N];
         self.current_idx = 0;
         self.initialized_count = 0;
+    }
+
+    /// Computes the accumulated damage taking into account `EGL_BUFFER_AGE_EXT` if available.
+    ///
+    /// Rules according to `EGL_EXT_buffer_age`:
+    /// - `age == 0`: Buffer contents are uninitialized/invalid (requires full damage).
+    /// - `age == 1`: Back buffer contains the contents from the immediately preceding frame -> only `current_damage`.
+    /// - `age > 1`: Back buffer is `age` frames old -> union of `current_damage` and the previous `age - 1` frames.
+    /// - If `age as usize > N` or `age <= 0`: falls back to full damage.
+    /// - If `buffer_age` is `None`: falls back to ring-buffer rotation (`rotate_damage`).
+    pub fn rotate_damage_with_age(
+        &mut self,
+        current_damage: Option<DamageRect>,
+        buffer_age: Option<i32>,
+        viewport_width: i32,
+        viewport_height: i32,
+    ) -> Option<DamageRect> {
+        let full_rect = DamageRect::new(0, 0, viewport_width.max(1), viewport_height.max(1));
+
+        if let Some(age) = buffer_age {
+            if age <= 0 || age as usize > N || self.initialized_count < age as usize {
+                // Buffer is not yet seeded or contents are unknown: full repaint required.
+                self.history[self.current_idx] = current_damage.or(Some(full_rect));
+                self.current_idx = (self.current_idx + 1) % N;
+                self.initialized_count = (self.initialized_count + 1).min(N);
+                return Some(full_rect);
+            }
+
+            let cur = match current_damage {
+                Some(d) => d,
+                None => {
+                    self.history[self.current_idx] = None;
+                    self.current_idx = (self.current_idx + 1) % N;
+                    return None;
+                }
+            };
+
+            let mut accumulated = cur;
+            let age_usize = age as usize;
+            for step in 1..age_usize {
+                let slot = (self.current_idx + N - step) % N;
+                if let Some(prev) = self.history[slot] {
+                    accumulated = accumulated.union(&prev);
+                }
+            }
+
+            self.history[self.current_idx] = Some(cur);
+            self.current_idx = (self.current_idx + 1) % N;
+            self.initialized_count = (self.initialized_count + 1).min(N);
+
+            Some(accumulated.clamp_to_viewport(viewport_width, viewport_height))
+        } else {
+            self.rotate_damage(current_damage, viewport_width, viewport_height)
+        }
     }
 
     /// Computes the accumulated damage needed for the buffer currently being drawn,
@@ -659,5 +712,28 @@ mod tests {
         // Bounded by clip rect width/height
         assert!(dmg.width <= 50 + 8);
         assert!(dmg.height <= 50 + 8);
+    }
+
+    #[test]
+    fn test_damage_ring_rotate_with_age() {
+        let mut ring = DamageRing::<4>::new();
+
+        let dmg1 = Some(DamageRect::new(10, 10, 50, 50));
+        let dmg2 = Some(DamageRect::new(100, 100, 40, 40));
+
+        // Age 0 or unseeded requires full damage
+        let r0 = ring.rotate_damage_with_age(dmg1, Some(0), 800, 600);
+        assert_eq!(r0, Some(DamageRect::new(0, 0, 800, 600)));
+
+        // Seed second buffer with age 0
+        let _ = ring.rotate_damage_with_age(dmg1, Some(0), 800, 600);
+
+        // Age 1: Back buffer is from immediately preceding frame -> only dmg2
+        let r1 = ring.rotate_damage_with_age(dmg2, Some(1), 800, 600);
+        assert_eq!(r1, dmg2);
+
+        // Age 2: Back buffer is 2 frames old -> union of dmg2 and previous frame's dmg1
+        let r2 = ring.rotate_damage_with_age(dmg1, Some(2), 800, 600);
+        assert_eq!(r2, Some(DamageRect::new(10, 10, 50, 50).union(&dmg2.unwrap())));
     }
 }

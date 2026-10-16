@@ -22,7 +22,7 @@ local function Hardware(props: { reactive: boolean? }?)
     local cpu_binding = if is_reactive and Zenith.Signals and Zenith.Signals.Cpu then Zenith.Signals.Cpu else string.format("%d%%", cpu.percent)
     local mem_binding = if is_reactive and Zenith.Signals and Zenith.Signals.Memory then Zenith.Signals.Memory else string.format("%d%%", mem.percent)
 
-    local tip = string.format("CPU: %d%% | RAM: %d%% (%d/%d MB) | Disco: %d%% (%d/%d GB)\n• Clique: Monitor btop\n• Botão Direito: Monitor htop", cpu.percent, mem.percent, mem.used_mb or 0, mem.total_mb or 0, disk.percent, disk.used_gb or 0, disk.total_gb or 0)
+    local tip = string.format("CPU: %d%% | RAM: %d%% (%d/%d MB) | Disco: %d%% (%d/%d GB)\n• Clique: Monitor do Sistema\n• Botão Direito: Monitor htop\n• Clique do Meio: Monitor btop", cpu.percent, mem.percent, mem.used_mb or 0, mem.total_mb or 0, disk.percent, disk.used_gb or 0, disk.total_gb or 0)
 
     local hw_children = {
         Zenith.Box({
@@ -77,8 +77,9 @@ local function Hardware(props: { reactive: boolean? }?)
         padding = { x = pad_x, y = 2 },
         gap = 5,
         tooltip = tip,
-        on_click = "cmd:foot -e btop &",
-        on_right_click = "cmd:foot -e htop &",
+        on_click = (props and props.on_click) or "popup:toggle:SystemMonitorPopup",
+        on_right_click = (props and props.on_right_click) or "cmd:foot -e htop &",
+        on_middle_click = (props and props.on_middle_click) or "cmd:foot -e btop &",
         children = hw_children,
     })
 end

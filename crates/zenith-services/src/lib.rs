@@ -512,13 +512,15 @@ impl SystemService {
             }
         }
 
+        let xdg_cache = std::env::var("XDG_CACHE_HOME").ok().map(PathBuf::from);
+        let xdg_config = std::env::var("XDG_CONFIG_HOME").ok().map(PathBuf::from);
         let candidates = [
+            xdg_cache.as_ref().map(|p| p.join("quickshell/matugen/colors.json")),
+            xdg_cache.as_ref().map(|p| p.join("matugen/colors.json")),
+            xdg_config.as_ref().map(|p| p.join("quickshell/colors.json")),
             dirs_home_path(".cache/quickshell/matugen/colors.json"),
             dirs_home_path(".cache/matugen/colors.json"),
             dirs_home_path(".config/quickshell/colors.json"),
-            Some(PathBuf::from("/home/lucas/.cache/quickshell/matugen/colors.json")),
-            Some(PathBuf::from("/home/lucas/.cache/matugen/colors.json")),
-            Some(PathBuf::from("/home/lucas/.config/quickshell/colors.json")),
         ];
 
         let mut loaded = ThemePalette::default();

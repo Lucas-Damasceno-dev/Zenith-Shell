@@ -28,6 +28,16 @@ pub struct BluetoothStatus {
 impl Default for BluetoothStatus {
     fn default() -> Self {
         Self {
+            powered: false,
+            devices: Vec::new(),
+        }
+    }
+}
+
+impl BluetoothStatus {
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        Self {
             powered: true,
             devices: vec![
                 BluetoothDevice {
@@ -341,9 +351,7 @@ impl BluetoothService {
                             }
                         }
 
-                        if !devices.is_empty() {
-                            return BluetoothStatus { powered, devices };
-                        }
+                        return BluetoothStatus { powered, devices };
                     }
                 }
             }
@@ -359,8 +367,12 @@ mod tests {
 
     #[test]
     fn test_bluetooth_status_and_devices() {
+        let mock = BluetoothStatus::mock();
+        assert!(!mock.devices.is_empty());
+        assert!(mock.devices.iter().any(|d| !d.mac.is_empty()));
+
         let status = BluetoothService::status();
-        assert!(!status.devices.is_empty());
-        assert!(status.devices.iter().any(|d| !d.mac.is_empty()));
+        // Hardware query returns gracefully without panic
+        let _ = status.powered;
     }
 }

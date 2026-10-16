@@ -50,6 +50,12 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Settings Hub & Center** | `modules/settings/` | ✅ **Implemented** (`overlays/Settings.luau` + `settings_store.luau`) | **Milestone 13** |
 | **Modular Bar Architecture**| `Bar.qml` + `RightBarModules.qml` | ✅ **Implemented** (`bar.luau` + 26 `lib/widgets/*`) | **Milestone 13** |
 | **UI Kit & Design System** | Reusable QML Controls | ✅ **Implemented** (`config/zenith/lib/ui_kit.luau`) | **Milestone 13** |
+| **Clipboard Popup (Cliphist)**| `overlays/ClipboardPopup.qml` | ✅ **Implemented** (`overlays/ClipboardPopup.luau` + `lib/widgets/clipboard.luau`) | **Milestone 14 (Onda 2.1)** |
+| **System Monitor Popup**    | `modules/system_monitor/` / `SystemMonitorUtils.js` | ✅ **Implemented** (`overlays/SystemMonitorPopup.luau`) | **Milestone 14 (Onda 2.2)** |
+| **USB & Removable Media**   | `modules/usb/` / `UsbService.qml` | ✅ **Implemented** (`overlays/USBPopup.luau` + `lib/widgets/usb.luau`) | **Milestone 14 (Onda 2.3)** |
+| **Battery Health & Profiles**| `overlays/BatteryPopup.qml` | ✅ **Implemented** (`overlays/BatteryPopup.luau` + `lib/widgets/battery.luau`) | **Milestone 14 (Onda 2.3)** |
+| **Audio & Media Mixer**     | `overlays/AudioPopup.qml` & `MediaPopup.qml` | ✅ **Implemented** (`overlays/AudioPopup.luau` & `MediaPopup.luau`) | **Milestone 14 (Onda 2.4)** |
+| **Custom Luau Validation Suite** | QML lint / parity verification | ✅ **Implemented** (`tests/validate_custom_suite.py` - 57/57 files) | **Milestone 14 (Onda 3.4)** |
 
 ---
 
@@ -80,5 +86,20 @@ This document maps all features from the existing Quickshell configuration (`/et
 - Zenith-Shell replaces fork-exec overhead with native in-process Rust readers:
   - Memory: Direct `/proc/self/statm` + libc `sysinfo`.
   - CPU: Delta tracking on `/proc/stat`.
-  - Battery: Direct reads on `/sys/class/power_supply/BAT*`.
   - Eliminates subshell forks and bash process spawning during 1-second telemetry ticks.
+
+### 4. Overlays & Specialized Popups
+- **Clipboard Popup (`overlays/ClipboardPopup.luau`):** Paridade integral com o histórico cliphist do Quickshell (`cliphist list`, `cliphist decode`, preview de imagem/texto, filtro por categoria, pesquisa em tempo real, wipe de histórico e atalhos de seleção rápida).
+- **System Monitor Popup (`overlays/SystemMonitorPopup.luau`):** Telemetria em tempo real (CPU, RAM, Swap, Root/Home Disk), tabela dinâmica de processos ordenados por CPU/RAM com ação de término (`kill -TERM`), visualização de serviços systemd (`pipewire`, etc.) e integração com utilitários de terminal (`btop`, `htop`).
+- **USB & Removable Media Popup (`overlays/USBPopup.luau`):** Detecção de dispositivos de bloco e pendrives via `udisks2`/`lsblk`, botões de montagem/desmontagem rápida e ejetar com segurança.
+- **Battery Health Popup (`overlays/BatteryPopup.luau`):** Estimativa de tempo restante, contagem de ciclos de carga, saúde percentual da bateria e seletor de perfis de energia (`power-profiles-daemon`).
+- **Audio & Media Mixer (`overlays/AudioPopup.luau`, `overlays/MediaPopup.luau`):** Controle de volume por aplicação/stream PipeWire, troca de sink/source de áudio e controle de reprodução MPRIS com visualização de capa e scrubber.
+
+### 5. Custom Luau Validation Suite & Paridade Sintática
+- **Validador Oficial:** `tests/validate_custom_suite.py`
+- **Cobertura:** 57 arquivos Luau declarativos em `config/zenith/` (100% aprovados com 0 erros de sintaxe e delimitadores perfeitamente balanceados).
+- **Inventário Auditado:**
+  - 18 Overlays em `config/zenith/overlays/`
+  - 26 Widgets de barra em `config/zenith/lib/widgets/`
+  - 8 Bibliotecas de componentes UI em `config/zenith/lib/`
+  - 5 Configurações principais (`bar.luau`, `dock.luau`, `canvas.luau`, `island.luau`, `zenith.d.luau`)

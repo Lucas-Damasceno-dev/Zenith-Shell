@@ -78,6 +78,7 @@ struct HyprlandState {
     workspaces: Vec<WorkspaceItem>,
     active_window: ActiveWindowSnapshot,
     clients: Vec<ClientItem>,
+    monitors: Vec<MonitorItem>,
     gaps_out: u32,
     socket_dir: Option<PathBuf>,
 }
@@ -121,48 +122,44 @@ impl HyprlandService {
         r.gaps_out
     }
 
-    /// Retrieve current monitors snapshot from Hyprland IPC.
+    /// Parses JSON array from `j/monitors` into a list of MonitorItems.
+    pub fn parse_monitors_json(resp: &str) -> Vec<MonitorItem> {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(resp) {
+            let mut list = Vec::new();
+            for item in items {
+                list.push(MonitorItem {
+                    id: item["id"].as_i64().unwrap_or(0),
+                    name: item["name"].as_str().unwrap_or("").to_string(),
+                    width: item["width"].as_u64().unwrap_or(1920) as u32,
+                    height: item["height"].as_u64().unwrap_or(1080) as u32,
+                    refresh_rate: item["refreshRate"].as_f64().unwrap_or(60.0) as f32,
+                    scale: item["scale"].as_f64().unwrap_or(1.0) as f32,
+                    focused: item["focused"].as_bool().unwrap_or(false),
+                });
+            }
+            list
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Retrieve current monitors snapshot from non-blocking Hyprland state cache.
     pub fn monitors() -> Vec<MonitorItem> {
         let state_arc = Self::get_state();
-        let (is_hypr, socket_dir) = {
-            let r = state_arc.read().unwrap();
-            (r.is_hyprland, r.socket_dir.clone())
-        };
-
-        if is_hypr {
-            if let Some(ref dir) = socket_dir {
-                let cmd_sock = dir.join(".socket.sock");
-                if let Ok(resp) = send_socket_command(&cmd_sock, "j/monitors") {
-                    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&resp) {
-                        let mut list = Vec::new();
-                        for item in items {
-                            list.push(MonitorItem {
-                                id: item["id"].as_i64().unwrap_or(0),
-                                name: item["name"].as_str().unwrap_or("").to_string(),
-                                width: item["width"].as_u64().unwrap_or(1920) as u32,
-                                height: item["height"].as_u64().unwrap_or(1080) as u32,
-                                refresh_rate: item["refreshRate"].as_f64().unwrap_or(60.0) as f32,
-                                scale: item["scale"].as_f64().unwrap_or(1.0) as f32,
-                                focused: item["focused"].as_bool().unwrap_or(false),
-                            });
-                        }
-                        if !list.is_empty() {
-                            return list;
-                        }
-                    }
-                }
-            }
+        let r = state_arc.read().unwrap();
+        if !r.monitors.is_empty() {
+            r.monitors.clone()
+        } else {
+            vec![MonitorItem {
+                id: 0,
+                name: "DP-1".to_string(),
+                width: 1366,
+                height: 768,
+                refresh_rate: 60.0,
+                scale: 1.0,
+                focused: true,
+            }]
         }
-
-        vec![MonitorItem {
-            id: 0,
-            name: "DP-1".to_string(),
-            width: 1366,
-            height: 768,
-            refresh_rate: 60.0,
-            scale: 1.0,
-            focused: true,
-        }]
     }
 
     /// Focus a window by address (e.g. `0x1234abcd`).
@@ -428,14 +425,21 @@ impl HyprlandService {
                     clients = parse_clients_json(&resp);
                 }
 
+                // Query initial monitors
+                let mut monitors = Vec::new();
+                if let Ok(resp) = send_socket_command(&cmd_sock, "j/monitors") {
+                    monitors = Self::parse_monitors_json(&resp);
+                }
+
                 let gaps_out = query_gaps_out(&cmd_sock);
 
                 info!(
-                    "Hyprland IPC detected at {}. Initial workspace: {}, active window: '{}', clients: {}, gaps: {}",
+                    "Hyprland IPC detected at {}. Initial workspace: {}, active window: '{}', clients: {}, monitors: {}, gaps: {}",
                     dir.display(),
                     active_workspace,
                     active_window.class,
                     clients.len(),
+                    monitors.len(),
                     gaps_out
                 );
 
@@ -445,6 +449,7 @@ impl HyprlandService {
                     workspaces,
                     active_window,
                     clients,
+                    monitors,
                     gaps_out,
                     socket_dir: Some(dir),
                 }));
@@ -563,6 +568,15 @@ impl HyprlandService {
                     workspaces,
                     active_window,
                     clients: fallback_clients,
+                    monitors: vec![MonitorItem {
+                        id: 0,
+                        name: "DP-1".to_string(),
+                        width: 1366,
+                        height: 768,
+                        refresh_rate: 60.0,
+                        scale: 1.0,
+                        focused: true,
+                    }],
                     gaps_out: 10,
                     socket_dir: None,
                 }))
@@ -804,6 +818,7 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
             }
             "focusedmon" => {
                 // Format: MONITOR,WORKSPACENAME
+                let mon_name = data.split(',').next().unwrap_or("").trim();
                 if let Some((_, ws_name)) = data.split_once(',') {
                     let ws_name = ws_name.trim();
                     let ws_id = ws_name.parse::<i32>().unwrap_or(1);
@@ -813,9 +828,22 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                         for item in &mut w.workspaces {
                             item.active = item.id == ws_id || item.name == ws_name;
                         }
+                        for mon in &mut w.monitors {
+                            mon.focused = mon.name == mon_name;
+                        }
                     }
                     changed = true;
                 }
+            }
+            "monitoradded" | "monitoraddedv2" | "monitorremoved" => {
+                if let Ok(resp) = send_socket_command(cmd_sock, "j/monitors") {
+                    let new_mons = HyprlandService::parse_monitors_json(&resp);
+                    if !new_mons.is_empty() {
+                        let mut w = state.write().unwrap();
+                        w.monitors = new_mons;
+                    }
+                }
+                changed = true;
             }
             "activewindowv2" => {
                 let addr = data.split(',').next().unwrap_or("").trim().to_string();
@@ -1111,6 +1139,15 @@ mod tests {
             ],
             active_window: ActiveWindowSnapshot::default(),
             clients: vec![],
+            monitors: vec![MonitorItem {
+                id: 0,
+                name: "DP-1".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh_rate: 60.0,
+                scale: 1.0,
+                focused: false,
+            }],
             socket_dir: None,
             gaps_out: 0,
         }));

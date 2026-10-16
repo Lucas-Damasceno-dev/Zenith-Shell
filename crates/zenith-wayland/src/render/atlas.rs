@@ -45,15 +45,15 @@ impl GlyphAtlas {
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
 
-        // Pre-allocate 2048x2048 R8 texture (1 byte per pixel for alpha masks)
+        // Pre-allocate 2048x2048 RGBA8 texture (supports monochrome masks and full-color emojis)
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            glow::R8 as i32,
+            glow::RGBA8 as i32,
             ATLAS_SIZE as i32,
             ATLAS_SIZE as i32,
             0,
-            glow::RED,
+            glow::RGBA,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(None),
         );
@@ -126,6 +126,10 @@ impl GlyphAtlas {
 
             let is_col = match image.content {
                 SwashContent::Mask => {
+                    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+                    for &a in &image.data {
+                        rgba.extend_from_slice(&[255, 255, 255, a]);
+                    }
                     self.gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
                         0,
@@ -133,17 +137,17 @@ impl GlyphAtlas {
                         y as i32,
                         width as i32,
                         height as i32,
-                        glow::RED,
+                        glow::RGBA,
                         glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(Some(&image.data)),
+                        glow::PixelUnpackData::Slice(Some(&rgba)),
                     );
                     false
                 }
                 SwashContent::SubpixelMask => {
-                    // Extract green channel or convert RGB subpixel to grayscale alpha
-                    let mut alpha_data = Vec::with_capacity((width * height) as usize);
+                    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
                     for chunk in image.data.chunks_exact(3) {
-                        alpha_data.push(chunk[1]);
+                        let avg = ((chunk[0] as u16 + chunk[1] as u16 + chunk[2] as u16) / 3) as u8;
+                        rgba.extend_from_slice(&[255, 255, 255, avg]);
                     }
                     self.gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
@@ -152,18 +156,14 @@ impl GlyphAtlas {
                         y as i32,
                         width as i32,
                         height as i32,
-                        glow::RED,
+                        glow::RGBA,
                         glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(Some(&alpha_data)),
+                        glow::PixelUnpackData::Slice(Some(&rgba)),
                     );
                     false
                 }
                 SwashContent::Color => {
-                    // For emoji/colored glyphs, extract luminance as fallback mask
-                    let mut alpha_data = Vec::with_capacity((width * height) as usize);
-                    for chunk in image.data.chunks_exact(4) {
-                        alpha_data.push(chunk[3]);
-                    }
+                    // True color RGBA emoji raster
                     self.gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
                         0,
@@ -171,9 +171,9 @@ impl GlyphAtlas {
                         y as i32,
                         width as i32,
                         height as i32,
-                        glow::RED,
+                        glow::RGBA,
                         glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(Some(&alpha_data)),
+                        glow::PixelUnpackData::Slice(Some(&image.data)),
                     );
                     true
                 }

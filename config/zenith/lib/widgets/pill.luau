@@ -20,6 +20,7 @@ type PillProps = {
     tooltip: any?,
     on_click: string?,
     on_right_click: string?,
+    on_middle_click: string?,
     on_scroll_up: string?,
     on_scroll_down: string?,
     children: { any }?,
@@ -151,8 +152,14 @@ local function Pill(props: PillProps?)
         tooltip = p.tooltip,
         on_click = p.on_click,
         on_right_click = p.on_right_click,
+        on_middle_click = p.on_middle_click,
         on_scroll_up = p.on_scroll_up,
         on_scroll_down = p.on_scroll_down,
+        badge = p.badge,
+        badge_color = p.badge_color,
+        icon = p.icon,
+        icon_color = p.icon_color,
+        label = p.label,
         children = content_children,
     })
 end

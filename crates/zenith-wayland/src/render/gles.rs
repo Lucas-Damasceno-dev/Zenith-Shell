@@ -8,7 +8,7 @@ use zenith_layout::ComputedBox;
 use super::atlas::GlyphAtlas;
 use super::custom_shader::CustomShaderPipeline;
 use super::image_cache::ImageCache;
-use super::primitives::SdfRectShader;
+use super::primitives::{SdfInstance, SdfRectShader};
 
 #[inline]
 fn color_to_norm(c: zenith_layout::Color) -> (f32, f32, f32, f32) {
@@ -25,16 +25,19 @@ precision highp float;
 
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
+layout(location = 2) in float a_is_color;
 
 uniform vec2 u_resolution;
 
 out vec2 v_uv;
+out float v_is_color;
 
 void main() {
     vec2 clip = (a_pos / u_resolution) * 2.0 - 1.0;
     clip.y = -clip.y;
     gl_Position = vec4(clip, 0.0, 1.0);
     v_uv = a_uv;
+    v_is_color = a_is_color;
 }
 "#;
 
@@ -42,23 +45,34 @@ const TEXT_FS: &str = r#"#version 300 es
 precision highp float;
 
 in vec2 v_uv;
+in float v_is_color;
 uniform sampler2D u_atlas;
 uniform vec4 u_text_color;
 
 out vec4 frag_color;
 
 void main() {
-    float a = texture(u_atlas, v_uv).r;
-    if (a <= 0.001) {
+    vec4 tex = texture(u_atlas, v_uv);
+    if (tex.a <= 0.001) {
         discard;
     }
-    frag_color = vec4(u_text_color.rgb, u_text_color.a * a);
+    if (v_is_color > 0.5) {
+        frag_color = vec4(tex.rgb, tex.a * u_text_color.a);
+    } else {
+        frag_color = vec4(u_text_color.rgb, u_text_color.a * tex.a);
+    }
 }
 "#;
+
+#[inline]
+fn current_font_family() -> String {
+    std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string())
+}
 
 pub struct GlesRenderer {
     gl: Arc<glow::Context>,
     sdf_shader: SdfRectShader,
+    sdf_instances: Vec<SdfInstance>,
     atlas: GlyphAtlas,
     image_cache: ImageCache,
     custom_shaders: CustomShaderPipeline,
@@ -100,11 +114,13 @@ impl GlesRenderer {
         gl.bind_vertex_array(Some(text_vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(text_vbo));
 
-        // Vertex layout: [pos_x, pos_y, uv_u, uv_v]
+        // Vertex layout: [pos_x, pos_y, uv_u, uv_v, is_color] (stride: 5 floats = 20 bytes)
         gl.enable_vertex_attrib_array(0);
-        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 4 * 4, 0);
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 5 * 4, 0);
         gl.enable_vertex_attrib_array(1);
-        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 4 * 4, 2 * 4);
+        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 5 * 4, 2 * 4);
+        gl.enable_vertex_attrib_array(2);
+        gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, 5 * 4, 4 * 4);
 
         gl.bind_vertex_array(None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
@@ -114,6 +130,7 @@ impl GlesRenderer {
         Ok(Self {
             gl,
             sdf_shader,
+            sdf_instances: Vec::with_capacity(128),
             atlas,
             image_cache,
             custom_shaders,
@@ -181,9 +198,15 @@ impl GlesRenderer {
             self.gl.clear(glow::COLOR_BUFFER_BIT);
 
             self.gl.enable(glow::BLEND);
-            self.gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            self.gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
 
-            // Pass 1: Analytical SDF Geometries & Drop Shadows
+            // Pass 1: Analytical SDF Geometries & Drop Shadows (Single Batched Instanced Draw Call)
+            self.sdf_instances.clear();
             for (i, b) in boxes.iter().enumerate() {
                 if b.width <= 0.0 || b.height <= 0.0 {
                     continue;
@@ -268,8 +291,7 @@ impl GlesRenderer {
                     || self.inspect_mode;
 
                 if has_visible_geometry {
-                    self.sdf_shader.draw(
-                        res,
+                    self.sdf_instances.push(SdfInstance::new(
                         quad_rect,
                         (box_x, box_y, box_w, box_h),
                         b.border_radius,
@@ -278,15 +300,14 @@ impl GlesRenderer {
                         border_width,
                         shadow_spec,
                         alpha_factor,
-                    );
+                    ));
                 }
 
                 // Focus outline for active TextInput
                 if let Some(ref input) = b.text_input {
                     if input.active {
                         let focus_col = (124.0 / 255.0, 77.0 / 255.0, 1.0, 0.86);
-                        self.sdf_shader.draw(
-                            res,
+                        self.sdf_instances.push(SdfInstance::new(
                             (box_x - 2.0, box_y - 2.0, box_w + 4.0, box_h + 4.0),
                             (box_x, box_y, box_w, box_h),
                             b.border_radius,
@@ -295,14 +316,13 @@ impl GlesRenderer {
                             2.0,
                             None,
                             alpha_factor,
-                        );
+                        ));
 
                         // Quad de seleção com cor de destaque (theme.primary_container)
                         if let Some((sel_rx, sel_ry, sel_rw, sel_rh)) = input.selection_rect {
                             let sel_quad = (box_x + sel_rx, box_y + sel_ry, sel_rw, sel_rh);
                             let sel_bg = (124.0 / 255.0, 77.0 / 255.0, 1.0, 0.40 * alpha_factor);
-                            self.sdf_shader.draw(
-                                res,
+                            self.sdf_instances.push(SdfInstance::new(
                                 sel_quad,
                                 sel_quad,
                                 2.0,
@@ -311,7 +331,7 @@ impl GlesRenderer {
                                 0.0,
                                 None,
                                 alpha_factor,
-                            );
+                            ));
                         }
                     }
                 }
@@ -326,8 +346,7 @@ impl GlesRenderer {
                     let norm = ((sl.value - sl.min) / (sl.max - sl.min).max(0.001)).clamp(0.0, 1.0);
 
                     // Background track
-                    self.sdf_shader.draw(
-                        res,
+                    self.sdf_instances.push(SdfInstance::new(
                         (box_x, track_y, box_w, track_h),
                         (box_x, track_y, box_w, track_h),
                         track_h * 0.5,
@@ -336,13 +355,12 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
-                    );
+                    ));
 
                     // Active filled track
                     let active_w = box_w * norm;
                     if active_w > 1.0 {
-                        self.sdf_shader.draw(
-                            res,
+                        self.sdf_instances.push(SdfInstance::new(
                             (box_x, track_y, active_w, track_h),
                             (box_x, track_y, active_w, track_h),
                             track_h * 0.5,
@@ -351,15 +369,14 @@ impl GlesRenderer {
                             0.0,
                             None,
                             alpha_factor,
-                        );
+                        ));
                     }
 
                     // Thumb
                     let thumb_d = sl.thumb_radius * 2.0;
                     let thumb_x = (box_x + norm * (box_w - thumb_d)).clamp(box_x, box_x + box_w - thumb_d);
                     let thumb_y = box_y + (box_h - thumb_d) * 0.5;
-                    self.sdf_shader.draw(
-                        res,
+                    self.sdf_instances.push(SdfInstance::new(
                         (thumb_x, thumb_y, thumb_d, thumb_d),
                         (thumb_x, thumb_y, thumb_d, thumb_d),
                         sl.thumb_radius,
@@ -368,7 +385,7 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
-                    );
+                    ));
                 }
 
                 // Render Zenith.Switch
@@ -382,8 +399,7 @@ impl GlesRenderer {
                     let thumb_color = color_to_norm(sw.thumb_color);
 
                     // Pill body
-                    self.sdf_shader.draw(
-                        res,
+                    self.sdf_instances.push(SdfInstance::new(
                         (box_x, box_y, box_w, box_h),
                         (box_x, box_y, box_w, box_h),
                         pill_radius,
@@ -392,7 +408,7 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
-                    );
+                    ));
 
                     // Sliding thumb
                     let thumb_d = (box_h - 4.0).max(4.0);
@@ -403,8 +419,7 @@ impl GlesRenderer {
                     } else {
                         box_x + 2.0
                     };
-                    self.sdf_shader.draw(
-                        res,
+                    self.sdf_instances.push(SdfInstance::new(
                         (thumb_x, thumb_y, thumb_d, thumb_d),
                         (thumb_x, thumb_y, thumb_d, thumb_d),
                         thumb_r,
@@ -413,9 +428,18 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
-                    );
+                    ));
                 }
             }
+            self.sdf_shader.draw_batch(res, &self.sdf_instances);
+            self.sdf_instances.clear();
+
+            self.gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
 
             // Pass 2: Raster/SVG Images & Active Tooltip Floating Balloons
             for (i, b) in boxes.iter().enumerate() {
@@ -571,9 +595,10 @@ impl GlesRenderer {
                     self.text_buffer.set_metrics(metrics);
                     let is_complex = text.chars().any(|c| c as u32 > 0x0600);
                     let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
+                    let font_family = current_font_family();
                     self.text_buffer.set_text(
                         &text,
-                        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
+                        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
                         shaping,
                         None,
                     );
@@ -602,15 +627,16 @@ impl GlesRenderer {
 
                                 let gx1 = gx + gw;
                                 let gy1 = gy + gh;
+                                let is_col = if cached.is_color { 1.0f32 } else { 0.0f32 };
 
                                 self.glyph_scratch.extend_from_slice(&[
-                                    gx,  gy,  cached.u0, cached.v0,
-                                    gx1, gy,  cached.u1, cached.v0,
-                                    gx,  gy1, cached.u0, cached.v1,
+                                    gx,  gy,  cached.u0, cached.v0, is_col,
+                                    gx1, gy,  cached.u1, cached.v0, is_col,
+                                    gx,  gy1, cached.u0, cached.v1, is_col,
 
-                                    gx,  gy1, cached.u0, cached.v1,
-                                    gx1, gy,  cached.u1, cached.v0,
-                                    gx1, gy1, cached.u1, cached.v1,
+                                    gx,  gy1, cached.u0, cached.v1, is_col,
+                                    gx1, gy,  cached.u1, cached.v0, is_col,
+                                    gx1, gy1, cached.u1, cached.v1, is_col,
                                 ]);
                             }
                         }
@@ -640,7 +666,7 @@ impl GlesRenderer {
                         );
                         self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, slice, glow::DYNAMIC_DRAW);
 
-                        let vertex_count = (self.glyph_scratch.len() / 4) as i32;
+                        let vertex_count = (self.glyph_scratch.len() / 5) as i32;
                         self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
 
                         self.gl.bind_texture(glow::TEXTURE_2D, None);
@@ -708,9 +734,10 @@ impl GlesRenderer {
                         let line_height = font_sz * 1.3;
                         let metrics = Metrics::new(font_sz, line_height);
                         self.text_buffer.set_metrics(metrics);
+                        let font_family = current_font_family();
                         self.text_buffer.set_text(
                             tip_text,
-                            &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
+                            &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
                             Shaping::Basic,
                             None,
                         );
@@ -733,15 +760,16 @@ impl GlesRenderer {
 
                                     let gx1 = gx + gw;
                                     let gy1 = gy + gh;
+                                    let is_col = if cached.is_color { 1.0f32 } else { 0.0f32 };
 
                                     self.glyph_scratch.extend_from_slice(&[
-                                        gx,  gy,  cached.u0, cached.v0,
-                                        gx1, gy,  cached.u1, cached.v0,
-                                        gx,  gy1, cached.u0, cached.v1,
+                                        gx,  gy,  cached.u0, cached.v0, is_col,
+                                        gx1, gy,  cached.u1, cached.v0, is_col,
+                                        gx,  gy1, cached.u0, cached.v1, is_col,
 
-                                        gx,  gy1, cached.u0, cached.v1,
-                                        gx1, gy,  cached.u1, cached.v0,
-                                        gx1, gy1, cached.u1, cached.v1,
+                                        gx,  gy1, cached.u0, cached.v1, is_col,
+                                        gx1, gy,  cached.u1, cached.v0, is_col,
+                                        gx1, gy1, cached.u1, cached.v1, is_col,
                                     ]);
                                 }
                             }
@@ -768,7 +796,7 @@ impl GlesRenderer {
                             );
                             self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, slice, glow::DYNAMIC_DRAW);
 
-                            let vertex_count = (self.glyph_scratch.len() / 4) as i32;
+                            let vertex_count = (self.glyph_scratch.len() / 5) as i32;
                             self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
 
                             self.gl.bind_texture(glow::TEXTURE_2D, None);

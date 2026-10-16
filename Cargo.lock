@@ -2600,6 +2600,7 @@ dependencies = [
  "wayland-egl",
  "wayland-protocols",
  "wayland-protocols-wlr",
+ "xkbcommon",
  "zenith-core",
  "zenith-layout",
  "zenith-runtime",

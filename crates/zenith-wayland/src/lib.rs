@@ -13,13 +13,19 @@ pub use clipboard::ClipboardManager;
 pub use gestures::{GesturePhase, PinchGestureEvent, PointerGesturesManager, SwipeGestureEvent};
 pub use headless::HeadlessEngine;
 pub use idle::{IdleEvent, IdleManager, IdleNotificationData, IdleStatus};
-pub use ime::{compose_dead_key, keysym_to_dead_key};
+pub use ime::{ComposeResult, XkbComposeTracker};
 pub use monitor::{MonitorLifecycleManager, MonitorState, OutputMode};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor,
+    data_device_manager::{
+        data_device::DataDeviceHandler,
+        data_offer::DataOfferHandler,
+        data_source::DataSourceHandler,
+        DataDeviceManagerState,
+    },
+    delegate_compositor, delegate_data_device, delegate_keyboard, delegate_layer, delegate_output,
+    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -68,8 +74,118 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
     zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1::ExtSessionLockManagerV1,
+    ext_session_lock_v1::{self, ExtSessionLockV1},
+    ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1},
+};
+
+pub struct SessionLockSurface {
+    pub output: wl_output::WlOutput,
+    pub lock_surface: ExtSessionLockSurfaceV1,
+    pub wl_surface: wl_surface::WlSurface,
+    pub width: u32,
+    pub height: u32,
+    pub configured: bool,
+    pub computed_boxes: Vec<zenith_layout::ComputedBox>,
+    pub canvas_cache: Vec<u8>,
+    pub egl_surface: Option<crate::egl::EglSurface>,
+    pub damage_ring: crate::render::damage::DamageRing<4>,
+    pub frame_callback_pending: bool,
+}
+
+#[derive(Default)]
+pub struct SessionLockState {
+    pub manager: Option<ExtSessionLockManagerV1>,
+    pub lock: Option<ExtSessionLockV1>,
+    pub surfaces: Vec<SessionLockSurface>,
+    pub locked: bool,
+}
+
+/// Swizzles a tiny-skia RGBA byte slice into Wayland Argb8888 memory layout (BGRA little-endian).
+#[inline]
+pub fn copy_rgba_to_argb8888(dst: &mut [u8], src: &[u8]) {
+    let len = dst.len().min(src.len());
+    let chunks = len / 4;
+    for i in 0..chunks {
+        let idx = i * 4;
+        let r = src[idx];
+        let g = src[idx + 1];
+        let b = src[idx + 2];
+        let a = src[idx + 3];
+        dst[idx] = b;
+        dst[idx + 1] = g;
+        dst[idx + 2] = r;
+        dst[idx + 3] = a;
+    }
+}
 
 pub type FocusedInputState = (String, usize, Option<(usize, usize)>);
+
+impl Dispatch<ExtSessionLockManagerV1, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtSessionLockManagerV1,
+        _event: <ExtSessionLockManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {}
+}
+
+impl Dispatch<ExtSessionLockV1, ()> for WaylandApp {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtSessionLockV1,
+        event: ext_session_lock_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => {
+                info!("ext-session-lock-v1: session successfully locked by compositor");
+                state.session_lock.locked = true;
+                let _ = state.draw_lock_surfaces();
+            }
+            ext_session_lock_v1::Event::Finished => {
+                info!("ext-session-lock-v1: session lock finished");
+                proxy.destroy();
+                state.session_lock.lock = None;
+                state.session_lock.locked = false;
+                state.session_lock.surfaces.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockSurfaceV1, ()> for WaylandApp {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_surface_v1::Event::Configure { serial, width, height } => {
+                proxy.ack_configure(serial);
+                for surf in &mut state.session_lock.surfaces {
+                    if &surf.lock_surface == proxy {
+                        surf.width = width;
+                        surf.height = height;
+                        surf.configured = true;
+                        break;
+                    }
+                }
+                let _ = state.draw_lock_surfaces();
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<WpCursorShapeManagerV1, ()> for WaylandApp {
     fn event(
@@ -152,7 +268,8 @@ pub struct PopupWindow {
     pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
     pub spring: Option<zenith_core::SpringAnimation>,
     pub closing: bool,
-    pub damage_ring: crate::render::damage::DamageRing<2>,
+    pub damage_ring: crate::render::damage::DamageRing<4>,
+    pub frame_callback_pending: bool,
 }
 
 /// Individual Layer Shell bar window instance attached to a Wayland output.
@@ -167,7 +284,8 @@ pub struct BarInstance {
     pub canvas_cache: Vec<u8>,
     pub egl_surface: Option<crate::egl::EglSurface>,
     pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
-    pub damage_ring: crate::render::damage::DamageRing<2>,
+    pub damage_ring: crate::render::damage::DamageRing<4>,
+    pub frame_callback_pending: bool,
 }
 
 /// Main application state for Wayland event handling.
@@ -216,9 +334,9 @@ pub struct WaylandApp {
     pub inspect_mode: bool,
     pub modifiers: Modifiers,
     pub pointer_pressed: bool,
-    pub clipboard: std::sync::Arc<std::sync::Mutex<String>>,
     pub clipboard_manager: ClipboardManager,
-    pub active_dead_key: Option<char>,
+    pub compose_tracker: XkbComposeTracker,
+    pub pam_auth_rx: Option<std::sync::mpsc::Receiver<bool>>,
     pub active_dragging_slider: Option<String>,
     pub monitor_manager: MonitorLifecycleManager,
     pub gestures_manager: PointerGesturesManager,
@@ -228,6 +346,10 @@ pub struct WaylandApp {
     pub last_pointer_enter_serial: Option<u32>,
     pub current_cursor_shape: Option<Shape>,
     pub tooltip_hover: Option<(String, std::time::Instant)>,
+    pub session_lock: SessionLockState,
+    pub needs_redraw_bars: bool,
+    pub needs_redraw_popup: bool,
+    pub needs_redraw_dock: bool,
 }
 
 impl WaylandApp {
@@ -303,6 +425,20 @@ impl WaylandApp {
             }
         };
 
+        let mut clipboard_manager = ClipboardManager::new();
+        if let Ok(ddm) = DataDeviceManagerState::bind(&globals, &qh) {
+            if let Some(first_seat) = seat_state.seats().next() {
+                clipboard_manager.data_device = Some(ddm.get_data_device(&qh, &first_seat));
+            }
+            clipboard_manager.manager_state = Some(ddm);
+        }
+
+        let mut session_lock = SessionLockState::default();
+        if let Ok(lock_mgr) = globals.bind::<ExtSessionLockManagerV1, _, _>(&qh, 1..=1, ()) {
+            info!("Bound ext_session_lock_manager_v1 protocol for secure Wayland session locking");
+            session_lock.manager = Some(lock_mgr);
+        }
+
         let mut app = Self {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
@@ -348,9 +484,9 @@ impl WaylandApp {
             inspect_mode: false,
             modifiers: Modifiers::default(),
             pointer_pressed: false,
-            clipboard: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
-            clipboard_manager: ClipboardManager::new(),
-            active_dead_key: None,
+            clipboard_manager,
+            compose_tracker: XkbComposeTracker::new(),
+            pam_auth_rx: None,
             active_dragging_slider: None,
             monitor_manager,
             gestures_manager,
@@ -360,11 +496,59 @@ impl WaylandApp {
             last_pointer_enter_serial: None,
             current_cursor_shape: None,
             tooltip_hover: None,
+            session_lock,
+            needs_redraw_bars: false,
+            needs_redraw_popup: false,
+            needs_redraw_dock: false,
         };
 
         app.create_bar(&qh)?;
 
         Ok((app, conn, event_queue))
+    }
+
+    /// Securely locks the Wayland desktop session via `ext-session-lock-v1` if supported,
+    /// falling back to exclusive overlay popup.
+    pub fn lock_session(&mut self) {
+        if let Some(ref mgr) = self.session_lock.manager {
+            if self.session_lock.lock.is_none() {
+                info!("Requesting compositor session lock via ext-session-lock-v1");
+                let lock = mgr.lock(&self.qh, ());
+                self.session_lock.surfaces.clear();
+                for out in self.output_state.outputs() {
+                    let wl_surface = self.compositor_state.create_surface(&self.qh);
+                    let lock_surf = lock.get_lock_surface(&wl_surface, &out, &self.qh, ());
+                    self.session_lock.surfaces.push(SessionLockSurface {
+                        output: out,
+                        lock_surface: lock_surf,
+                        wl_surface,
+                        width: 0,
+                        height: 0,
+                        configured: false,
+                        computed_boxes: Vec::new(),
+                        canvas_cache: Vec::new(),
+                        egl_surface: None,
+                        damage_ring: crate::render::damage::DamageRing::new(),
+                        frame_callback_pending: false,
+                    });
+                }
+                self.session_lock.lock = Some(lock);
+                return;
+            }
+        }
+        let _ = self.open_popup("LockScreen");
+    }
+
+    /// Unlocks the session, destroying compositor lock and dismissing lockscreen.
+    pub fn unlock_session(&mut self) {
+        if let Some(lock) = self.session_lock.lock.take() {
+            info!("Unlocking and destroying ext-session-lock-v1 session");
+            lock.unlock_and_destroy();
+            self.session_lock.locked = false;
+            self.session_lock.surfaces.clear();
+        }
+        let _ = zenith_services::HyprlandService::dispatch("submap", "reset");
+        self.close_popup();
     }
 
     /// Creates a layer surface bar for a specific Wayland output (or default if None).
@@ -415,6 +599,7 @@ impl WaylandApp {
             egl_surface: None,
             scale_tracker,
             damage_ring: crate::render::damage::DamageRing::new(),
+            frame_callback_pending: false,
         });
 
         let _ = self.update_bar_visibility();
@@ -442,8 +627,37 @@ impl WaylandApp {
 
     /// Polls completed background workers and triggers Promise resolution callbacks.
     pub fn poll_async_tasks(&mut self) -> Result<usize, Box<dyn std::error::Error>> {
-        let count = self.runtime.poll_async_events()?;
+        let mut count = self.runtime.poll_async_events()?;
+        if let Some(ref rx) = self.pam_auth_rx {
+            if let Ok(success) = rx.try_recv() {
+                self.pam_auth_rx = None;
+                if success {
+                    self.runtime.set_search_query("");
+                    self.unlock_session();
+                } else {
+                    self.runtime.set_search_query("");
+                    if self.session_lock.locked {
+                        let _ = self.draw_lock_surfaces();
+                    } else if let Some(ref p) = self.popup {
+                        let id = p.id.clone();
+                        let _ = self.reload_popup(&id);
+                    }
+                }
+                count += 1;
+            }
+        }
         Ok(count)
+    }
+
+    /// Dispatches an asynchronous PAM authentication check in a background worker thread.
+    pub fn start_pam_auth(&mut self, password: &str) {
+        let pwd = password.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pam_auth_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = verify_pam_password_sync(&pwd);
+            let _ = tx.send(res);
+        });
     }
 
     /// Evaluates arbitrary Luau code via the embedded runtime (used by REPL).
@@ -501,21 +715,73 @@ impl WaylandApp {
         self.idle_manager.should_pause_animations() || self.monitor_manager.should_pause_rendering()
     }
 
-    /// Requests an optimized redraw of the active bar and popup surfaces without reloading scripts from disk.
+    /// Requests an optimized redraw of the active bar, popup and dock surfaces via VSync frame callbacks.
     pub fn request_redraw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.should_pause_animations() {
             return Ok(());
         }
-        for bar in &self.bars {
-            bar.surface.wl_surface().frame(&self.qh, bar.surface.wl_surface().clone());
-        }
-        if let Some(ref popup) = self.popup {
-            popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
-        }
-        if let Some(ref dock) = self.dock {
-            dock.surface.wl_surface().frame(&self.qh, dock.surface.wl_surface().clone());
+
+        if self.session_lock.locked {
+            let mut need_draw = false;
+            for surf in &mut self.session_lock.surfaces {
+                if !surf.frame_callback_pending {
+                    surf.frame_callback_pending = true;
+                    need_draw = true;
+                }
+            }
+            if need_draw {
+                let _ = self.draw_lock_surfaces();
+            }
+            return Ok(());
         }
 
+        let mut bars_need_draw = false;
+        for bar in &mut self.bars {
+            if !bar.frame_callback_pending {
+                bar.frame_callback_pending = true;
+                bars_need_draw = true;
+            } else {
+                self.needs_redraw_bars = true;
+            }
+        }
+        if bars_need_draw {
+            self.needs_redraw_bars = false;
+            let _ = self.update_bar_visibility();
+            let _ = self.draw();
+        }
+
+        if let Some(ref mut popup) = self.popup {
+            if !popup.frame_callback_pending {
+                popup.frame_callback_pending = true;
+                self.needs_redraw_popup = false;
+                let _ = self.draw_popup();
+            } else {
+                self.needs_redraw_popup = true;
+            }
+        }
+
+        if let Some(ref mut dock) = self.dock {
+            if !dock.frame_callback_pending {
+                dock.frame_callback_pending = true;
+                self.needs_redraw_dock = false;
+                let _ = self.update_dock_visibility();
+                if !self.dock_hidden {
+                    let _ = self.reload_dock();
+                }
+                let _ = self.draw_dock();
+            } else {
+                self.needs_redraw_dock = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Forces an immediate synchronous redraw of bars, popup and dock (bypassing VSync frame callbacks).
+    pub fn redraw_now(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.should_pause_animations() {
+            return Ok(());
+        }
         let _ = self.update_bar_visibility();
         self.draw()?;
         if let Some(ref p) = self.popup {
@@ -529,6 +795,9 @@ impl WaylandApp {
                 let _ = self.reload_dock();
             }
         }
+        self.needs_redraw_bars = false;
+        self.needs_redraw_popup = false;
+        self.needs_redraw_dock = false;
         Ok(())
     }
 
@@ -629,6 +898,59 @@ impl WaylandApp {
         Ok(())
     }
 
+    /// Resolves and caches the file content for an overlay script.
+    pub fn resolve_overlay_script(&mut self, id: &str, script_name: &str) -> Result<String, String> {
+        if let Some(cached_path) = self.overlay_path_cache.get(id) {
+            if let Ok(content) = std::fs::read_to_string(cached_path) {
+                return Ok(content);
+            }
+        }
+
+        let mut candidates = vec![
+            format!("config/zenith/overlays/{}.luau", script_name),
+            format!("config/zenith/overlays/{}.lua", script_name),
+            format!("config/zenith/overlays/{}Popup.luau", script_name),
+            format!("config/zenith/overlays/{}.luau", id),
+            format!("config/zenith/{}.luau", script_name.to_lowercase()),
+            format!("../../config/zenith/overlays/{}.luau", script_name),
+            format!("../../config/zenith/overlays/{}.luau", id),
+        ];
+
+        if let Ok(config_dir) = std::env::var("ZENITH_CONFIG_DIR") {
+            candidates.push(format!("{}/overlays/{}.luau", config_dir, script_name));
+            candidates.push(format!("{}/overlays/{}.luau", config_dir, id));
+        }
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            candidates.push(format!("{}/zenith/overlays/{}.luau", xdg, script_name));
+            candidates.push(format!("{}/zenith/overlays/{}.luau", xdg, id));
+        }
+
+        for c in &candidates {
+            let p = std::path::PathBuf::from(c);
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                self.overlay_path_cache.insert(id.to_string(), p);
+                return Ok(content);
+            }
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            let home_candidates = [
+                format!("{}/.config/zenith/overlays/{}.luau", home, script_name),
+                format!("{}/.config/zenith/overlays/{}.luau", home, id),
+                format!("{}/.config/zenith/{}.luau", home, script_name.to_lowercase()),
+            ];
+            for c in &home_candidates {
+                let p = std::path::PathBuf::from(c);
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    self.overlay_path_cache.insert(id.to_string(), p);
+                    return Ok(content);
+                }
+            }
+        }
+
+        Err(format!("Cannot find overlay script for popup '{}'", id))
+    }
+
     /// Opens or switches to a popup window by overlay id.
     pub fn open_popup(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         if id.eq_ignore_ascii_case("dock") {
@@ -662,59 +984,7 @@ impl WaylandApp {
             _ => (id, Anchor::TOP | Anchor::RIGHT, 340, 380, 8, 14, 0, 0),
         };
 
-        let mut script_content = None;
-        if let Some(cached_path) = self.overlay_path_cache.get(id) {
-            if let Ok(content) = std::fs::read_to_string(cached_path) {
-                script_content = Some(content);
-            }
-        }
-
-        if script_content.is_none() {
-            let candidates = [
-                format!("config/zenith/overlays/{}.luau", script_name),
-                format!("config/zenith/overlays/{}.lua", script_name),
-                format!("config/zenith/overlays/{}Popup.luau", script_name),
-                format!("config/zenith/overlays/{}.luau", id),
-                format!("config/zenith/{}.luau", script_name.to_lowercase()),
-                format!("../../config/zenith/overlays/{}.luau", script_name),
-                format!("../../config/zenith/overlays/{}.luau", id),
-                format!("/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/{}.luau", script_name),
-                format!("/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/{}.luau", id),
-                format!("/home/lucas/.config/zenith/overlays/{}.luau", script_name),
-                format!("/home/lucas/.config/zenith/overlays/{}.luau", id),
-            ];
-
-            for c in &candidates {
-                let p = std::path::PathBuf::from(c);
-                if let Ok(content) = std::fs::read_to_string(&p) {
-                    self.overlay_path_cache.insert(id.to_string(), p);
-                    script_content = Some(content);
-                    break;
-                }
-            }
-
-            if script_content.is_none() {
-                if let Ok(home) = std::env::var("HOME") {
-                    let home_candidates = [
-                        format!("{}/.config/zenith/overlays/{}.luau", home, script_name),
-                        format!("{}/.config/zenith/overlays/{}.luau", home, id),
-                        format!("{}/.config/zenith/{}.luau", home, script_name.to_lowercase()),
-                    ];
-                    for c in &home_candidates {
-                        let p = std::path::PathBuf::from(c);
-                        if let Ok(content) = std::fs::read_to_string(&p) {
-                            self.overlay_path_cache.insert(id.to_string(), p);
-                            script_content = Some(content);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let content = script_content.ok_or_else(|| {
-            format!("Cannot find overlay script for popup '{}'", id)
-        })?;
+        let content = self.resolve_overlay_script(id, script_name)?;
 
         self.runtime.set_search_query("");
         self.runtime.set_selected_index(1);
@@ -853,6 +1123,7 @@ impl WaylandApp {
             spring,
             closing: false,
             damage_ring: crate::render::damage::DamageRing::new(),
+            frame_callback_pending: false,
         });
 
         Ok(())
@@ -1180,12 +1451,20 @@ impl WaylandApp {
             return Ok(());
         }
 
-        let candidates = [
-            format!("{}/.config/zenith/overlays/Dock.luau", std::env::var("HOME").unwrap_or_default()),
+        let mut candidates = vec![
             "config/zenith/overlays/Dock.luau".to_string(),
             "config/zenith/overlays/Dock.lua".to_string(),
-            "/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith/overlays/Dock.luau".to_string(),
+            "../../config/zenith/overlays/Dock.luau".to_string(),
         ];
+        if let Ok(config_dir) = std::env::var("ZENITH_CONFIG_DIR") {
+            candidates.push(format!("{}/overlays/Dock.luau", config_dir));
+        }
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            candidates.push(format!("{}/zenith/overlays/Dock.luau", xdg));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(format!("{}/.config/zenith/overlays/Dock.luau", home));
+        }
 
         let mut script_content = None;
         for c in &candidates {
@@ -1249,10 +1528,305 @@ impl WaylandApp {
             spring: None,
             closing: false,
             damage_ring: crate::render::damage::DamageRing::new(),
+            frame_callback_pending: false,
         });
 
         let _ = self.update_dock_visibility();
 
+        Ok(())
+    }
+
+    /// Scales computed layout boxes by fractional/integer surface scale factor.
+    pub fn scale_computed_boxes<'a>(
+        boxes: &'a [zenith_layout::ComputedBox],
+        scale_factor: f32,
+    ) -> std::borrow::Cow<'a, [zenith_layout::ComputedBox]> {
+        if (scale_factor - 1.0).abs() > 0.001 {
+            std::borrow::Cow::Owned(boxes.iter().map(|b| {
+                let mut scaled = b.clone();
+                scaled.x *= scale_factor;
+                scaled.y *= scale_factor;
+                scaled.width *= scale_factor;
+                scaled.height *= scale_factor;
+                scaled.border_width *= scale_factor;
+                scaled.border_radius *= scale_factor;
+                if let Some((ref txt, color, size)) = scaled.text {
+                    scaled.text = Some((txt.clone(), color, size * scale_factor));
+                }
+                if let Some(ref mut input) = scaled.text_input {
+                    input.font_size *= scale_factor;
+                }
+                if let Some(ref mut shadow) = scaled.shadow {
+                    shadow.blur *= scale_factor;
+                    shadow.offset_x *= scale_factor;
+                    shadow.offset_y *= scale_factor;
+                }
+                if let Some([cx, cy, cw, ch]) = scaled.clip_rect {
+                    scaled.clip_rect = Some([cx * scale_factor, cy * scale_factor, cw * scale_factor, ch * scale_factor]);
+                }
+                scaled
+            }).collect())
+        } else {
+            std::borrow::Cow::Borrowed(boxes)
+        }
+    }
+
+    /// Unified rendering pipeline for all Wayland surfaces (Bars, Dock, Popups, Lockscreen).
+    /// Enforces correct EGL make_current ordering before buffer age query, and swizzles
+    /// RGBA to Little-Endian Argb8888 (BGRA) for SHM fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_surface_pipeline_helper(
+        egl_context: &Option<std::sync::Arc<crate::egl::EglContext>>,
+        gles_renderer: &mut Option<crate::render::gles::GlesRenderer>,
+        font_system: &mut cosmic_text::FontSystem,
+        swash_cache: &mut cosmic_text::SwashCache,
+        pool: &mut smithay_client_toolkit::shm::slot::SlotPool,
+        qh: &QueueHandle<WaylandApp>,
+        wl_surface: &wl_surface::WlSurface,
+        egl_surface: &mut Option<crate::egl::EglSurface>,
+        damage_ring: &mut crate::render::damage::DamageRing<4>,
+        canvas_cache: &mut Vec<u8>,
+        render_boxes: &[zenith_layout::ComputedBox],
+        damage: Option<(i32, i32, i32, i32)>,
+        scale_factor: f32,
+        width: u32,
+        height: u32,
+        scale_or_spring: f32,
+        attach_frame_callback: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let phys_w = ((width as f32) * scale_factor).round().max(1.0) as u32;
+        let phys_h = ((height as f32) * scale_factor).round().max(1.0) as u32;
+
+        if let Some(ref egl_ctx) = egl_context {
+            if egl_surface.is_none() {
+                if let Ok(egl_surf) = egl_ctx.create_surface(wl_surface, phys_w, phys_h) {
+                    *egl_surface = Some(egl_surf);
+                }
+            }
+        }
+
+        let p_damage = damage.map(|(dx, dy, dw, dh)| {
+            let p_dx = ((dx as f32) * scale_factor).round() as i32;
+            let p_dy = ((dy as f32) * scale_factor).round() as i32;
+            let p_dw = ((dw as f32) * scale_factor).round() as i32;
+            let p_dh = ((dh as f32) * scale_factor).round() as i32;
+            crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh)
+        });
+
+        let mut drawn_egl = false;
+        let mut dmg_rect = None;
+        let mut p_dx = 0;
+        let mut p_dy = 0;
+        let mut p_dw = phys_w as i32;
+        let mut p_dh = phys_h as i32;
+
+        if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (egl_context, gles_renderer) {
+            if let Some(ref egl_surf) = egl_surface {
+                // Critical: egl_ctx.make_current MUST be called BEFORE querying EGL_BUFFER_AGE_EXT
+                if egl_ctx.make_current(egl_surf).is_ok() {
+                    let buffer_age = egl_surf.query_buffer_age();
+                    let calculated_dmg = damage_ring.rotate_damage_with_age(p_damage, buffer_age, phys_w as i32, phys_h as i32);
+                    dmg_rect = calculated_dmg;
+                    let (dx, dy, dw, dh) = calculated_dmg
+                        .map(|r| (r.x, r.y, r.width, r.height))
+                        .unwrap_or((0, 0, phys_w as i32, phys_h as i32));
+                    p_dx = dx;
+                    p_dy = dy;
+                    p_dw = dw;
+                    p_dh = dh;
+
+                    if gles_rend.render_boxes(
+                        render_boxes,
+                        phys_w,
+                        phys_h,
+                        scale_or_spring,
+                        font_system,
+                        swash_cache,
+                        calculated_dmg,
+                    ).is_ok() {
+                        let _ = egl_surf.swap_buffers_with_damage(calculated_dmg);
+                        if attach_frame_callback {
+                            wl_surface.frame(qh, wl_surface.clone());
+                        }
+                        wl_surface.damage_buffer(p_dx, p_dy, p_dw, p_dh);
+                        wl_surface.commit();
+                        drawn_egl = true;
+                    }
+                }
+            }
+        }
+
+        if !drawn_egl {
+            if dmg_rect.is_none() {
+                dmg_rect = damage_ring.rotate_damage_with_age(p_damage, None, phys_w as i32, phys_h as i32);
+                let (dx, dy, dw, dh) = dmg_rect
+                    .map(|r| (r.x, r.y, r.width, r.height))
+                    .unwrap_or((0, 0, phys_w as i32, phys_h as i32));
+                p_dx = dx;
+                p_dy = dy;
+                p_dw = dw;
+                p_dh = dh;
+            }
+
+            let shm_target_len = (phys_w * phys_h * 4) as usize;
+            let shm_stride = phys_w * 4;
+            if canvas_cache.len() != shm_target_len {
+                *canvas_cache = vec![0u8; shm_target_len];
+            } else if damage.is_some() {
+                let cx1 = p_dx.max(0) as usize;
+                let cy1 = p_dy.max(0) as usize;
+                let cx2 = (p_dx + p_dw).max(0).min(phys_w as i32) as usize;
+                let cy2 = (p_dy + p_dh).max(0).min(phys_h as i32) as usize;
+                for row_y in cy1..cy2 {
+                    let row_start = (row_y * phys_w as usize + cx1) * 4;
+                    let row_end = (row_y * phys_w as usize + cx2) * 4;
+                    if row_end <= canvas_cache.len() {
+                        canvas_cache[row_start..row_end].fill(0);
+                    }
+                }
+            } else {
+                canvas_cache.fill(0);
+            }
+
+            Self::render_boxes_to_canvas(
+                canvas_cache,
+                render_boxes,
+                phys_w,
+                phys_h,
+                scale_or_spring,
+                font_system,
+                swash_cache,
+                dmg_rect,
+            )?;
+
+            let (buffer, canvas) = pool.create_buffer(
+                phys_w as i32,
+                phys_h as i32,
+                shm_stride as i32,
+                wl_shm::Format::Argb8888,
+            )?;
+
+            copy_rgba_to_argb8888(canvas, canvas_cache);
+
+            buffer.attach_to(wl_surface)?;
+            if attach_frame_callback {
+                wl_surface.frame(qh, wl_surface.clone());
+            }
+            wl_surface.damage_buffer(p_dx, p_dy, p_dw, p_dh);
+            wl_surface.commit();
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_surface_pipeline(
+        &mut self,
+        wl_surface: &wl_surface::WlSurface,
+        egl_surface: &mut Option<crate::egl::EglSurface>,
+        damage_ring: &mut crate::render::damage::DamageRing<4>,
+        canvas_cache: &mut Vec<u8>,
+        render_boxes: &[zenith_layout::ComputedBox],
+        damage: Option<(i32, i32, i32, i32)>,
+        scale_factor: f32,
+        width: u32,
+        height: u32,
+        scale_or_spring: f32,
+        attach_frame_callback: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Self::render_surface_pipeline_helper(
+            &self.egl_context,
+            &mut self.gles_renderer,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &mut self.pool,
+            &self.qh,
+            wl_surface,
+            egl_surface,
+            damage_ring,
+            canvas_cache,
+            render_boxes,
+            damage,
+            scale_factor,
+            width,
+            height,
+            scale_or_spring,
+            attach_frame_callback,
+        )
+    }
+
+    /// Renders the LockScreen UI tree directly to all active ExtSessionLockSurfaceV1 Wayland surfaces.
+    pub fn draw_lock_surfaces(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.session_lock.locked {
+            return Ok(());
+        }
+
+        let script = self.resolve_overlay_script("lockscreen", "LockScreen").unwrap_or_else(|_| {
+            r##"
+            local Ui = Zenith.Ui
+            return Ui.Column {
+                width = "100%",
+                height = "100%",
+                align_items = "center",
+                justify_content = "center",
+                background_color = "#101216",
+                children = {
+                    Ui.Text { text = "Zenith Desktop Locked", font_size = 28, color = "#FFFFFF" },
+                    Ui.TextInput { id = "password", placeholder = "Enter password to unlock...", active = true }
+                }
+            }
+            "##.to_string()
+        });
+
+        for i in 0..self.session_lock.surfaces.len() {
+            let surf = &self.session_lock.surfaces[i];
+            if !surf.configured || surf.width == 0 || surf.height == 0 {
+                continue;
+            }
+            let width = surf.width;
+            let height = surf.height;
+
+            self.runtime.set_current_output_geometry("lock", width, height);
+            let root_ui = match self.runtime.eval_ui(&script) {
+                Ok(ui) => ui,
+                Err(e) => {
+                    tracing::error!("Failed to evaluate LockScreen UI: {}", e);
+                    continue;
+                }
+            };
+
+            let new_boxes = self.layout_engine.compute(&root_ui, width as f32, height as f32);
+            let surf = &mut self.session_lock.surfaces[i];
+            let damage = Self::compute_damage_rect(&surf.computed_boxes, &new_boxes, width, height);
+            surf.computed_boxes = new_boxes;
+
+            let render_boxes = std::borrow::Cow::Borrowed(&surf.computed_boxes);
+            let wl_surf = surf.wl_surface.clone();
+            let egl_surf = &mut surf.egl_surface;
+            let damage_ring = &mut surf.damage_ring;
+            let canvas_cache = &mut surf.canvas_cache;
+            let attach_frame = surf.frame_callback_pending;
+
+            Self::render_surface_pipeline_helper(
+                &self.egl_context,
+                &mut self.gles_renderer,
+                &mut self.font_system,
+                &mut self.swash_cache,
+                &mut self.pool,
+                &self.qh,
+                &wl_surf,
+                egl_surf,
+                damage_ring,
+                canvas_cache,
+                &render_boxes,
+                damage,
+                1.0,
+                width,
+                height,
+                1.0,
+                attach_frame,
+            )?;
+        }
         Ok(())
     }
 
@@ -1301,8 +1875,7 @@ impl WaylandApp {
                 wl_shm::Format::Argb8888,
             )?;
 
-            let copy_len = canvas.len().min(dock.canvas_cache.len());
-            canvas[..copy_len].copy_from_slice(&dock.canvas_cache[..copy_len]);
+            copy_rgba_to_argb8888(canvas, &dock.canvas_cache);
 
             buffer.attach_to(dock.surface.wl_surface())?;
             dock.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
@@ -1321,126 +1894,36 @@ impl WaylandApp {
         dock.computed_boxes = new_boxes;
 
         let scale_factor = dock.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
-        let (phys_w, phys_h) = dock.scale_tracker.as_ref().map(|t| t.physical_size(width, height)).unwrap_or((width, height));
         if let Some(ref tracker) = dock.scale_tracker {
             tracker.apply_destination(width as i32, height as i32);
         }
 
-        let render_boxes: std::borrow::Cow<'_, [zenith_layout::ComputedBox]> = if (scale_factor - 1.0).abs() > 0.001 {
-            std::borrow::Cow::Owned(dock.computed_boxes.iter().map(|b| {
-                let mut scaled = b.clone();
-                scaled.x *= scale_factor;
-                scaled.y *= scale_factor;
-                scaled.width *= scale_factor;
-                scaled.height *= scale_factor;
-                scaled.border_width *= scale_factor;
-                scaled.border_radius *= scale_factor;
-                if let Some((ref txt, color, size)) = scaled.text {
-                    scaled.text = Some((txt.clone(), color, size * scale_factor));
-                }
-                if let Some(ref mut input) = scaled.text_input {
-                    input.font_size *= scale_factor;
-                }
-                if let Some(ref mut shadow) = scaled.shadow {
-                    shadow.blur *= scale_factor;
-                    shadow.offset_x *= scale_factor;
-                    shadow.offset_y *= scale_factor;
-                }
-                if let Some([cx, cy, cw, ch]) = scaled.clip_rect {
-                    scaled.clip_rect = Some([cx * scale_factor, cy * scale_factor, cw * scale_factor, ch * scale_factor]);
-                }
-                scaled
-            }).collect())
-        } else {
-            std::borrow::Cow::Borrowed(&dock.computed_boxes)
-        };
+        let render_boxes = Self::scale_computed_boxes(&dock.computed_boxes, scale_factor);
+        let wl_surf = dock.surface.wl_surface().clone();
+        let egl_surf = &mut dock.egl_surface;
+        let damage_ring = &mut dock.damage_ring;
+        let canvas_cache = &mut dock.canvas_cache;
+        let attach_frame = dock.frame_callback_pending;
 
-        let mut drawn_egl = false;
-        let p_damage = damage.map(|(dx, dy, dw, dh)| {
-            let p_dx = ((dx as f32) * scale_factor).round() as i32;
-            let p_dy = ((dy as f32) * scale_factor).round() as i32;
-            let p_dw = ((dw as f32) * scale_factor).round() as i32;
-            let p_dh = ((dh as f32) * scale_factor).round() as i32;
-            crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh)
-        });
-        let dmg_rect = dock.damage_ring.rotate_damage(p_damage, phys_w as i32, phys_h as i32);
-        let (p_dx, p_dy, p_dw, p_dh) = dmg_rect
-            .map(|r| (r.x, r.y, r.width, r.height))
-            .unwrap_or((0, 0, phys_w as i32, phys_h as i32));
-
-        if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (&self.egl_context, &mut self.gles_renderer) {
-            if dock.egl_surface.is_none() {
-                if let Ok(egl_surf) = egl_ctx.create_surface(dock.surface.wl_surface(), phys_w, phys_h) {
-                    dock.egl_surface = Some(egl_surf);
-                }
-            }
-
-            if let Some(ref egl_surf) = dock.egl_surface {
-                if egl_ctx.make_current(egl_surf).is_ok()
-                    && gles_rend.render_boxes(
-                        &render_boxes,
-                        phys_w,
-                        phys_h,
-                        1.0,
-                        &mut self.font_system,
-                        &mut self.swash_cache,
-                        dmg_rect,
-                    ).is_ok()
-                {
-                    let _ = egl_surf.swap_buffers_with_damage(dmg_rect);
-                    dock.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
-                    dock.surface.commit();
-                    drawn_egl = true;
-                }
-            }
-        }
-
-        if !drawn_egl {
-            let shm_target_len = (phys_w * phys_h * 4) as usize;
-            let shm_stride = phys_w * 4;
-            if dock.canvas_cache.len() != shm_target_len {
-                dock.canvas_cache = vec![0u8; shm_target_len];
-            } else if damage.is_some() {
-                let cx1 = p_dx.max(0) as usize;
-                let cy1 = p_dy.max(0) as usize;
-                let cx2 = (p_dx + p_dw).max(0).min(phys_w as i32) as usize;
-                let cy2 = (p_dy + p_dh).max(0).min(phys_h as i32) as usize;
-                for row_y in cy1..cy2 {
-                    let row_start = (row_y * phys_w as usize + cx1) * 4;
-                    let row_end = (row_y * phys_w as usize + cx2) * 4;
-                    if row_end <= dock.canvas_cache.len() {
-                        dock.canvas_cache[row_start..row_end].fill(0);
-                    }
-                }
-            } else {
-                dock.canvas_cache.fill(0);
-            }
-
-            Self::render_boxes_to_canvas(
-                &mut dock.canvas_cache,
-                &render_boxes,
-                phys_w,
-                phys_h,
-                1.0,
-                &mut self.font_system,
-                &mut self.swash_cache,
-                dmg_rect,
-            )?;
-
-            let (buffer, canvas) = self.pool.create_buffer(
-                phys_w as i32,
-                phys_h as i32,
-                shm_stride as i32,
-                wl_shm::Format::Argb8888,
-            )?;
-
-            let copy_len = canvas.len().min(dock.canvas_cache.len());
-            canvas[..copy_len].copy_from_slice(&dock.canvas_cache[..copy_len]);
-
-            buffer.attach_to(dock.surface.wl_surface())?;
-            dock.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
-            dock.surface.commit();
-        }
+        Self::render_surface_pipeline_helper(
+            &self.egl_context,
+            &mut self.gles_renderer,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &mut self.pool,
+            &self.qh,
+            &wl_surf,
+            egl_surf,
+            damage_ring,
+            canvas_cache,
+            &render_boxes,
+            damage,
+            scale_factor,
+            width,
+            height,
+            1.0,
+            attach_frame,
+        )?;
 
         Ok(())
     }
@@ -1506,21 +1989,11 @@ impl WaylandApp {
         } else if action == "popup:close" || action == "close" {
             self.close_popup();
         } else if action == "lock" || action == "system:lock" {
-            let _ = self.open_popup("LockScreen");
+            self.lock_session();
         } else if action == "lock:unlock" {
             let query = self.runtime.get_search_query();
-            if verify_pam_password(&query) {
-                self.runtime.set_search_query("");
-                let _ = zenith_services::HyprlandService::dispatch("submap", "reset");
-                self.close_popup();
-            } else {
-                self.runtime.set_search_query("");
-                if let Some(ref p) = self.popup {
-                    let id = p.id.clone();
-                    let _ = self.reload_popup(&id);
-                    let _ = self.draw_popup();
-                }
-            }
+            self.runtime.set_search_query("");
+            self.start_pam_auth(&query);
         } else if action == "bar:toggle_autohide" {
             let cur = self.runtime.storage.get("barAutoHide").and_then(|v| v.as_bool()).unwrap_or_else(Self::read_bar_autohide_setting);
             let next = !cur;
@@ -1588,7 +2061,7 @@ impl WaylandApp {
         }
     }
 
-    /// Draw the computed Luau layout into the SHM buffer for all active bar outputs.
+    /// Draw the computed Luau layout into the SHM or EGL buffer for all active bar outputs.
     pub fn draw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.monitor_manager.should_pause_rendering() {
             return Ok(());
@@ -1632,8 +2105,7 @@ impl WaylandApp {
                     stride as i32,
                     wl_shm::Format::Argb8888,
                 )?;
-                let copy_len = canvas.len().min(bar.canvas_cache.len());
-                canvas[..copy_len].copy_from_slice(&bar.canvas_cache[..copy_len]);
+                copy_rgba_to_argb8888(canvas, &bar.canvas_cache);
                 buffer.attach_to(bar.surface.wl_surface())?;
                 bar.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
                 bar.surface.commit();
@@ -1668,132 +2140,42 @@ impl WaylandApp {
             bar.computed_boxes = new_boxes;
 
             let scale_factor = bar.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
-            let (phys_w, phys_h) = bar.scale_tracker.as_ref().map(|t| t.physical_size(width, height)).unwrap_or((width, height));
             if let Some(ref tracker) = bar.scale_tracker {
                 tracker.apply_destination(width as i32, height as i32);
             }
 
-            let render_boxes: std::borrow::Cow<'_, [zenith_layout::ComputedBox]> = if (scale_factor - 1.0).abs() > 0.001 {
-                std::borrow::Cow::Owned(bar.computed_boxes.iter().map(|b| {
-                    let mut scaled = b.clone();
-                    scaled.x *= scale_factor;
-                    scaled.y *= scale_factor;
-                    scaled.width *= scale_factor;
-                    scaled.height *= scale_factor;
-                    scaled.border_width *= scale_factor;
-                    scaled.border_radius *= scale_factor;
-                    if let Some((ref txt, color, size)) = scaled.text {
-                        scaled.text = Some((txt.clone(), color, size * scale_factor));
-                    }
-                    if let Some(ref mut input) = scaled.text_input {
-                        input.font_size *= scale_factor;
-                    }
-                    if let Some(ref mut shadow) = scaled.shadow {
-                        shadow.blur *= scale_factor;
-                        shadow.offset_x *= scale_factor;
-                        shadow.offset_y *= scale_factor;
-                    }
-                    if let Some([cx, cy, cw, ch]) = scaled.clip_rect {
-                        scaled.clip_rect = Some([cx * scale_factor, cy * scale_factor, cw * scale_factor, ch * scale_factor]);
-                    }
-                    scaled
-                }).collect())
-            } else {
-                std::borrow::Cow::Borrowed(&bar.computed_boxes)
-            };
+            let render_boxes = Self::scale_computed_boxes(&bar.computed_boxes, scale_factor);
+            let wl_surf = bar.surface.wl_surface().clone();
+            let egl_surf = &mut bar.egl_surface;
+            let damage_ring = &mut bar.damage_ring;
+            let canvas_cache = &mut bar.canvas_cache;
+            let attach_frame = bar.frame_callback_pending;
 
-            let mut drawn_egl = false;
-            let p_damage = damage.map(|(dx, dy, dw, dh)| {
-                let p_dx = ((dx as f32) * scale_factor).round() as i32;
-                let p_dy = ((dy as f32) * scale_factor).round() as i32;
-                let p_dw = ((dw as f32) * scale_factor).round() as i32;
-                let p_dh = ((dh as f32) * scale_factor).round() as i32;
-                crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh)
-            });
-            let dmg_rect = bar.damage_ring.rotate_damage(p_damage, phys_w as i32, phys_h as i32);
-            let (p_dx, p_dy, p_dw, p_dh) = dmg_rect
-                .map(|r| (r.x, r.y, r.width, r.height))
-                .unwrap_or((0, 0, phys_w as i32, phys_h as i32));
-
-            if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (&self.egl_context, &mut self.gles_renderer) {
-                if bar.egl_surface.is_none() {
-                    if let Ok(egl_surf) = egl_ctx.create_surface(bar.surface.wl_surface(), phys_w, phys_h) {
-                        bar.egl_surface = Some(egl_surf);
-                    }
-                }
-
-                if let Some(ref egl_surf) = bar.egl_surface {
-                    if egl_ctx.make_current(egl_surf).is_ok()
-                        && gles_rend.render_boxes(
-                            &render_boxes,
-                            phys_w,
-                            phys_h,
-                            1.0,
-                            &mut self.font_system,
-                            &mut self.swash_cache,
-                            dmg_rect,
-                        ).is_ok()
-                    {
-                        let _ = egl_surf.swap_buffers_with_damage(dmg_rect);
-                        bar.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
-                        bar.surface.commit();
-                        drawn_egl = true;
-                    }
-                }
-            }
-
-            if !drawn_egl {
-                let shm_target_len = (phys_w * phys_h * 4) as usize;
-                let shm_stride = phys_w * 4;
-                if bar.canvas_cache.len() != shm_target_len {
-                    bar.canvas_cache = vec![0u8; shm_target_len];
-                } else if damage.is_some() {
-                    let cx1 = p_dx.max(0) as usize;
-                    let cy1 = p_dy.max(0) as usize;
-                    let cx2 = (p_dx + p_dw).max(0).min(phys_w as i32) as usize;
-                    let cy2 = (p_dy + p_dh).max(0).min(phys_h as i32) as usize;
-                    for row_y in cy1..cy2 {
-                        let row_start = (row_y * phys_w as usize + cx1) * 4;
-                        let row_end = (row_y * phys_w as usize + cx2) * 4;
-                        if row_end <= bar.canvas_cache.len() {
-                            bar.canvas_cache[row_start..row_end].fill(0);
-                        }
-                    }
-                } else {
-                    bar.canvas_cache.fill(0);
-                }
-
-                Self::render_boxes_to_canvas(
-                    &mut bar.canvas_cache,
-                    &render_boxes,
-                    phys_w,
-                    phys_h,
-                    1.0,
-                    &mut self.font_system,
-                    &mut self.swash_cache,
-                    dmg_rect,
-                )?;
-
-                let (buffer, canvas) = self.pool.create_buffer(
-                    phys_w as i32,
-                    phys_h as i32,
-                    shm_stride as i32,
-                    wl_shm::Format::Argb8888,
-                )?;
-
-                let copy_len = canvas.len().min(bar.canvas_cache.len());
-                canvas[..copy_len].copy_from_slice(&bar.canvas_cache[..copy_len]);
-
-                buffer.attach_to(bar.surface.wl_surface())?;
-                bar.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
-                bar.surface.commit();
-            }
+            Self::render_surface_pipeline_helper(
+                &self.egl_context,
+                &mut self.gles_renderer,
+                &mut self.font_system,
+                &mut self.swash_cache,
+                &mut self.pool,
+                &self.qh,
+                &wl_surf,
+                egl_surf,
+                damage_ring,
+                canvas_cache,
+                &render_boxes,
+                damage,
+                scale_factor,
+                width,
+                height,
+                1.0,
+                attach_frame,
+            )?;
         }
 
         Ok(())
     }
 
-    /// Draw the computed Luau layout for the open popup into the SHM buffer.
+    /// Draw the computed Luau layout for the open popup into the SHM or EGL buffer.
     pub fn draw_popup(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.monitor_manager.should_pause_rendering() {
             return Ok(());
@@ -1836,133 +2218,39 @@ impl WaylandApp {
         popup.computed_boxes = new_boxes;
 
         let scale_factor = popup.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
-        let (phys_w, phys_h) = popup.scale_tracker.as_ref().map(|t| t.physical_size(width, height)).unwrap_or((width, height));
         if let Some(ref tracker) = popup.scale_tracker {
             tracker.apply_destination(width as i32, height as i32);
         }
 
-        let render_boxes: std::borrow::Cow<'_, [zenith_layout::ComputedBox]> = if (scale_factor - 1.0).abs() > 0.001 {
-            std::borrow::Cow::Owned(popup.computed_boxes.iter().map(|b| {
-                let mut scaled = b.clone();
-                scaled.x *= scale_factor;
-                scaled.y *= scale_factor;
-                scaled.width *= scale_factor;
-                scaled.height *= scale_factor;
-                scaled.border_width *= scale_factor;
-                scaled.border_radius *= scale_factor;
-                if let Some((ref txt, color, size)) = scaled.text {
-                    scaled.text = Some((txt.clone(), color, size * scale_factor));
-                }
-                if let Some(ref mut input) = scaled.text_input {
-                    input.font_size *= scale_factor;
-                }
-                if let Some(ref mut shadow) = scaled.shadow {
-                    shadow.blur *= scale_factor;
-                    shadow.offset_x *= scale_factor;
-                    shadow.offset_y *= scale_factor;
-                }
-                if let Some([cx, cy, cw, ch]) = scaled.clip_rect {
-                    scaled.clip_rect = Some([cx * scale_factor, cy * scale_factor, cw * scale_factor, ch * scale_factor]);
-                }
-                scaled
-            }).collect())
-        } else {
-            std::borrow::Cow::Borrowed(&popup.computed_boxes)
-        };
+        let render_boxes = Self::scale_computed_boxes(&popup.computed_boxes, scale_factor);
+        let wl_surf = popup.surface.wl_surface().clone();
+        let egl_surf = &mut popup.egl_surface;
+        let damage_ring = &mut popup.damage_ring;
+        let canvas_cache = &mut popup.canvas_cache;
+        let attach_frame = is_animating || popup.frame_callback_pending;
 
-        let mut drawn_egl = false;
-        let p_damage = damage.map(|(dx, dy, dw, dh)| {
-            let p_dx = ((dx as f32) * scale_factor).round() as i32;
-            let p_dy = ((dy as f32) * scale_factor).round() as i32;
-            let p_dw = ((dw as f32) * scale_factor).round() as i32;
-            let p_dh = ((dh as f32) * scale_factor).round() as i32;
-            crate::render::DamageRect::new(p_dx, p_dy, p_dw, p_dh)
-        });
-        let dmg_rect = popup.damage_ring.rotate_damage(p_damage, phys_w as i32, phys_h as i32);
-        let (p_dx, p_dy, p_dw, p_dh) = dmg_rect
-            .map(|r| (r.x, r.y, r.width, r.height))
-            .unwrap_or((0, 0, phys_w as i32, phys_h as i32));
+        Self::render_surface_pipeline_helper(
+            &self.egl_context,
+            &mut self.gles_renderer,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &mut self.pool,
+            &self.qh,
+            &wl_surf,
+            egl_surf,
+            damage_ring,
+            canvas_cache,
+            &render_boxes,
+            damage,
+            scale_factor,
+            width,
+            height,
+            spring_val,
+            attach_frame,
+        )?;
 
-        if let (Some(ref egl_ctx), Some(ref mut gles_rend)) = (&self.egl_context, &mut self.gles_renderer) {
-            if popup.egl_surface.is_none() {
-                if let Ok(egl_surf) = egl_ctx.create_surface(popup.surface.wl_surface(), phys_w, phys_h) {
-                    popup.egl_surface = Some(egl_surf);
-                }
-            }
-
-            if let Some(ref egl_surf) = popup.egl_surface {
-                if egl_ctx.make_current(egl_surf).is_ok()
-                    && gles_rend.render_boxes(
-                        &render_boxes,
-                        phys_w,
-                        phys_h,
-                        spring_val,
-                        &mut self.font_system,
-                        &mut self.swash_cache,
-                        dmg_rect,
-                    ).is_ok()
-                {
-                    let _ = egl_surf.swap_buffers_with_damage(dmg_rect);
-                    if is_animating {
-                        popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
-                    }
-                    popup.surface.wl_surface().damage_buffer(p_dx, p_dy, p_dw, p_dh);
-                    popup.surface.commit();
-                    drawn_egl = true;
-                }
-            }
-        }
-
-        if !drawn_egl {
-            let shm_target_len = (phys_w * phys_h * 4) as usize;
-            let shm_stride = phys_w * 4;
-            if popup.canvas_cache.len() != shm_target_len {
-                popup.canvas_cache = vec![0u8; shm_target_len];
-            } else if damage.is_some() {
-                let cx1 = p_dx.max(0) as usize;
-                let cy1 = p_dy.max(0) as usize;
-                let cx2 = (p_dx + p_dw).max(0).min(phys_w as i32) as usize;
-                let cy2 = (p_dy + p_dh).max(0).min(phys_h as i32) as usize;
-                for row_y in cy1..cy2 {
-                    let row_start = (row_y * phys_w as usize + cx1) * 4;
-                    let row_end = (row_y * phys_w as usize + cx2) * 4;
-                    if row_end <= popup.canvas_cache.len() {
-                        popup.canvas_cache[row_start..row_end].fill(0);
-                    }
-                }
-            } else {
-                popup.canvas_cache.fill(0);
-            }
-
-            Self::render_boxes_to_canvas(
-                &mut popup.canvas_cache,
-                &render_boxes,
-                phys_w,
-                phys_h,
-                spring_val,
-                &mut self.font_system,
-                &mut self.swash_cache,
-                dmg_rect,
-            )?;
-
-            let (buffer, canvas) = self.pool.create_buffer(
-                phys_w as i32,
-                phys_h as i32,
-                shm_stride as i32,
-                wl_shm::Format::Argb8888,
-            )?;
-
-            let copy_len = canvas.len().min(popup.canvas_cache.len());
-            canvas[..copy_len].copy_from_slice(&popup.canvas_cache[..copy_len]);
-
-            buffer.attach_to(popup.surface.wl_surface())?;
-            if is_animating {
-                popup.surface.wl_surface().frame(&self.qh, popup.surface.wl_surface().clone());
-            }
-            let p_dw = ((width as f32) * scale_factor).round() as i32;
-            let p_dh = ((height as f32) * scale_factor).round() as i32;
-            popup.surface.wl_surface().damage_buffer(0, 0, p_dw, p_dh);
-            popup.surface.commit();
+        if is_animating {
+            popup.frame_callback_pending = true;
         }
 
         Ok(())
@@ -2049,6 +2337,115 @@ delegate_seat!(WaylandApp);
 delegate_pointer!(WaylandApp);
 delegate_keyboard!(WaylandApp);
 delegate_registry!(WaylandApp);
+delegate_data_device!(WaylandApp);
+
+impl AsMut<DataDeviceManagerState> for WaylandApp {
+    fn as_mut(&mut self) -> &mut DataDeviceManagerState {
+        self.clipboard_manager
+            .manager_state
+            .as_mut()
+            .expect("DataDeviceManagerState not initialized")
+    }
+}
+
+impl DataDeviceHandler for WaylandApp {
+    fn enter(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice, _x: f64, _y: f64, _surface: &wayland_client::protocol::wl_surface::WlSurface) {}
+    fn leave(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice) {}
+    fn motion(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice, _x: f64, _y: f64) {}
+    fn selection(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice) {
+        if self.clipboard_manager.copy_source.is_none() {
+            if let Some(ref device) = self.clipboard_manager.data_device {
+                if let Some(offer) = device.data().selection_offer() {
+                    let mime_match = offer.with_mime_types(|types| {
+                        crate::clipboard::TEXT_MIME_TYPES
+                            .iter()
+                            .find(|m| types.iter().any(|t| t == *m))
+                            .copied()
+                    });
+                    if let Some(mime) = mime_match {
+                        if let Ok(mut read_pipe) = offer.receive(mime.to_string()) {
+                            let ram_buf = self.clipboard_manager.ram_buffer.clone();
+                            std::thread::spawn(move || {
+                                use std::io::Read;
+                                let mut text = String::new();
+                                if read_pipe.read_to_string(&mut text).is_ok() && !text.is_empty() {
+                                    if let Ok(mut lock) = ram_buf.lock() {
+                                        *lock = text;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn drop_performed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice) {}
+}
+
+impl DataOfferHandler for WaylandApp {
+    fn source_actions(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _offer: &mut smithay_client_toolkit::data_device_manager::data_offer::DragOffer,
+        _actions: wayland_client::protocol::wl_data_device_manager::DndAction,
+    ) {}
+    fn selected_action(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _offer: &mut smithay_client_toolkit::data_device_manager::data_offer::DragOffer,
+        _actions: wayland_client::protocol::wl_data_device_manager::DndAction,
+    ) {}
+}
+
+impl DataSourceHandler for WaylandApp {
+    fn accept_mime(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &wayland_client::protocol::wl_data_source::WlDataSource,
+        _mime: Option<String>,
+    ) {}
+    fn send_request(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &wayland_client::protocol::wl_data_source::WlDataSource,
+        mime: String,
+        write_pipe: smithay_client_toolkit::data_device_manager::WritePipe,
+    ) {
+        self.clipboard_manager.handle_send_request(&mime, write_pipe);
+    }
+    fn cancelled(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &wayland_client::protocol::wl_data_source::WlDataSource,
+    ) {
+        self.clipboard_manager.copy_source = None;
+    }
+    fn dnd_dropped(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &wayland_client::protocol::wl_data_source::WlDataSource,
+    ) {}
+    fn dnd_finished(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &wayland_client::protocol::wl_data_source::WlDataSource,
+    ) {}
+    fn action(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &wayland_client::protocol::wl_data_source::WlDataSource,
+        _action: wayland_client::protocol::wl_data_device_manager::DndAction,
+    ) {}
+}
 
 impl AsMut<SubcompositorState> for WaylandApp {
     fn as_mut(&mut self) -> &mut SubcompositorState {
@@ -2296,6 +2693,11 @@ impl SeatHandler for WaylandApp {
     }
 
     fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wayland_client::protocol::wl_seat::WlSeat) {
+        if self.clipboard_manager.data_device.is_none() {
+            if let Some(ref mgr) = self.clipboard_manager.manager_state {
+                self.clipboard_manager.data_device = Some(mgr.get_data_device(qh, &seat));
+            }
+        }
         self.idle_manager.register_seat(&seat, qh);
         if self.pointer.is_none() {
             if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
@@ -2385,6 +2787,40 @@ impl SeatHandler for WaylandApp {
         self.cursor_shape_device = None;
         self.keyboard = None;
     }
+}
+
+fn measure_text_cursor_idx(
+    font_system: &mut cosmic_text::FontSystem,
+    text: &str,
+    font_size: f32,
+    rel_x: f32,
+) -> usize {
+    if text.is_empty() || rel_x <= 0.0 {
+        return 0;
+    }
+    let font_family = std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string());
+    let mut buffer = cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(font_size, font_size * 1.3));
+    buffer.set_text(
+        text,
+        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
+        cosmic_text::Shaping::Basic,
+        None,
+    );
+    buffer.shape_until_scroll(font_system, false);
+
+    for run in buffer.layout_runs() {
+        let mut total_w = 0.0f32;
+        for (idx, glyph) in run.glyphs.iter().enumerate() {
+            if rel_x < total_w + glyph.w * 0.5 {
+                return idx;
+            }
+            total_w += glyph.w;
+        }
+        return run.glyphs.len();
+    }
+
+    let char_w = (font_size * 0.62).max(1.0);
+    (rel_x / char_w).round() as usize
 }
 
 impl PointerHandler for WaylandApp {
@@ -2565,8 +3001,7 @@ impl PointerHandler for WaylandApp {
                                         if inp.id.as_deref() == Some(input_id) && inp.active {
                                             let (px, _) = self.pointer_pos;
                                             let rel_x = (px - b.x as f64).max(0.0) as f32;
-                                            let char_w = (inp.font_size * 0.62).max(1.0);
-                                            let char_idx = (rel_x / char_w).round() as usize;
+                                            let char_idx = measure_text_cursor_idx(&mut self.font_system, &inp.text, inp.font_size, rel_x);
                                             self.runtime.editor_drag(input_id, char_idx);
                                             let (cur, sel) = self.runtime.get_editor_state(input_id);
                                             inp.cursor_pos = cur;
@@ -2744,8 +3179,7 @@ impl PointerHandler for WaylandApp {
                                     if let Some(ref input) = b.text_input {
                                         let id = input.id.clone().unwrap_or_else(|| "text_input".to_string());
                                         let rel_x = (px - b.x as f64).max(0.0) as f32;
-                                        let char_w = (input.font_size * 0.62).max(1.0);
-                                        let char_idx = (rel_x / char_w).round() as usize;
+                                        let char_idx = measure_text_cursor_idx(&mut self.font_system, &input.text, input.font_size, rel_x);
                                         self.runtime.editor_click(&id, char_idx, self.modifiers.shift, std::time::Instant::now());
                                         let (cur, sel) = self.runtime.get_editor_state(&id);
                                         focused_new_input = Some((id, cur, sel));
@@ -3098,10 +3532,37 @@ impl KeyboardHandler for WaylandApp {
                 let is_ctrl = self.modifiers.ctrl;
                 let is_shift = self.modifiers.shift;
 
-                // Dead-key interception for ABNT2 / international layout
-                if let Some(dead_char) = keysym_to_dead_key(event.keysym) {
-                    self.active_dead_key = Some(dead_char);
-                    return;
+                if !is_ctrl {
+                    match self.compose_tracker.feed(event.keysym) {
+                        ComposeResult::Composed(text) => {
+                            self.runtime.editor_insert(input_id, &text);
+                            let cur_txt = self.runtime.get_input_text(input_id);
+                            let (cursor_pos, selection_range) = self.runtime.get_editor_state(input_id);
+                            if let Some(ref cb) = inp.on_change {
+                                let _ = self.runtime.trigger_callback_with_arg(cb, &cur_txt);
+                            }
+                            if let Some(ref mut popup) = self.popup {
+                                for pb in popup.computed_boxes.iter_mut() {
+                                    if let Some(ref mut pb_inp) = pb.text_input {
+                                        if pb_inp.id.as_deref() == Some(input_id) {
+                                            pb_inp.text = cur_txt.clone();
+                                            pb_inp.cursor_pos = cursor_pos;
+                                            pb_inp.selection_range = selection_range;
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = self.request_redraw();
+                            return;
+                        }
+                        ComposeResult::Composing => {
+                            return;
+                        }
+                        ComposeResult::Cancelled => {
+                            return;
+                        }
+                        ComposeResult::Nothing => {}
+                    }
                 }
 
                 match event.keysym {
@@ -3131,25 +3592,19 @@ impl KeyboardHandler for WaylandApp {
                     // Ctrl+C: Copy (Zero-Fork Native Wayland Clipboard + RAM Buffer)
                     Keysym::c | Keysym::C if is_ctrl => {
                         if let Some(text) = self.runtime.editor_copy(input_id) {
-                            self.clipboard_manager.copy(&text);
-                            if let Ok(mut lock) = self.clipboard.lock() {
-                                *lock = text;
-                            }
+                            self.clipboard_manager.copy_with_wayland(&self.qh, &text, _serial);
                         }
                         return;
                     }
                     // Ctrl+X: Cut (Zero-Fork Native Wayland Clipboard + RAM Buffer)
                     Keysym::x | Keysym::X if is_ctrl => {
                         if let Some(text) = self.runtime.editor_cut(input_id) {
-                            self.clipboard_manager.copy(&text);
-                            if let Ok(mut lock) = self.clipboard.lock() {
-                                *lock = text;
-                            }
+                            self.clipboard_manager.copy_with_wayland(&self.qh, &text, _serial);
                         }
                     }
                     // Ctrl+V: Paste (Zero-Fork Native Wayland Clipboard Offer + RAM Buffer)
                     Keysym::v | Keysym::V if is_ctrl => {
-                        let paste_text = self.clipboard_manager.paste();
+                        let paste_text = self.clipboard_manager.paste_with_conn(Some(_conn));
                         if !paste_text.is_empty() {
                             self.runtime.editor_paste(input_id, &paste_text);
                         }
@@ -3187,16 +3642,7 @@ impl KeyboardHandler for WaylandApp {
                     }
                     _ => {
                         if !is_ctrl {
-                            if let Some(dead_char) = self.active_dead_key.take() {
-                                if let Some(ref text) = event.utf8 {
-                                    let base_char = text.chars().next().unwrap_or(' ');
-                                    let composed = compose_dead_key(dead_char, base_char);
-                                    self.runtime.editor_insert(input_id, &composed);
-                                } else {
-                                    let composed = compose_dead_key(dead_char, ' ');
-                                    self.runtime.editor_insert(input_id, &composed);
-                                }
-                            } else if let Some(ref text) = event.utf8 {
+                            if let Some(ref text) = event.utf8 {
                                 let text = text.trim_matches(|c: char| c.is_control());
                                 if !text.is_empty() {
                                     self.runtime.editor_insert(input_id, text);
@@ -3245,17 +3691,10 @@ impl KeyboardHandler for WaylandApp {
                 }
             }
             Keysym::Return => {
-                if popup_id.eq_ignore_ascii_case("lock") || popup_id.eq_ignore_ascii_case("lockscreen") {
+                if popup_id.eq_ignore_ascii_case("lock") || popup_id.eq_ignore_ascii_case("lockscreen") || self.session_lock.locked {
                     let query = self.runtime.get_search_query();
-                    if verify_pam_password(&query) {
-                        self.runtime.set_search_query("");
-                        let _ = zenith_services::HyprlandService::dispatch("submap", "reset");
-                        self.close_popup();
-                    } else {
-                        self.runtime.set_search_query("");
-                        let _ = self.reload_popup(&popup_id);
-                        let _ = self.draw_popup();
-                    }
+                    self.runtime.set_search_query("");
+                    self.start_pam_auth(&query);
                     return;
                 }
                 if popup_id.eq_ignore_ascii_case("launcher") {
@@ -3383,11 +3822,25 @@ impl CompositorHandler for WaylandApp {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        // Session lock surfaces VSync sync
+        if self.session_lock.locked {
+            for surf in &mut self.session_lock.surfaces {
+                if surf.wl_surface == *surface {
+                    surf.frame_callback_pending = false;
+                    let _ = self.draw_lock_surfaces();
+                    return;
+                }
+            }
+        }
+
         // Step active spring animations on popups
         if let Some(ref mut popup) = self.popup {
             if popup.surface.wl_surface() == surface {
+                popup.frame_callback_pending = false;
+                let mut should_draw = self.needs_redraw_popup;
                 if let Some(ref mut anim) = popup.spring {
                     anim.step(0.016);
+                    should_draw = true;
                     if popup.closing && (anim.is_settled() || anim.current <= 0.04) {
                         self.popup = None;
                         return;
@@ -3400,17 +3853,41 @@ impl CompositorHandler for WaylandApp {
                             b.scroll_offset_y = new_scroll;
                         }
                     }
-                    let _ = self.request_redraw();
+                    should_draw = true;
                 }
-                let _ = self.draw_popup();
+                if should_draw {
+                    self.needs_redraw_popup = false;
+                    let _ = self.draw_popup();
+                }
+                return;
+            }
+        }
+
+        // Active dock VSync sync
+        if let Some(ref mut dock) = self.dock {
+            if dock.surface.wl_surface() == surface {
+                dock.frame_callback_pending = false;
+                if self.needs_redraw_dock {
+                    self.needs_redraw_dock = false;
+                    let _ = self.update_dock_visibility();
+                    if !self.dock_hidden {
+                        let _ = self.reload_dock();
+                    }
+                    let _ = self.draw_dock();
+                }
                 return;
             }
         }
 
         // Active bar VSync sync
-        for bar in &self.bars {
+        for bar in &mut self.bars {
             if bar.surface.wl_surface() == surface {
-                let _ = self.draw();
+                bar.frame_callback_pending = false;
+                if self.needs_redraw_bars {
+                    self.needs_redraw_bars = false;
+                    let _ = self.update_bar_visibility();
+                    let _ = self.draw();
+                }
                 break;
             }
         }
@@ -3680,8 +4157,48 @@ impl LayerShellHandler for WaylandApp {
 }
 
 /// Verifies user authentication password using system unix_chkpwd helper.
-fn verify_pam_password(password: &str) -> bool {
-    let user = std::env::var("USER").unwrap_or_else(|_| "lucas".to_string());
+fn get_current_username() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+        })
+}
+
+/// Verifies user authentication password using system unix_chkpwd helper.
+/// Runs in a worker thread with timeout to prevent main event loop deadlocks.
+pub fn verify_pam_password(password: &str) -> bool {
+    let pwd = password.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = verify_pam_password_sync(&pwd);
+        let _ = tx.send(res);
+    });
+
+    rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap_or(false)
+}
+
+fn verify_pam_password_sync(password: &str) -> bool {
+    let user = match get_current_username() {
+        Some(u) => u,
+        None => {
+            tracing::error!("Could not resolve active username for PAM authentication");
+            return false;
+        }
+    };
+
     let chkpwd_paths = [
         "/run/wrappers/bin/unix_chkpwd",
         "/usr/sbin/unix_chkpwd",
@@ -3691,7 +4208,7 @@ fn verify_pam_password(password: &str) -> bool {
 
     for path in &chkpwd_paths {
         if let Ok(mut child) = std::process::Command::new(path)
-            .args([&user, "nullok"])
+            .arg(&user)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

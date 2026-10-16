@@ -171,6 +171,7 @@
     "accentColor": "#fcbc00",
     "barAutoHide": true,
     "barCompactMode": false,
+    "cliphist_raw": "5814\tsystemctl --user start zenith-shell.service\n",
     "colorScheme": "tonal_spot",
     "counter": 42,
     "darkMode": true,

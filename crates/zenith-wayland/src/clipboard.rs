@@ -78,17 +78,41 @@ impl ClipboardManager {
         }
     }
 
-    /// Reads text from active system clipboard or RAM fallback without subprocesses.
-    pub fn paste(&self) -> String {
-        // First try reading from native Wayland selection offer
+    /// Reads text from active system clipboard or RAM fallback without deadlocks, optionally flushing connection.
+    pub fn paste_with_conn(&self, conn: Option<&wayland_client::Connection>) -> String {
+        // Return immediately from pre-fetched RAM buffer if populated
+        if let Ok(lock) = self.ram_buffer.lock() {
+            if !lock.is_empty() {
+                return lock.clone();
+            }
+        }
+
+        // Try fast reading from native Wayland selection offer only for supported MIME types
         if let Some(ref device) = self.data_device {
             if let Some(offer) = device.data().selection_offer() {
-                for mime in TEXT_MIME_TYPES {
+                let mime_match = offer.with_mime_types(|types| {
+                    TEXT_MIME_TYPES.iter().find(|m| types.iter().any(|t| t == *m)).copied()
+                });
+
+                if let Some(mime) = mime_match {
                     if let Ok(mut read_pipe) = offer.receive(mime.to_string()) {
-                        use std::io::Read;
-                        let mut content = String::new();
-                        if read_pipe.read_to_string(&mut content).is_ok() && !content.is_empty() {
-                            return content;
+                        if let Some(c) = conn {
+                            let _ = c.flush();
+                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            use std::io::Read;
+                            let mut content = String::new();
+                            let _ = read_pipe.read_to_string(&mut content);
+                            let _ = tx.send(content);
+                        });
+                        if let Ok(content) = rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                            if !content.is_empty() {
+                                if let Ok(mut lock) = self.ram_buffer.lock() {
+                                    *lock = content.clone();
+                                }
+                                return content;
+                            }
                         }
                     }
                 }
@@ -97,6 +121,11 @@ impl ClipboardManager {
 
         // Fallback to in-process memory buffer
         self.ram_buffer.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Reads text from active system clipboard or RAM fallback without subprocesses.
+    pub fn paste(&self) -> String {
+        self.paste_with_conn(None)
     }
 
     /// Handles a paste request from an external Wayland client writing into pipe.

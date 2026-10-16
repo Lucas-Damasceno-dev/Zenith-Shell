@@ -104,11 +104,12 @@ just test
 * [x] **OSD HUD:** Volume, brilho e microfone em tempo real (`overlays/OSD.luau`)
 * [ ] **ControlCenterPopup:** Migrar central combinada (`overlays/ControlCenterPopup.qml` ➔ `overlays/ControlCenter.luau`)
 * [x] **BatteryPopup:** Detalhes de saúde, perfis de energia (power-profiles-daemon) (`overlays/BatteryPopup.luau`)
+* [x] **USBPopup:** Dispositivos USB e montagem de mídia removível (`overlays/USBPopup.luau`)
 
 ### 🌊 Onda 3: Superfícies de Input e Navegação
 * [x] **App Launcher:** Fuzzy search XDG, keyboard grab, cursor navigation (`overlays/Launcher.luau`)
 * [x] **PowerMenu:** Lock, Suspend, Reboot, Shutdown com confirmação (`overlays/PowerMenu.luau`)
-* [ ] **ClipboardPopup:** Histórico de cliphist com preview (`overlays/ClipboardPopup.qml`)
+* [x] **ClipboardPopup:** Histórico de cliphist com preview (`overlays/ClipboardPopup.luau`)
 * [ ] **WorkspaceSwitcher / Expose:** Visualizador de janelas e troca rápida (`overlays/ExposePopup.qml`)
 
 ### 🌊 Onda 4: Superfícies Avançadas do Desktop
@@ -120,7 +121,7 @@ just test
 
 ### 🌊 Onda 5: Utilitários & Ferramentas do Sistema
 * [x] **Settings Center:** Configuração do ecossistema (`overlays/Settings.luau` + `lib/settings_store.luau`)
-* [ ] **System Monitor Popup:** Gráficos de processo, CPU, GPU e I/O (`overlays/SystemMonitorPopup.qml`)
+* [x] **System Monitor Popup:** Gráficos de processo, CPU, GPU e I/O (`overlays/SystemMonitorPopup.luau`)
 * [ ] **Scratchpad Drawer:** Gaveta lateral para janelas especiais Hyprland (`overlays/ScratchpadDrawer.qml`)
 * [ ] **ScreenDraw Overlay:** Desenho e anotações sobre a tela (`overlays/ScreenDrawOverlay.qml`)
 

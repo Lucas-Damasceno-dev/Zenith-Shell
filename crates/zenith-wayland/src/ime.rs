@@ -4,93 +4,92 @@
 //! and text-input focus management with visual focus rings.
 
 use smithay_client_toolkit::seat::keyboard::Keysym;
+use xkbcommon::xkb::compose::{self, State, Table};
+use xkbcommon::xkb::Context;
 
-/// Maps a Keysym dead key to its accent char representation.
-pub fn keysym_to_dead_key(keysym: Keysym) -> Option<char> {
-    match keysym {
-        Keysym::dead_tilde => Some('~'),
-        Keysym::dead_acute => Some('\''),
-        Keysym::dead_grave => Some('`'),
-        Keysym::dead_circumflex => Some('^'),
-        Keysym::dead_cedilla => Some(','),
-        Keysym::dead_diaeresis => Some('"'),
-        _ => None,
+/// Result of feeding a keysym to the XKB compose state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeResult {
+    /// Sequence resolved to a composed UTF-8 character (e.g. dead_tilde + a -> "ã").
+    Composed(String),
+    /// State machine is actively buffering dead keys / multi-key sequence.
+    Composing,
+    /// Sequence was invalidated or cancelled.
+    Cancelled,
+    /// No compose sequence active for this key.
+    Nothing,
+}
+
+/// Native XKB Compose State Machine leveraging system compose tables according to active locale.
+pub struct XkbComposeTracker {
+    state: Option<State>,
+}
+
+impl Default for XkbComposeTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Composes a dead-key accent with a base character (e.g. `~` + `a` -> `ã`).
-pub fn compose_dead_key(dead: char, base: char) -> String {
-    match (dead, base) {
-        // Tilde (~)
-        ('~', 'a') => "ã".to_string(),
-        ('~', 'o') => "õ".to_string(),
-        ('~', 'n') => "ñ".to_string(),
-        ('~', 'A') => "Ã".to_string(),
-        ('~', 'O') => "Õ".to_string(),
-        ('~', 'N') => "Ñ".to_string(),
-        ('~', ' ') | ('~', '~') => "~".to_string(),
+impl XkbComposeTracker {
+    /// Initializes compose table from system locale (LC_ALL / LC_CTYPE / LANG) with reliable UTF-8 fallback.
+    pub fn new() -> Self {
+        let ctx = Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let locale_str = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_else(|_| "C.UTF-8".to_string());
 
-        // Acute (')
-        ('\'', 'a') => "á".to_string(),
-        ('\'', 'e') => "é".to_string(),
-        ('\'', 'i') => "í".to_string(),
-        ('\'', 'o') => "ó".to_string(),
-        ('\'', 'u') => "ú".to_string(),
-        ('\'', 'c') => "ç".to_string(),
-        ('\'', 'A') => "Á".to_string(),
-        ('\'', 'E') => "É".to_string(),
-        ('\'', 'I') => "Í".to_string(),
-        ('\'', 'O') => "Ó".to_string(),
-        ('\'', 'U') => "Ú".to_string(),
-        ('\'', 'C') => "Ç".to_string(),
-        ('\'', ' ') | ('\'', '\'') => "´".to_string(),
+        let candidates = if locale_str == "C" || locale_str == "POSIX" || locale_str.is_empty() {
+            vec!["C.UTF-8", "en_US.UTF-8", "pt_BR.UTF-8", "C"]
+        } else {
+            vec![locale_str.as_str(), "C.UTF-8", "en_US.UTF-8", "pt_BR.UTF-8", "C"]
+        };
 
-        // Grave (`)
-        ('`', 'a') => "à".to_string(),
-        ('`', 'e') => "è".to_string(),
-        ('`', 'i') => "ì".to_string(),
-        ('`', 'o') => "ò".to_string(),
-        ('`', 'u') => "ù".to_string(),
-        ('`', 'A') => "À".to_string(),
-        ('`', 'E') => "È".to_string(),
-        ('`', 'I') => "Ì".to_string(),
-        ('`', 'O') => "Ò".to_string(),
-        ('`', 'U') => "Ù".to_string(),
-        ('`', ' ') | ('`', '`') => "`".to_string(),
+        let mut table = None;
+        for loc in candidates {
+            if let Ok(t) = Table::new_from_locale(&ctx, std::ffi::OsStr::new(loc), compose::COMPILE_NO_FLAGS) {
+                table = Some(t);
+                break;
+            }
+        }
 
-        // Circumflex (^)
-        ('^', 'a') => "â".to_string(),
-        ('^', 'e') => "ê".to_string(),
-        ('^', 'i') => "î".to_string(),
-        ('^', 'o') => "ô".to_string(),
-        ('^', 'u') => "û".to_string(),
-        ('^', 'A') => "Â".to_string(),
-        ('^', 'E') => "Ê".to_string(),
-        ('^', 'I') => "Î".to_string(),
-        ('^', 'O') => "Ô".to_string(),
-        ('^', 'U') => "Û".to_string(),
-        ('^', ' ') | ('^', '^') => "^".to_string(),
+        let state = table.map(|t| State::new(&t, compose::STATE_NO_FLAGS));
 
-        // Cedilla (,)
-        (',', 'c') => "ç".to_string(),
-        (',', 'C') => "Ç".to_string(),
-        (',', ' ') => "¸".to_string(),
+        Self { state }
+    }
 
-        // Diaeresis (")
-        ('"', 'a') => "ä".to_string(),
-        ('"', 'e') => "ë".to_string(),
-        ('"', 'i') => "ï".to_string(),
-        ('"', 'o') => "ö".to_string(),
-        ('"', 'u') => "ü".to_string(),
-        ('"', 'A') => "Ä".to_string(),
-        ('"', 'E') => "Ë".to_string(),
-        ('"', 'I') => "Ï".to_string(),
-        ('"', 'O') => "Ö".to_string(),
-        ('"', 'U') => "Ü".to_string(),
-        ('"', ' ') | ('"', '"') => "¨".to_string(),
+    /// Feeds a Wayland Keysym into the compose engine.
+    pub fn feed(&mut self, keysym: Keysym) -> ComposeResult {
+        if let Some(ref mut state) = self.state {
+            state.feed(xkbcommon::xkb::Keysym::new(keysym.raw()));
+            match state.status() {
+                compose::Status::Composed => {
+                    let res = state.utf8();
+                    state.reset();
+                    if let Some(utf8) = res {
+                        ComposeResult::Composed(utf8)
+                    } else {
+                        ComposeResult::Cancelled
+                    }
+                }
+                compose::Status::Composing => ComposeResult::Composing,
+                compose::Status::Cancelled => {
+                    state.reset();
+                    ComposeResult::Cancelled
+                }
+                compose::Status::Nothing => ComposeResult::Nothing,
+            }
+        } else {
+            ComposeResult::Nothing
+        }
+    }
 
-        // Fallback: emit both characters sequentially
-        (d, b) => format!("{}{}", d, b),
+    /// Resets any active composing buffer.
+    pub fn reset(&mut self) {
+        if let Some(ref mut state) = self.state {
+            state.reset();
+        }
     }
 }
 
@@ -99,25 +98,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_abnt2_dead_key_compositions() {
-        assert_eq!(compose_dead_key('~', 'a'), "ã");
-        assert_eq!(compose_dead_key('~', 'o'), "õ");
-        assert_eq!(compose_dead_key('\'', 'c'), "ç");
-        assert_eq!(compose_dead_key('\'', 'e'), "é");
-        assert_eq!(compose_dead_key('^', 'e'), "ê");
-        assert_eq!(compose_dead_key('`', 'a'), "à");
-        assert_eq!(compose_dead_key('"', 'u'), "ü");
+    fn test_xkb_compose_tracker_initialization() {
+        let mut tracker = XkbComposeTracker::new();
+        // Feeding a non-dead key should return Nothing
+        assert_eq!(tracker.feed(Keysym::a), ComposeResult::Nothing);
+        // Reset should not panic
+        tracker.reset();
     }
 
     #[test]
-    fn test_dead_key_standalone_space() {
-        assert_eq!(compose_dead_key('~', ' '), "~");
-        assert_eq!(compose_dead_key('\'', ' '), "´");
-        assert_eq!(compose_dead_key('^', ' '), "^");
-    }
-
-    #[test]
-    fn test_uncomposable_fallback() {
-        assert_eq!(compose_dead_key('~', 'z'), "~z");
+    fn test_xkb_compose_dead_key_sequence() {
+        let mut tracker = XkbComposeTracker::new();
+        if tracker.state.is_some() {
+            let r1 = tracker.feed(Keysym::dead_tilde);
+            assert_eq!(r1, ComposeResult::Composing);
+            let r2 = tracker.feed(Keysym::a);
+            assert_eq!(r2, ComposeResult::Composed("ã".to_string()));
+        }
     }
 }

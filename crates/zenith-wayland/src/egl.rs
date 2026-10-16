@@ -200,6 +200,17 @@ impl EglSurface {
         self.egl.swap_buffers(self.display, self.surface)
     }
 
+    /// Queries the age of the current back buffer via `EGL_BUFFER_AGE_EXT` (0x313D).
+    /// Returns:
+    /// - `Some(0)`: The buffer contents are uninitialized/invalid (requires full damage).
+    /// - `Some(1)`: The buffer contents match the previous frame (1 frame old).
+    /// - `Some(n)`: The buffer contents are `n` frames old (requires union of damage over last `n` frames).
+    /// - `None`: The extension is unsupported or query failed.
+    pub fn query_buffer_age(&self) -> Option<i32> {
+        const EGL_BUFFER_AGE_EXT: i32 = 0x313D;
+        self.egl.query_surface(self.display, self.surface, EGL_BUFFER_AGE_EXT).ok()
+    }
+
     #[inline]
     pub fn width(&self) -> u32 {
         self.width

@@ -316,9 +316,10 @@ impl ShmFallbackRenderer {
                 buffer.set_metrics(metrics);
                 let is_complex = text.chars().any(|c| c as u32 > 0x0600);
                 let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
+                let font_family = std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string());
                 buffer.set_text(
                     &text,
-                    &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrainsMono Nerd Font")),
+                    &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
                     shaping,
                     None,
                 );
@@ -357,14 +358,15 @@ impl ShmFallbackRenderer {
                             let idx = (py as usize * width as usize + px as usize) * 4;
                             let alpha = glyph_color.a() as u32;
                             if alpha > 0 && idx + 3 < canvas.len() {
-                                let bg_b = canvas[idx] as u32;
+                                // tiny-skia SHM canvas stores premultiplied RGBA in memory:
+                                let bg_r = canvas[idx] as u32;
                                 let bg_g = canvas[idx + 1] as u32;
-                                let bg_r = canvas[idx + 2] as u32;
+                                let bg_b = canvas[idx + 2] as u32;
                                 let bg_a = canvas[idx + 3] as u32;
 
-                                let fg_b = glyph_color.b() as u32;
-                                let fg_g = glyph_color.g() as u32;
                                 let fg_r = glyph_color.r() as u32;
+                                let fg_g = glyph_color.g() as u32;
+                                let fg_b = glyph_color.b() as u32;
                                 let inv_a = 255 - alpha;
 
                                 let out_r = (((fg_r * alpha + bg_r * inv_a + 128) * 257) >> 16) as u8;
@@ -372,9 +374,9 @@ impl ShmFallbackRenderer {
                                 let out_b = (((fg_b * alpha + bg_b * inv_a + 128) * 257) >> 16) as u8;
                                 let out_a = (((alpha * 255 + bg_a * inv_a + 128) * 257) >> 16) as u8;
 
-                                canvas[idx] = out_b;
+                                canvas[idx] = out_r;
                                 canvas[idx + 1] = out_g;
-                                canvas[idx + 2] = out_r;
+                                canvas[idx + 2] = out_b;
                                 canvas[idx + 3] = out_a;
                             }
                         }
