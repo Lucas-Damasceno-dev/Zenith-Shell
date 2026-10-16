@@ -9,7 +9,7 @@ static MEMORY_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_vmrss_reading_accuracy() {
-    let _lock = MEMORY_MUTEX.lock().unwrap();
+    let _lock = MEMORY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (vmrss_mb, heap_mb) = read_self_memory();
     let vmrss_kb = read_vmrss_kb();
 
@@ -34,7 +34,7 @@ fn test_vmrss_reading_accuracy() {
 
 #[test]
 fn test_vmrss_stability_across_100_reloads() {
-    let _lock = MEMORY_MUTEX.lock().unwrap();
+    let _lock = MEMORY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = HeadlessEngine::new().expect("Failed to initialize HeadlessEngine");
 
     // Warmup 5 runs
@@ -73,7 +73,7 @@ fn test_vmrss_stability_across_100_reloads() {
 
 #[test]
 fn test_vmrss_complex_subsystems_stability() {
-    let _lock = MEMORY_MUTEX.lock().unwrap();
+    let _lock = MEMORY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = HeadlessEngine::new().expect("Failed to initialize HeadlessEngine");
 
     // Warmup 3 runs with complex script (Sliders, Switches, TextInputs, Shaders, Shadows)
@@ -114,7 +114,7 @@ fn test_vmrss_complex_subsystems_stability() {
 
 #[test]
 fn test_storage_and_worker_memory_stability() {
-    let _lock = MEMORY_MUTEX.lock().unwrap();
+    let _lock = MEMORY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     use zenith_runtime::storage::StorageEngine;
     use zenith_runtime::worker::WorkerThreadPool;
 
@@ -152,7 +152,7 @@ fn test_storage_and_worker_memory_stability() {
 
 #[test]
 fn test_headless_render_buffer_memory_stability() {
-    let _lock = MEMORY_MUTEX.lock().unwrap();
+    let _lock = MEMORY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = HeadlessEngine::new().expect("Failed to initialize HeadlessEngine");
     let script = realistic_bar_script("12:00:00", 20, 80);
 

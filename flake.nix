@@ -47,6 +47,15 @@
 
             buildInputs = runtimeLibs;
 
+            FONTCONFIG_FILE = pkgs.makeFontsConf {
+              fontDirectories = [ pkgs.dejavu_fonts ];
+            };
+
+            nativeCheckInputs = with pkgs; [
+              dejavu_fonts
+              fontconfig
+            ];
+
             postInstall = ''
               mkdir -p $out/share/zenith
               cp -r config/zenith/* $out/share/zenith/
