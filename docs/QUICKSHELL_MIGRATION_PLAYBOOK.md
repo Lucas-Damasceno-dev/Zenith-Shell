@@ -102,7 +102,7 @@ just test
 * [x] **BluetoothPopup:** Dispositivos pareados e status (`overlays/BluetoothPopup.luau`)
 * [x] **CalendarPopup:** Visualização mensal e eventos (`overlays/CalendarPopup.luau`)
 * [x] **OSD HUD:** Volume, brilho e microfone em tempo real (`overlays/OSD.luau`)
-* [ ] **ControlCenterPopup:** Migrar central combinada (`overlays/ControlCenterPopup.qml` ➔ `overlays/ControlCenter.luau`)
+* [x] **ControlCenterPopup:** Migrar central combinada (`overlays/ControlCenterPopup.qml` ➔ `overlays/ControlCenter.luau`)
 * [x] **BatteryPopup:** Detalhes de saúde, perfis de energia (power-profiles-daemon) (`overlays/BatteryPopup.luau`)
 * [x] **USBPopup:** Dispositivos USB e montagem de mídia removível (`overlays/USBPopup.luau`)
 
@@ -110,7 +110,7 @@ just test
 * [x] **App Launcher:** Fuzzy search XDG, keyboard grab, cursor navigation (`overlays/Launcher.luau`)
 * [x] **PowerMenu:** Lock, Suspend, Reboot, Shutdown com confirmação (`overlays/PowerMenu.luau`)
 * [x] **ClipboardPopup:** Histórico de cliphist com preview (`overlays/ClipboardPopup.luau`)
-* [ ] **WorkspaceSwitcher / Expose:** Visualizador de janelas e troca rápida (`overlays/ExposePopup.qml`)
+* [x] **WorkspaceSwitcher / Expose:** Visualizador de janelas e troca rápida (`overlays/ExposePopup.luau`)
 
 ### 🌊 Onda 4: Superfícies Avançadas do Desktop
 * [x] **Dock Interativa:** Fixação de apps, indicadores de janelas ativas (`overlays/Dock.luau`)
@@ -122,8 +122,8 @@ just test
 ### 🌊 Onda 5: Utilitários & Ferramentas do Sistema
 * [x] **Settings Center:** Configuração do ecossistema (`overlays/Settings.luau` + `lib/settings_store.luau`)
 * [x] **System Monitor Popup:** Gráficos de processo, CPU, GPU e I/O (`overlays/SystemMonitorPopup.luau`)
-* [ ] **Scratchpad Drawer:** Gaveta lateral para janelas especiais Hyprland (`overlays/ScratchpadDrawer.qml`)
-* [ ] **ScreenDraw Overlay:** Desenho e anotações sobre a tela (`overlays/ScreenDrawOverlay.qml`)
+* [x] **Scratchpad Drawer:** Gaveta lateral para janelas especiais Hyprland (`overlays/ScratchpadDrawer.luau`)
+* [x] **ScreenDraw Overlay:** Desenho e anotações sobre a tela (`overlays/ScreenDrawOverlay.luau`)
 
 ---
 

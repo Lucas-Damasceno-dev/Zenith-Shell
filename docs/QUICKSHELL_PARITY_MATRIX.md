@@ -50,12 +50,16 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Settings Hub & Center** | `modules/settings/` | ✅ **Implemented** (`overlays/Settings.luau` + `settings_store.luau`) | **Milestone 13** |
 | **Modular Bar Architecture**| `Bar.qml` + `RightBarModules.qml` | ✅ **Implemented** (`bar.luau` + 26 `lib/widgets/*`) | **Milestone 13** |
 | **UI Kit & Design System** | Reusable QML Controls | ✅ **Implemented** (`config/zenith/lib/ui_kit.luau`) | **Milestone 13** |
+| **Control Center**          | `overlays/ControlCenterPopup.qml` | ✅ **Implemented** (`overlays/ControlCenter.luau`) | **Milestone 15 (Onda 5.1)** |
 | **Clipboard Popup (Cliphist)**| `overlays/ClipboardPopup.qml` | ✅ **Implemented** (`overlays/ClipboardPopup.luau` + `lib/widgets/clipboard.luau`) | **Milestone 14 (Onda 2.1)** |
 | **System Monitor Popup**    | `modules/system_monitor/` / `SystemMonitorUtils.js` | ✅ **Implemented** (`overlays/SystemMonitorPopup.luau`) | **Milestone 14 (Onda 2.2)** |
 | **USB & Removable Media**   | `modules/usb/` / `UsbService.qml` | ✅ **Implemented** (`overlays/USBPopup.luau` + `lib/widgets/usb.luau`) | **Milestone 14 (Onda 2.3)** |
 | **Battery Health & Profiles**| `overlays/BatteryPopup.qml` | ✅ **Implemented** (`overlays/BatteryPopup.luau` + `lib/widgets/battery.luau`) | **Milestone 14 (Onda 2.3)** |
 | **Audio & Media Mixer**     | `overlays/AudioPopup.qml` & `MediaPopup.qml` | ✅ **Implemented** (`overlays/AudioPopup.luau` & `MediaPopup.luau`) | **Milestone 14 (Onda 2.4)** |
-| **Custom Luau Validation Suite** | QML lint / parity verification | ✅ **Implemented** (`tests/validate_custom_suite.py` - 57/57 files) | **Milestone 14 (Onda 3.4)** |
+| **Window Exposé / Switcher**| `overlays/ExposePopup.qml` | ✅ **Implemented** (`overlays/ExposePopup.luau`) | **Milestone 15 (Onda 5.2)** |
+| **Scratchpad Drawer**       | `overlays/ScratchpadDrawer.qml` | ✅ **Implemented** (`overlays/ScratchpadDrawer.luau`) | **Milestone 15 (Onda 5.3)** |
+| **Screen Draw Annotation**  | `overlays/ScreenDrawOverlay.qml` | ✅ **Implemented** (`overlays/ScreenDrawOverlay.luau`) | **Milestone 15 (Onda 5.4)** |
+| **Custom Luau Validation Suite** | QML lint / parity verification | ✅ **Implemented** (`tests/validate_custom_suite.py` - 61/61 files) | **Milestone 15 (100% Parity)** |
 
 ---
 
@@ -94,12 +98,16 @@ This document maps all features from the existing Quickshell configuration (`/et
 - **USB & Removable Media Popup (`overlays/USBPopup.luau`):** Detecção de dispositivos de bloco e pendrives via `udisks2`/`lsblk`, botões de montagem/desmontagem rápida e ejetar com segurança.
 - **Battery Health Popup (`overlays/BatteryPopup.luau`):** Estimativa de tempo restante, contagem de ciclos de carga, saúde percentual da bateria e seletor de perfis de energia (`power-profiles-daemon`).
 - **Audio & Media Mixer (`overlays/AudioPopup.luau`, `overlays/MediaPopup.luau`):** Controle de volume por aplicação/stream PipeWire, troca de sink/source de áudio e controle de reprodução MPRIS com visualização de capa e scrubber.
+- **Control Center (`overlays/ControlCenter.luau`):** Central unificada de toggles rápidos, sliders de áudio/brilho, mini-player MPRIS e perfis de energia.
+- **Window Exposé / Overview (`overlays/ExposePopup.luau`):** Visão geral Mission Control de janelas ativas, filtros por workspace e atalhos rápidos de fechamento/foco.
+- **Scratchpad Drawer (`overlays/ScratchpadDrawer.luau`):** Gerenciador visual dedicado de janelas em workspaces especiais do Hyprland.
+- **Screen Draw & Annotation (`overlays/ScreenDrawOverlay.luau`):** Barra flutuante de ferramentas de marcação vetorial livre e anotação em tempo real.
 
 ### 5. Custom Luau Validation Suite & Paridade Sintática
 - **Validador Oficial:** `tests/validate_custom_suite.py`
-- **Cobertura:** 57 arquivos Luau declarativos em `config/zenith/` (100% aprovados com 0 erros de sintaxe e delimitadores perfeitamente balanceados).
+- **Cobertura:** 61 arquivos Luau declarativos em `config/zenith/` (100% aprovados com 0 erros de sintaxe e delimitadores perfeitamente balanceados).
 - **Inventário Auditado:**
-  - 18 Overlays em `config/zenith/overlays/`
+  - 22 Overlays em `config/zenith/overlays/`
   - 26 Widgets de barra em `config/zenith/lib/widgets/`
   - 8 Bibliotecas de componentes UI em `config/zenith/lib/`
   - 5 Configurações principais (`bar.luau`, `dock.luau`, `canvas.luau`, `island.luau`, `zenith.d.luau`)

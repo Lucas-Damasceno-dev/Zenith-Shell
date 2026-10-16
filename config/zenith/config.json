@@ -319,7 +319,7 @@
     "repl_test": 99,
     "settings_active_page": 16,
     "system_activity": true,
-    "system_idle": true,
+    "system_idle": false,
     "theme": "catppuccin",
     "wallpaperPath": ""
   },
