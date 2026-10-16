@@ -318,6 +318,7 @@
     "reducedMotion": false,
     "repl_test": 99,
     "settings_active_page": 16,
+    "sysmon_tab": "processes",
     "system_activity": true,
     "system_idle": false,
     "theme": "catppuccin",
