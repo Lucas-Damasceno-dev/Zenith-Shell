@@ -3,7 +3,12 @@
 //! Provides natural inertial scrolling with exponential friction,
 //! damped momentum deceleration, and spring-based rubber-band overscroll.
 
+use crate::errors::KineticScrollError;
 use crate::spring::{SpringAnimation, SpringConfig};
+use crate::traits::ScrollEngine;
+
+/// Type alias for 100% backward and architectural API compatibility.
+pub type KineticScroll = KineticScrollEngine;
 
 /// State and physics engine for kinetic inertial scrolling.
 #[derive(Debug, Clone)]
@@ -166,6 +171,95 @@ impl KineticScrollEngine {
         self.velocity = 0.0;
         self.offset = self.offset.clamp(self.min_offset, self.max_offset);
         self.in_overscroll = false;
+    }
+
+    /// Returns current boundary limits as `(min_offset, max_offset)`.
+    #[inline]
+    pub fn bounds(&self) -> (f32, f32) {
+        (self.min_offset, self.max_offset)
+    }
+
+    /// Returns current velocity.
+    #[inline]
+    pub fn velocity(&self) -> f32 {
+        self.velocity
+    }
+
+    /// Validates internal state and boundaries.
+    pub fn validate(&self) -> Result<(), KineticScrollError> {
+        if !self.min_offset.is_finite() || !self.max_offset.is_finite() || self.min_offset > self.max_offset {
+            return Err(KineticScrollError::InvalidBounds {
+                min: self.min_offset,
+                max: self.max_offset,
+            });
+        }
+        if !self.offset.is_finite() || !self.velocity.is_finite() {
+            return Err(KineticScrollError::NonFiniteInput(if !self.offset.is_finite() {
+                self.offset
+            } else {
+                self.velocity
+            }));
+        }
+        if !self.friction.is_finite() || self.friction <= 0.0 || self.friction >= 1.0 {
+            return Err(KineticScrollError::InvalidFriction(self.friction));
+        }
+        Ok(())
+    }
+
+    /// Safely steps simulation forward by `dt` seconds, returning an error on invalid input.
+    pub fn step_safe(&mut self, dt: f32) -> Result<f32, KineticScrollError> {
+        if !dt.is_finite() || dt < 0.0 {
+            return Err(KineticScrollError::NonFiniteInput(dt));
+        }
+        self.validate()?;
+        Ok(self.step(dt))
+    }
+}
+
+impl ScrollEngine for KineticScrollEngine {
+    #[inline]
+    fn offset(&self) -> f32 {
+        self.offset()
+    }
+
+    #[inline]
+    fn set_offset(&mut self, offset: f32) {
+        self.set_offset(offset);
+    }
+
+    #[inline]
+    fn add_impulse(&mut self, delta_y: f32) {
+        self.add_impulse(delta_y);
+    }
+
+    #[inline]
+    fn on_scroll(&mut self, delta_y: f32) {
+        self.on_scroll(delta_y);
+    }
+
+    #[inline]
+    fn step(&mut self, dt: f32) -> f32 {
+        self.step(dt)
+    }
+
+    #[inline]
+    fn is_settled(&self) -> bool {
+        self.is_settled()
+    }
+
+    #[inline]
+    fn stop(&mut self) {
+        self.stop();
+    }
+
+    #[inline]
+    fn bounds(&self) -> (f32, f32) {
+        self.bounds()
+    }
+
+    #[inline]
+    fn set_bounds(&mut self, min: f32, max: f32) {
+        self.set_bounds(min, max);
     }
 }
 

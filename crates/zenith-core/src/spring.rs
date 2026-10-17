@@ -1,5 +1,8 @@
 //! Spring physics animation engine based on damped harmonic oscillator.
 
+use crate::errors::SpringError;
+use crate::traits::Animation;
+
 /// Physical configuration for a spring simulation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpringConfig {
@@ -83,6 +86,39 @@ impl SpringConfig {
     /// Standard preset for over-damped motion (heavy friction, no overshoot).
     pub fn over_damped() -> Self {
         Self::overdamped(170.0, 1.5)
+    }
+
+    /// Validates spring physical parameters.
+    pub fn validate(&self) -> Result<(), SpringError> {
+        if !self.stiffness.is_finite() || self.stiffness <= 0.0 {
+            return Err(SpringError::InvalidParameter {
+                parameter: "stiffness",
+                value: self.stiffness,
+                reason: "stiffness must be positive and finite",
+            });
+        }
+        if !self.damping.is_finite() || self.damping < 0.0 {
+            return Err(SpringError::InvalidParameter {
+                parameter: "damping",
+                value: self.damping,
+                reason: "damping must be non-negative and finite",
+            });
+        }
+        if !self.mass.is_finite() || self.mass <= 0.0 {
+            return Err(SpringError::InvalidParameter {
+                parameter: "mass",
+                value: self.mass,
+                reason: "mass must be positive and finite",
+            });
+        }
+        if !self.precision.is_finite() || self.precision <= 0.0 {
+            return Err(SpringError::InvalidParameter {
+                parameter: "precision",
+                value: self.precision,
+                reason: "precision must be positive and finite",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -180,6 +216,90 @@ impl SpringAnimation {
         }
 
         self.current
+    }
+
+    /// Resets current position and target position to `val`, and clears velocity.
+    pub fn reset(&mut self, val: f32) {
+        self.current = val;
+        self.target = val;
+        self.velocity = 0.0;
+    }
+
+    /// Returns current animated position.
+    #[inline]
+    pub fn current(&self) -> f32 {
+        self.current
+    }
+
+    /// Returns target destination value.
+    #[inline]
+    pub fn target(&self) -> f32 {
+        self.target
+    }
+
+    /// Returns current velocity.
+    #[inline]
+    pub fn velocity(&self) -> f32 {
+        self.velocity
+    }
+
+    /// Validates internal state and configuration for finite, physically valid values.
+    pub fn validate(&self) -> Result<(), SpringError> {
+        self.config.validate()?;
+        if !self.current.is_finite() || !self.velocity.is_finite() || !self.target.is_finite() {
+            return Err(SpringError::NonFiniteState {
+                current: self.current,
+                velocity: self.velocity,
+                target: self.target,
+            });
+        }
+        Ok(())
+    }
+
+    /// Safely steps simulation forward by `dt` seconds, returning an error on invalid input or non-finite state.
+    pub fn step_safe(&mut self, dt: f32) -> Result<f32, SpringError> {
+        if !dt.is_finite() || dt < 0.0 {
+            return Err(SpringError::InvalidDeltaTime(dt));
+        }
+        self.validate()?;
+        Ok(self.step(dt))
+    }
+}
+
+impl Animation<f32> for SpringAnimation {
+    #[inline]
+    fn step(&mut self, dt: f32) -> f32 {
+        self.step(dt)
+    }
+
+    #[inline]
+    fn is_settled(&self) -> bool {
+        self.is_settled()
+    }
+
+    #[inline]
+    fn target(&self) -> f32 {
+        self.target
+    }
+
+    #[inline]
+    fn set_target(&mut self, target: f32) {
+        self.set_target(target);
+    }
+
+    #[inline]
+    fn current(&self) -> f32 {
+        self.current
+    }
+
+    #[inline]
+    fn velocity(&self) -> f32 {
+        self.velocity
+    }
+
+    #[inline]
+    fn reset(&mut self, val: f32) {
+        self.reset(val);
     }
 }
 
