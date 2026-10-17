@@ -41,7 +41,7 @@ pub fn clamp_safe<T: PartialOrd + Copy>(val: T, min: T, max: T) -> T {
 /// Clamps a value within `[min, max]`, falling back to `fallback` if `val` or bounds are unordered (e.g. NaN).
 #[inline]
 pub fn clamp_nan_safe<T: PartialOrd + Copy>(val: T, min: T, max: T, fallback: T) -> T {
-    if val.partial_cmp(&val).is_none() {
+    if val.partial_cmp(&val).is_none() || min.partial_cmp(&max).is_none() {
         return fallback;
     }
     let (min, max) = if min > max { (max, min) } else { (min, max) };

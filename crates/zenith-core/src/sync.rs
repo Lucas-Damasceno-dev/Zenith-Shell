@@ -61,6 +61,12 @@ impl SharedSpringAnimation {
         let mut guard = self.inner.lock().expect("mutex poisoned");
         guard.reset(val);
     }
+
+    /// Returns current velocity thread-safely.
+    pub fn velocity(&self) -> f32 {
+        let guard = self.inner.lock().expect("mutex poisoned");
+        guard.velocity
+    }
 }
 
 impl Animation<f32> for SharedSpringAnimation {
@@ -85,8 +91,7 @@ impl Animation<f32> for SharedSpringAnimation {
     }
 
     fn velocity(&self) -> f32 {
-        let guard = self.inner.lock().expect("mutex poisoned");
-        guard.velocity
+        SharedSpringAnimation::velocity(self)
     }
 
     fn reset(&mut self, val: f32) {
@@ -161,6 +166,12 @@ impl SharedKineticScroll {
     pub fn bounds(&self) -> (f32, f32) {
         let guard = self.inner.read().expect("rwlock poisoned");
         guard.bounds()
+    }
+
+    /// Returns current velocity thread-safely.
+    pub fn velocity(&self) -> f32 {
+        let guard = self.inner.read().expect("rwlock poisoned");
+        guard.velocity()
     }
 }
 

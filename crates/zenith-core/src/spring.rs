@@ -158,9 +158,11 @@ impl SpringAnimation {
     /// Step simulation forward by `dt` seconds using 4th-order Runge-Kutta (RK4) integration.
     /// Handles sub-pixel micro-values (< 0.001) ensuring stable rest without infinite oscillation.
     pub fn step(&mut self, dt: f32) -> f32 {
-        if self.is_settled() {
-            self.current = self.target;
-            self.velocity = 0.0;
+        if dt == 0.0 || self.is_settled() {
+            if self.is_settled() {
+                self.current = self.target;
+                self.velocity = 0.0;
+            }
             return self.current;
         }
 

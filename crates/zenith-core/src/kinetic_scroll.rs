@@ -60,8 +60,7 @@ impl KineticScrollEngine {
     pub fn set_offset(&mut self, offset: f32) {
         self.offset = offset.clamp(self.min_offset, self.max_offset);
         self.velocity = 0.0;
-        self.spring.current = self.offset;
-        self.spring.target = self.offset;
+        self.spring.reset(self.offset);
         self.in_overscroll = false;
     }
 
@@ -83,55 +82,35 @@ impl KineticScrollEngine {
         let fps_ratio = (dt * 60.0).clamp(0.1, 3.0);
 
         // Check if currently outside bounds (overscroll rubber-band)
-        if self.offset < self.min_offset {
-            // Sub-pixel threshold: if difference is < 0.001, snap directly to rest
-            if (self.min_offset - self.offset) < 0.001 {
-                self.offset = self.min_offset;
-                self.velocity = 0.0;
-                self.in_overscroll = false;
-                self.spring.current = self.min_offset;
-                self.spring.target = self.min_offset;
-                self.spring.velocity = 0.0;
-                return self.offset;
-            }
-
-            self.in_overscroll = true;
-            self.spring.current = self.offset;
-            self.spring.target = self.min_offset;
-            self.offset = self.spring.step(dt);
-            self.velocity *= 0.5f32.powf(fps_ratio);
-
-            if self.spring.is_settled() || (self.min_offset - self.offset).abs() < 0.001 {
-                self.offset = self.min_offset;
-                self.velocity = 0.0;
-                self.in_overscroll = false;
-                self.spring.current = self.min_offset;
-                self.spring.velocity = 0.0;
-            }
+        let bound = if self.offset < self.min_offset {
+            Some(self.min_offset)
         } else if self.offset > self.max_offset {
+            Some(self.max_offset)
+        } else {
+            None
+        };
+
+        if let Some(target) = bound {
             // Sub-pixel threshold: if difference is < 0.001, snap directly to rest
-            if (self.offset - self.max_offset) < 0.001 {
-                self.offset = self.max_offset;
+            if (self.offset - target).abs() < 0.001 {
+                self.offset = target;
                 self.velocity = 0.0;
                 self.in_overscroll = false;
-                self.spring.current = self.max_offset;
-                self.spring.target = self.max_offset;
-                self.spring.velocity = 0.0;
+                self.spring.reset(target);
                 return self.offset;
             }
 
             self.in_overscroll = true;
             self.spring.current = self.offset;
-            self.spring.target = self.max_offset;
+            self.spring.target = target;
             self.offset = self.spring.step(dt);
             self.velocity *= 0.5f32.powf(fps_ratio);
 
-            if self.spring.is_settled() || (self.offset - self.max_offset).abs() < 0.001 {
-                self.offset = self.max_offset;
+            if self.spring.is_settled() || (self.offset - target).abs() < 0.001 {
+                self.offset = target;
                 self.velocity = 0.0;
                 self.in_overscroll = false;
-                self.spring.current = self.max_offset;
-                self.spring.velocity = 0.0;
+                self.spring.reset(target);
             }
         } else {
             self.in_overscroll = false;
