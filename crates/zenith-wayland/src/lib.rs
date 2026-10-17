@@ -272,6 +272,13 @@ pub struct PopupWindow {
     pub frame_callback_pending: bool,
 }
 
+impl Drop for PopupWindow {
+    fn drop(&mut self) {
+        self.egl_surface = None;
+        self.scale_tracker = None;
+    }
+}
+
 /// Individual Layer Shell bar window instance attached to a Wayland output.
 pub struct BarInstance {
     pub output: Option<wl_output::WlOutput>,
@@ -286,6 +293,13 @@ pub struct BarInstance {
     pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
     pub damage_ring: crate::render::damage::DamageRing<4>,
     pub frame_callback_pending: bool,
+}
+
+impl Drop for BarInstance {
+    fn drop(&mut self) {
+        self.egl_surface = None;
+        self.scale_tracker = None;
+    }
 }
 
 /// Main application state for Wayland event handling.
@@ -1945,8 +1959,8 @@ impl WaylandApp {
 
     /// Destroys the persistent dock layer surface.
     pub fn destroy_dock(&mut self) {
-        if let Some(dock) = self.dock.take() {
-            dock.surface.wl_surface().destroy();
+        if let Some(_dock) = self.dock.take() {
+            info!("Destroyed persistent dock layer surface");
         }
     }
 
@@ -4073,6 +4087,15 @@ impl LayerShellHandler for WaylandApp {
             if popup.surface.wl_surface() == layer.wl_surface() {
                 info!("Layer surface closed by compositor: popup '{}'", popup.id);
                 self.popup = None;
+                return;
+            }
+        }
+
+        if let Some(ref dock) = self.dock {
+            if dock.surface.wl_surface() == layer.wl_surface() {
+                info!("Layer surface closed by compositor: dock");
+                self.dock = None;
+                return;
             }
         }
     }
