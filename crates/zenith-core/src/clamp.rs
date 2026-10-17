@@ -38,6 +38,16 @@ pub fn clamp_safe<T: PartialOrd + Copy>(val: T, min: T, max: T) -> T {
     clamp(val, min, max)
 }
 
+/// Clamps a value within `[min, max]`, falling back to `fallback` if `val` or bounds are unordered (e.g. NaN).
+#[inline]
+pub fn clamp_nan_safe<T: PartialOrd + Copy>(val: T, min: T, max: T, fallback: T) -> T {
+    if val.partial_cmp(&val).is_none() || min.partial_cmp(&max).is_none() {
+        return fallback;
+    }
+    let (min, max) = if min > max { (max, min) } else { (min, max) };
+    clamp(val, min, max)
+}
+
 /// Bounded range `[min, max]` defining valid clamp boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClampRange<T> {
@@ -50,6 +60,22 @@ impl<T> ClampRange<T> {
     #[inline]
     pub const fn new(min: T, max: T) -> Self {
         Self { min, max }
+    }
+}
+
+impl<T: PartialOrd> ClampRange<T> {
+    /// Returns `true` if boundaries are valid (`min <= max`).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.min <= self.max
+    }
+}
+
+impl<T: std::ops::Sub<Output = T> + Copy> ClampRange<T> {
+    /// Returns the total span (`max - min`) of the range.
+    #[inline]
+    pub fn span(&self) -> T {
+        self.max - self.min
     }
 }
 
@@ -74,6 +100,9 @@ pub trait ClampExt<T = Self> {
 
     /// Restricts `self` safely to `[min, max]`, normalizing inverted bounds.
     fn clamp_safe(self, min: T, max: T) -> Self;
+
+    /// Restricts `self` safely with fallback when unordered (e.g. NaN).
+    fn clamp_nan_safe(self, min: T, max: T, fallback: T) -> Self;
 }
 
 impl<T: PartialOrd + Copy> ClampExt<T> for T {
@@ -85,6 +114,11 @@ impl<T: PartialOrd + Copy> ClampExt<T> for T {
     #[inline]
     fn clamp_safe(self, min: T, max: T) -> Self {
         clamp_safe(self, min, max)
+    }
+
+    #[inline]
+    fn clamp_nan_safe(self, min: T, max: T, fallback: T) -> Self {
+        clamp_nan_safe(self, min, max, fallback)
     }
 }
 

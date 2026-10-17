@@ -142,3 +142,56 @@ fn test_clamp_ext_trait() {
     assert_eq!(15.clamp_safe(10, 0), 10);
     assert_eq!(7.clamp_safe(10, 0), 7);
 }
+
+#[test]
+fn test_clamp_nan_safe_contracts() {
+    use zenith_core::clamp_nan_safe;
+
+    // Normal values
+    assert_eq!(clamp_nan_safe(5.0_f32, 0.0, 10.0, 0.0), 5.0);
+    assert_eq!(clamp_nan_safe(-5.0_f32, 0.0, 10.0, 0.0), 0.0);
+    assert_eq!(clamp_nan_safe(15.0_f32, 0.0, 10.0, 0.0), 10.0);
+
+    // Inverted bounds normalizes automatically
+    assert_eq!(clamp_nan_safe(15.0_f32, 10.0, 0.0, 0.0), 10.0);
+
+    // NaN input falls back to default safely
+    assert_eq!(clamp_nan_safe(f32::NAN, 0.0, 10.0, 42.0), 42.0);
+
+    // Via ClampExt
+    assert_eq!(f32::NAN.clamp_nan_safe(0.0, 10.0, 99.0), 99.0);
+    assert_eq!(5.0_f32.clamp_nan_safe(0.0, 10.0, 99.0), 5.0);
+}
+
+#[test]
+fn test_clamp_range_validation_and_span() {
+    let valid_range = ClampRange::new(10.0_f32, 50.0_f32);
+    assert!(valid_range.is_valid());
+    assert_eq!(valid_range.span(), 40.0);
+
+    let invalid_range = ClampRange::new(50.0_f32, 10.0_f32);
+    assert!(!invalid_range.is_valid());
+}
+
+#[test]
+fn test_clamp_safe_concurrency() {
+    use std::thread;
+
+    let range = ClampRange::new(0, 100);
+    let mut handles = Vec::new();
+
+    for i in 0..4 {
+        let r = range;
+        handles.push(thread::spawn(move || {
+            for v in 0..50 {
+                let clamped = r.clamp(v * i - 20);
+                assert!(r.contains(clamped));
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("thread join failed");
+    }
+}
+

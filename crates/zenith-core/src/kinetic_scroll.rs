@@ -3,7 +3,12 @@
 //! Provides natural inertial scrolling with exponential friction,
 //! damped momentum deceleration, and spring-based rubber-band overscroll.
 
+use crate::errors::KineticScrollError;
 use crate::spring::{SpringAnimation, SpringConfig};
+use crate::traits::ScrollEngine;
+
+/// Type alias for 100% backward and architectural API compatibility.
+pub type KineticScroll = KineticScrollEngine;
 
 /// State and physics engine for kinetic inertial scrolling.
 #[derive(Debug, Clone)]
@@ -55,8 +60,7 @@ impl KineticScrollEngine {
     pub fn set_offset(&mut self, offset: f32) {
         self.offset = offset.clamp(self.min_offset, self.max_offset);
         self.velocity = 0.0;
-        self.spring.current = self.offset;
-        self.spring.target = self.offset;
+        self.spring.reset(self.offset);
         self.in_overscroll = false;
     }
 
@@ -78,55 +82,35 @@ impl KineticScrollEngine {
         let fps_ratio = (dt * 60.0).clamp(0.1, 3.0);
 
         // Check if currently outside bounds (overscroll rubber-band)
-        if self.offset < self.min_offset {
-            // Sub-pixel threshold: if difference is < 0.001, snap directly to rest
-            if (self.min_offset - self.offset) < 0.001 {
-                self.offset = self.min_offset;
-                self.velocity = 0.0;
-                self.in_overscroll = false;
-                self.spring.current = self.min_offset;
-                self.spring.target = self.min_offset;
-                self.spring.velocity = 0.0;
-                return self.offset;
-            }
-
-            self.in_overscroll = true;
-            self.spring.current = self.offset;
-            self.spring.target = self.min_offset;
-            self.offset = self.spring.step(dt);
-            self.velocity *= 0.5f32.powf(fps_ratio);
-
-            if self.spring.is_settled() || (self.min_offset - self.offset).abs() < 0.001 {
-                self.offset = self.min_offset;
-                self.velocity = 0.0;
-                self.in_overscroll = false;
-                self.spring.current = self.min_offset;
-                self.spring.velocity = 0.0;
-            }
+        let bound = if self.offset < self.min_offset {
+            Some(self.min_offset)
         } else if self.offset > self.max_offset {
+            Some(self.max_offset)
+        } else {
+            None
+        };
+
+        if let Some(target) = bound {
             // Sub-pixel threshold: if difference is < 0.001, snap directly to rest
-            if (self.offset - self.max_offset) < 0.001 {
-                self.offset = self.max_offset;
+            if (self.offset - target).abs() < 0.001 {
+                self.offset = target;
                 self.velocity = 0.0;
                 self.in_overscroll = false;
-                self.spring.current = self.max_offset;
-                self.spring.target = self.max_offset;
-                self.spring.velocity = 0.0;
+                self.spring.reset(target);
                 return self.offset;
             }
 
             self.in_overscroll = true;
             self.spring.current = self.offset;
-            self.spring.target = self.max_offset;
+            self.spring.target = target;
             self.offset = self.spring.step(dt);
             self.velocity *= 0.5f32.powf(fps_ratio);
 
-            if self.spring.is_settled() || (self.offset - self.max_offset).abs() < 0.001 {
-                self.offset = self.max_offset;
+            if self.spring.is_settled() || (self.offset - target).abs() < 0.001 {
+                self.offset = target;
                 self.velocity = 0.0;
                 self.in_overscroll = false;
-                self.spring.current = self.max_offset;
-                self.spring.velocity = 0.0;
+                self.spring.reset(target);
             }
         } else {
             self.in_overscroll = false;
@@ -166,6 +150,95 @@ impl KineticScrollEngine {
         self.velocity = 0.0;
         self.offset = self.offset.clamp(self.min_offset, self.max_offset);
         self.in_overscroll = false;
+    }
+
+    /// Returns current boundary limits as `(min_offset, max_offset)`.
+    #[inline]
+    pub fn bounds(&self) -> (f32, f32) {
+        (self.min_offset, self.max_offset)
+    }
+
+    /// Returns current velocity.
+    #[inline]
+    pub fn velocity(&self) -> f32 {
+        self.velocity
+    }
+
+    /// Validates internal state and boundaries.
+    pub fn validate(&self) -> Result<(), KineticScrollError> {
+        if !self.min_offset.is_finite() || !self.max_offset.is_finite() || self.min_offset > self.max_offset {
+            return Err(KineticScrollError::InvalidBounds {
+                min: self.min_offset,
+                max: self.max_offset,
+            });
+        }
+        if !self.offset.is_finite() || !self.velocity.is_finite() {
+            return Err(KineticScrollError::NonFiniteInput(if !self.offset.is_finite() {
+                self.offset
+            } else {
+                self.velocity
+            }));
+        }
+        if !self.friction.is_finite() || self.friction <= 0.0 || self.friction >= 1.0 {
+            return Err(KineticScrollError::InvalidFriction(self.friction));
+        }
+        Ok(())
+    }
+
+    /// Safely steps simulation forward by `dt` seconds, returning an error on invalid input.
+    pub fn step_safe(&mut self, dt: f32) -> Result<f32, KineticScrollError> {
+        if !dt.is_finite() || dt < 0.0 {
+            return Err(KineticScrollError::NonFiniteInput(dt));
+        }
+        self.validate()?;
+        Ok(self.step(dt))
+    }
+}
+
+impl ScrollEngine for KineticScrollEngine {
+    #[inline]
+    fn offset(&self) -> f32 {
+        self.offset()
+    }
+
+    #[inline]
+    fn set_offset(&mut self, offset: f32) {
+        self.set_offset(offset);
+    }
+
+    #[inline]
+    fn add_impulse(&mut self, delta_y: f32) {
+        self.add_impulse(delta_y);
+    }
+
+    #[inline]
+    fn on_scroll(&mut self, delta_y: f32) {
+        self.on_scroll(delta_y);
+    }
+
+    #[inline]
+    fn step(&mut self, dt: f32) -> f32 {
+        self.step(dt)
+    }
+
+    #[inline]
+    fn is_settled(&self) -> bool {
+        self.is_settled()
+    }
+
+    #[inline]
+    fn stop(&mut self) {
+        self.stop();
+    }
+
+    #[inline]
+    fn bounds(&self) -> (f32, f32) {
+        self.bounds()
+    }
+
+    #[inline]
+    fn set_bounds(&mut self, min: f32, max: f32) {
+        self.set_bounds(min, max);
     }
 }
 
