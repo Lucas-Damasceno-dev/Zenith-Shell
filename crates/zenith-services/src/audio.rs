@@ -7,6 +7,25 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
+use crate::error::AudioError;
+
+/// Contract for controlling audio playback devices, volume, and muting.
+pub trait AudioController: Send + Sync {
+    /// List available audio output sinks.
+    fn list_sinks(&self) -> Result<Vec<AudioDevice>, AudioError>;
+
+    /// Set volume percentage on default sink.
+    fn set_volume(&self, percent: u8) -> Result<(), AudioError>;
+
+    /// Adjust volume relatively by delta on default sink.
+    fn adjust_volume(&self, delta: i32) -> Result<(), AudioError>;
+
+    /// Toggle mute on default sink.
+    fn toggle_mute(&self) -> Result<(), AudioError>;
+
+    /// Set default sink by ID.
+    fn set_default_sink(&self, id: u32) -> Result<(), AudioError>;
+}
 
 /// Representation of an audio output sink or input source.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,15 +206,18 @@ impl AudioService {
         sinks
     }
 
-    /// List all audio output sinks via PipeWire `wpctl status` with fallback to kernel telemetry and non-blocking background refresh.
-    pub fn list_sinks() -> Vec<AudioDevice> {
+    /// List all audio output sinks, returning AudioError if cache lock is poisoned.
+    pub fn try_list_sinks() -> Result<Vec<AudioDevice>, AudioError> {
         let cache = SINKS_CACHE.get_or_init(|| {
             let initial = Self::query_kernel_audio_sinks();
             std::sync::Mutex::new((initial, std::time::Instant::now() - std::time::Duration::from_secs(10)))
         });
 
         let (sinks, elapsed) = {
-            let guard = cache.lock().unwrap();
+            let guard = match cache.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
             (guard.0.clone(), guard.1.elapsed())
         };
 
@@ -203,7 +225,12 @@ impl AudioService {
             Self::trigger_background_sinks_update();
         }
 
-        sinks
+        Ok(sinks)
+    }
+
+    /// List all audio output sinks via PipeWire `wpctl status` with fallback to kernel telemetry and non-blocking background refresh.
+    pub fn list_sinks() -> Vec<AudioDevice> {
+        Self::try_list_sinks().unwrap_or_else(|_| Self::query_kernel_audio_sinks())
     }
 }
 
@@ -250,31 +277,47 @@ impl AudioService {
         })
     }
 
-    /// Set volume percentage on default audio sink instantly with coalesced worker execution.
-    pub fn set_volume(percent: u8) {
+    /// Try setting volume percentage on default audio sink.
+    pub fn try_set_volume(percent: u8) -> Result<(), AudioError> {
         let clamped = percent.min(100);
         crate::SystemService::update_audio_cache(|snap| {
             snap.volume = clamped;
         });
         Self::notify_change();
-        let _ = Self::get_volume_worker().try_send(clamped);
+        match Self::get_volume_worker().try_send(clamped) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
+        }
     }
 
-    /// Adjust volume by relative delta percentage instantly with coalesced worker execution.
-    pub fn adjust_volume(delta: i32) {
+    /// Set volume percentage on default audio sink instantly with coalesced worker execution.
+    pub fn set_volume(percent: u8) {
+        let _ = Self::try_set_volume(percent);
+    }
+
+    /// Try adjusting volume by relative delta percentage.
+    pub fn try_adjust_volume(delta: i32) -> Result<(), AudioError> {
         let mut new_vol = 0;
         crate::SystemService::update_audio_cache(|snap| {
             let cur = snap.volume as i32;
-            let target = (cur + delta).clamp(0, 100) as u8;
+            let target = cur.saturating_add(delta).clamp(0, 100) as u8;
             snap.volume = target;
             new_vol = target;
         });
         Self::notify_change();
-        let _ = Self::get_volume_worker().try_send(new_vol);
+        match Self::get_volume_worker().try_send(new_vol) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
+        }
     }
 
-    /// Toggle mute state for default audio sink instantly.
-    pub fn toggle_mute() {
+    /// Adjust volume by relative delta percentage instantly with coalesced worker execution.
+    pub fn adjust_volume(delta: i32) {
+        let _ = Self::try_adjust_volume(delta);
+    }
+
+    /// Try toggling mute state for default audio sink.
+    pub fn try_toggle_mute() -> Result<(), AudioError> {
         crate::SystemService::update_audio_cache(|snap| {
             snap.is_muted = !snap.is_muted;
         });
@@ -284,10 +327,16 @@ impl AudioService {
                 .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
                 .status();
         });
+        Ok(())
     }
 
-    /// Set default audio output sink by ID via `wpctl set-default <id>`.
-    pub fn set_default_sink(id: u32) {
+    /// Toggle mute state for default audio sink instantly.
+    pub fn toggle_mute() {
+        let _ = Self::try_toggle_mute();
+    }
+
+    /// Try setting default audio output sink by ID.
+    pub fn try_set_default_sink(id: u32) -> Result<(), AudioError> {
         SELECTED_SINK_ID.store(id, Ordering::SeqCst);
         Self::invalidate_sinks_cache();
         Self::notify_change();
@@ -299,6 +348,34 @@ impl AudioService {
             crate::invalidate_audio_cache();
             Self::notify_change();
         });
+        Ok(())
+    }
+
+    /// Set default audio output sink by ID via `wpctl set-default <id>`.
+    pub fn set_default_sink(id: u32) {
+        let _ = Self::try_set_default_sink(id);
+    }
+}
+
+impl AudioController for AudioService {
+    fn list_sinks(&self) -> Result<Vec<AudioDevice>, AudioError> {
+        Self::try_list_sinks()
+    }
+
+    fn set_volume(&self, percent: u8) -> Result<(), AudioError> {
+        Self::try_set_volume(percent)
+    }
+
+    fn adjust_volume(&self, delta: i32) -> Result<(), AudioError> {
+        Self::try_adjust_volume(delta)
+    }
+
+    fn toggle_mute(&self) -> Result<(), AudioError> {
+        Self::try_toggle_mute()
+    }
+
+    fn set_default_sink(&self, id: u32) -> Result<(), AudioError> {
+        Self::try_set_default_sink(id)
     }
 }
 

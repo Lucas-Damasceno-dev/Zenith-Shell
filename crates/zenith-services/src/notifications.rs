@@ -3,10 +3,45 @@
 //! Captures and manages system toast notifications streamed from the user
 //! D-Bus session bus, supporting `notify-send` and desktop applications.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::error::NotificationError;
+
+/// Contract for desktop notification management.
+pub trait NotificationController: Send + Sync {
+    /// Retrieve all active desktop notifications.
+    fn list_active(&self) -> Result<Vec<NotificationItem>, NotificationError>;
+
+    /// Retrieve all historical notifications.
+    fn list_history(&self) -> Result<Vec<NotificationItem>, NotificationError>;
+
+    /// Retrieve count of active notifications.
+    fn count(&self) -> Result<usize, NotificationError>;
+
+    /// Create or insert a notification programmatically.
+    #[allow(clippy::too_many_arguments)]
+    fn notify(
+        &self,
+        app_name: String,
+        replaces_id: u32,
+        app_icon: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        urgency: u8,
+        expire_timeout_ms: i32,
+    ) -> Result<u32, NotificationError>;
+
+    /// Close notification by ID.
+    fn close(&self, id: u32) -> Result<(), NotificationError>;
+
+    /// Dismiss all active notifications.
+    fn clear_all(&self) -> Result<(), NotificationError>;
+
+    /// Clear all historical notifications.
+    fn clear_history(&self) -> Result<(), NotificationError>;
+}
 
 /// Structured representation of a desktop notification toast.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -36,18 +71,28 @@ static DND_ENABLED: AtomicBool = AtomicBool::new(false);
 pub struct NotificationService;
 
 impl NotificationService {
+    /// Retrieve all active notifications with explicit error handling.
+    pub fn try_list_active() -> Result<Vec<NotificationItem>, NotificationError> {
+        let state = Self::get_state();
+        let r = state.read().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
+        Ok(r.active.clone())
+    }
+
     /// Retrieve all active notifications.
     pub fn list_active() -> Vec<NotificationItem> {
+        Self::try_list_active().unwrap_or_default()
+    }
+
+    /// Retrieve all historical notifications with explicit error handling.
+    pub fn try_list_history() -> Result<Vec<NotificationItem>, NotificationError> {
         let state = Self::get_state();
-        let r = state.read().unwrap();
-        r.active.clone()
+        let r = state.read().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
+        Ok(r.history.clone())
     }
 
     /// Retrieve all historical notifications.
     pub fn list_history() -> Vec<NotificationItem> {
-        let state = Self::get_state();
-        let r = state.read().unwrap();
-        r.history.clone()
+        Self::try_list_history().unwrap_or_default()
     }
 
     /// Whether Do Not Disturb (DND) mode is active.
@@ -69,17 +114,21 @@ impl NotificationService {
         Self::notify_change();
     }
 
-    /// Retrieve count of active notifications.
-    pub fn count() -> usize {
+    /// Retrieve count of active notifications with explicit error handling.
+    pub fn try_count() -> Result<usize, NotificationError> {
         let state = Self::get_state();
-        let r = state.read().unwrap();
-        r.active.len()
+        let r = state.read().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
+        Ok(r.active.len())
     }
 
-    /// Create or insert a notification programmatically.
-    // Preserves the D-Bus freedesktop notifications parameter mapping and public API compatibility.
+    /// Retrieve count of active notifications.
+    pub fn count() -> usize {
+        Self::try_count().unwrap_or(0)
+    }
+
+    /// Create or insert a notification programmatically with explicit error handling.
     #[allow(clippy::too_many_arguments)]
-    pub fn notify(
+    pub fn try_notify(
         app_name: String,
         replaces_id: u32,
         app_icon: String,
@@ -88,9 +137,9 @@ impl NotificationService {
         actions: Vec<String>,
         urgency: u8,
         expire_timeout_ms: i32,
-    ) -> u32 {
+    ) -> Result<u32, NotificationError> {
         let state = Self::get_state();
-        let mut w = state.write().unwrap();
+        let mut w = state.write().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
 
         let id = if replaces_id > 0 {
             replaces_id
@@ -126,7 +175,7 @@ impl NotificationService {
             }
             drop(w);
             Self::notify_change();
-            return id;
+            return Ok(id);
         }
 
         // If replacing an existing item, update it in place
@@ -136,8 +185,9 @@ impl NotificationService {
             w.active.insert(0, item.clone());
             // Keep active limit reasonable (up to 15 toasts)
             if w.active.len() > 15 {
-                let dropped = w.active.pop().unwrap();
-                w.history.insert(0, dropped);
+                if let Some(dropped) = w.active.pop() {
+                    w.history.insert(0, dropped);
+                }
             }
         }
 
@@ -148,38 +198,81 @@ impl NotificationService {
 
         drop(w);
         Self::notify_change();
-        id
+        Ok(id)
     }
 
-    /// Close a notification by id.
-    pub fn close(id: u32) {
+    /// Create or insert a notification programmatically.
+    // Preserves the D-Bus freedesktop notifications parameter mapping and public API compatibility.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify(
+        app_name: String,
+        replaces_id: u32,
+        app_icon: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        urgency: u8,
+        expire_timeout_ms: i32,
+    ) -> u32 {
+        Self::try_notify(
+            app_name,
+            replaces_id,
+            app_icon,
+            summary,
+            body,
+            actions,
+            urgency,
+            expire_timeout_ms,
+        ).unwrap_or(0)
+    }
+
+    /// Close a notification by id with explicit error handling.
+    pub fn try_close(id: u32) -> Result<(), NotificationError> {
         let state = Self::get_state();
-        let mut w = state.write().unwrap();
+        let mut w = state.write().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
         if let Some(pos) = w.active.iter().position(|n| n.id == id) {
             let removed = w.active.remove(pos);
             w.history.insert(0, removed);
         }
         drop(w);
         Self::notify_change();
+        Ok(())
     }
 
-    /// Dismiss/clear all active notifications.
-    pub fn clear_all() {
+    /// Close a notification by id.
+    pub fn close(id: u32) {
+        let _ = Self::try_close(id);
+    }
+
+    /// Dismiss/clear all active notifications with explicit error handling.
+    pub fn try_clear_all() -> Result<(), NotificationError> {
         let state = Self::get_state();
-        let mut w = state.write().unwrap();
+        let mut w = state.write().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
         let mut drained = w.active.drain(..).collect::<Vec<_>>();
         w.history.append(&mut drained);
         drop(w);
         Self::notify_change();
+        Ok(())
+    }
+
+    /// Dismiss/clear all active notifications.
+    pub fn clear_all() {
+        let _ = Self::try_clear_all();
+    }
+
+    /// Clear all historical notifications with explicit error handling.
+    pub fn try_clear_history() -> Result<(), NotificationError> {
+        let state = Self::get_state();
+        let mut w = state.write().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
+        w.history.clear();
+        drop(w);
+        Self::notify_change();
+        Ok(())
     }
 
     /// Clear all historical notifications.
     pub fn clear_history() {
-        let state = Self::get_state();
-        let mut w = state.write().unwrap();
-        w.history.clear();
-        drop(w);
-        Self::notify_change();
+        let _ = Self::try_clear_history();
     }
 
     /// Register change notification listener.
@@ -213,26 +306,56 @@ impl NotificationService {
 
     #[allow(dead_code)]
     fn resolve_dbus_address_arg() -> Option<String> {
-        if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-            if !addr.is_empty() && addr != "disabled" {
-                return Some(format!("--address={}", addr));
-            }
-        }
+        crate::dbus::resolve_session_bus_address()
+    }
+}
 
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            let p = PathBuf::from(xdg).join("bus");
-            if p.exists() {
-                return Some(format!("--address=unix:path={}", p.display()));
-            }
-        }
+impl NotificationController for NotificationService {
+    fn list_active(&self) -> Result<Vec<NotificationItem>, NotificationError> {
+        Self::try_list_active()
+    }
 
-        let uid = unsafe { libc::getuid() };
-        let direct_sock = format!("/run/user/{}/bus", uid);
-        if std::path::Path::new(&direct_sock).exists() {
-            return Some(format!("--address=unix:path={}", direct_sock));
-        }
+    fn list_history(&self) -> Result<Vec<NotificationItem>, NotificationError> {
+        Self::try_list_history()
+    }
 
-        None
+    fn count(&self) -> Result<usize, NotificationError> {
+        Self::try_count()
+    }
+
+    fn notify(
+        &self,
+        app_name: String,
+        replaces_id: u32,
+        app_icon: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        urgency: u8,
+        expire_timeout_ms: i32,
+    ) -> Result<u32, NotificationError> {
+        Self::try_notify(
+            app_name,
+            replaces_id,
+            app_icon,
+            summary,
+            body,
+            actions,
+            urgency,
+            expire_timeout_ms,
+        )
+    }
+
+    fn close(&self, id: u32) -> Result<(), NotificationError> {
+        Self::try_close(id)
+    }
+
+    fn clear_all(&self) -> Result<(), NotificationError> {
+        Self::try_clear_all()
+    }
+
+    fn clear_history(&self) -> Result<(), NotificationError> {
+        Self::try_clear_history()
     }
 }
 
@@ -255,7 +378,10 @@ impl NotificationServer {
         _hints: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        let mut w = self.state.write().unwrap();
+        let mut w = match self.state.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         let id = if replaces_id > 0 {
             replaces_id
         } else {

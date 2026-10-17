@@ -4,9 +4,18 @@
 //! user D-Bus session bus, exposing metadata (title, artist, album, status) and
 //! transport controls (play-pause, next, previous).
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use crate::error::MprisError;
+
+/// Contract for MPRIS media player controller.
+pub trait MprisController: Send + Sync {
+    /// Retrieve snapshot of active media player state.
+    fn snapshot(&self) -> Result<MediaSnapshot, MprisError>;
+
+    /// Send playback transport control command ("play-pause", "next", "prev", "stop", etc.).
+    fn control(&self, cmd: &str) -> Result<(), MprisError>;
+}
 
 /// Snapshot of the current active media player state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -49,8 +58,8 @@ static IS_QUERYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 pub struct MprisService;
 
 impl MprisService {
-    /// Retrieve current media player snapshot, cached non-blockingly.
-    pub fn snapshot() -> MediaSnapshot {
+    /// Retrieve current media player snapshot, returning MprisError if lock poisoned.
+    pub fn try_snapshot() -> Result<MediaSnapshot, MprisError> {
         let cache_arc = CACHE.get_or_init(|| {
             Arc::new(RwLock::new(CachedState {
                 last_query: Instant::now() - Duration::from_secs(10),
@@ -60,7 +69,7 @@ impl MprisService {
         });
 
         let (snap, need_refresh) = {
-            let r = cache_arc.read().unwrap();
+            let r = cache_arc.read().map_err(|e| MprisError::LockPoisoned(e.to_string()))?;
             let threshold = if r.snapshot.is_available {
                 Duration::from_millis(1500)
             } else {
@@ -70,8 +79,9 @@ impl MprisService {
         };
 
         if need_refresh && !IS_QUERYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let mut w = cache_arc.write().unwrap();
-            w.last_query = Instant::now();
+            if let Ok(mut w) = cache_arc.write() {
+                w.last_query = Instant::now();
+            }
             let c_arc = cache_arc.clone();
             std::thread::spawn(move || {
                 let (fresh_snap, bus_name) = Self::query_active_player();
@@ -84,11 +94,26 @@ impl MprisService {
             });
         }
 
-        snap
+        Ok(snap)
     }
 
-    /// Dispatch media transport control command ("play-pause", "next", "prev").
-    pub fn control(cmd: &str) -> std::io::Result<()> {
+    /// Retrieve current media player snapshot, cached non-blockingly.
+    pub fn snapshot() -> MediaSnapshot {
+        Self::try_snapshot().unwrap_or_default()
+    }
+
+    /// Dispatch media transport control command with rich error diagnostics.
+    pub fn try_control(cmd: &str) -> Result<(), MprisError> {
+        let dbus_method = match cmd.to_ascii_lowercase().as_str() {
+            "play-pause" | "playpause" | "toggle" => "PlayPause",
+            "next" => "Next",
+            "prev" | "previous" => "Previous",
+            "stop" => "Stop",
+            "play" => "Play",
+            "pause" => "Pause",
+            _ => return Err(MprisError::UnknownCommand(cmd.to_string())),
+        };
+
         let bus_name = {
             let cache_arc = CACHE.get_or_init(|| {
                 Arc::new(RwLock::new(CachedState {
@@ -97,87 +122,57 @@ impl MprisService {
                     active_bus_name: None,
                 }))
             });
-            let r = cache_arc.read().unwrap();
+            let r = match cache_arc.read() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
             r.active_bus_name.clone()
         };
 
         let target_bus = match bus_name {
             Some(b) => b,
             None => {
-                // Discover active player if not cached yet
                 let players = Self::find_mpris_players();
                 match players.into_iter().next() {
                     Some(p) => p,
-                    None => return Ok(()),
+                    None => return Err(MprisError::NoPlayerActive),
                 }
             }
         };
 
-        let dbus_method = match cmd.to_lowercase().as_str() {
-            "play-pause" | "playpause" | "toggle" => "PlayPause",
-            "next" => "Next",
-            "prev" | "previous" => "Previous",
-            "stop" => "Stop",
-            "play" => "Play",
-            "pause" => "Pause",
-            _ => return Ok(()),
-        };
+        let conn = Self::get_session_connection()
+            .ok_or_else(|| MprisError::Dbus(crate::error::DbusError::ServiceUnavailable("D-Bus session bus unavailable".into())))?;
 
-        if let Some(conn) = Self::get_session_connection() {
-            let _ = conn.call_method(
-                Some(target_bus.as_str()),
-                "/org/mpris/MediaPlayer2",
-                Some("org.mpris.MediaPlayer2.Player"),
-                dbus_method,
-                &(),
-            );
-        }
+        conn.call_method(
+            Some(target_bus.as_str()),
+            "/org/mpris/MediaPlayer2",
+            Some("org.mpris.MediaPlayer2.Player"),
+            dbus_method,
+            &(),
+        )?;
 
         // Invalidate cache so next read updates immediately
         if let Some(c) = CACHE.get() {
-            let mut w = c.write().unwrap();
-            w.last_query = Instant::now() - Duration::from_secs(5);
+            if let Ok(mut w) = c.write() {
+                w.last_query = Instant::now() - Duration::from_secs(5);
+            }
         }
 
         Ok(())
     }
 
+    /// Dispatch media transport control command ("play-pause", "next", "prev").
+    pub fn control(cmd: &str) -> std::io::Result<()> {
+        Self::try_control(cmd).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+
+    #[allow(dead_code)]
     fn resolve_dbus_address_arg() -> Option<String> {
-        if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-            if !addr.is_empty() && addr != "disabled" {
-                return Some(format!("--address={}", addr));
-            }
-        }
-
-        // Try standard XDG runtime dir user bus socket
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            let path = PathBuf::from(xdg).join("bus");
-            if path.exists() {
-                return Some(format!("--address=unix:path={}", path.display()));
-            }
-        }
-
-        // Fallback to /run/user/<uid>/bus
-        let uid = unsafe { libc::getuid() };
-        let direct_sock = format!("/run/user/{}/bus", uid);
-        if std::path::Path::new(&direct_sock).exists() {
-            return Some(format!("--address=unix:path={}", direct_sock));
-        }
-
-        None
+        crate::dbus::resolve_session_bus_address()
     }
 
     fn get_session_connection() -> Option<zbus::blocking::Connection> {
-        if let Ok(conn) = zbus::blocking::Connection::session() {
-            return Some(conn);
-        }
-
-        let addr = Self::resolve_dbus_address_arg()?;
-        let path = addr.strip_prefix("--address=")?;
-        zbus::blocking::connection::Builder::address(path)
-            .ok()?
-            .build()
-            .ok()
+        crate::dbus::get_session_connection().ok()
     }
 
     fn find_mpris_players() -> Vec<String> {
@@ -379,6 +374,16 @@ impl MprisService {
         }
 
         result
+    }
+}
+
+impl MprisController for MprisService {
+    fn snapshot(&self) -> Result<MediaSnapshot, MprisError> {
+        Self::try_snapshot()
+    }
+
+    fn control(&self, cmd: &str) -> Result<(), MprisError> {
+        Self::try_control(cmd)
     }
 }
 

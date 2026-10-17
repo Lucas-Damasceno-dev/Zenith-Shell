@@ -12,6 +12,12 @@ static MEM_CACHE: OnceLock<RwLock<(MemorySnapshot, Instant)>> = OnceLock::new();
 static CPU_PREV: OnceLock<Mutex<(u64, u64, u8, Instant)>> = OnceLock::new();
 static THEME_CACHE: OnceLock<RwLock<(ThemePalette, Instant)>> = OnceLock::new();
 
+pub mod error;
+pub use error::{AudioError, DbusError, MprisError, NotificationError, ServiceError};
+
+pub mod dbus;
+pub use dbus::{get_session_connection, get_system_connection, resolve_session_bus_address, DbusConnectionProvider, DbusManager};
+
 pub mod hyprland;
 pub use hyprland::{ActiveWindowSnapshot, ClientItem, HyprlandService, MonitorItem, WorkspaceItem, WorkspacesSnapshot};
 
@@ -19,10 +25,10 @@ pub mod launcher;
 pub use launcher::{AppEntry, LauncherService};
 
 pub mod mpris;
-pub use mpris::{MediaSnapshot, MprisService};
+pub use mpris::{MediaSnapshot, MprisController, MprisService};
 
 pub mod notifications;
-pub use notifications::{NotificationItem, NotificationService};
+pub use notifications::{NotificationController, NotificationItem, NotificationService};
 
 pub mod tray;
 pub use tray::{StatusNotifierItemProxy, StatusNotifierWatcherProxy, TrayItem, TrayService};
@@ -37,7 +43,7 @@ pub mod bluetooth;
 pub use bluetooth::{BluetoothDevice, BluetoothService, BluetoothStatus};
 
 pub mod audio;
-pub use audio::{AudioDevice, AudioService};
+pub use audio::{AudioController, AudioDevice, AudioService};
 
 /// Invalidate cached audio snapshot when external PipeWire / WirePlumber events occur.
 pub fn invalidate_audio_cache() {
@@ -363,7 +369,10 @@ impl SystemService {
                 Instant::now() - Duration::from_secs(10),
             ))
         });
-        let mut guard = cache_lock.write().unwrap();
+        let mut guard = match cache_lock.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         f(&mut guard.0);
         guard.1 = Instant::now();
         guard.0.clone()
@@ -614,8 +623,10 @@ impl SystemService {
         svg_str.hash(&mut hasher);
         let key = (hasher.finish(), width, height);
 
-        if let Some(cached) = cache.read().unwrap().get(&key) {
-            return Ok(cached.clone());
+        if let Ok(guard) = cache.read() {
+            if let Some(cached) = guard.get(&key) {
+                return Ok(cached.clone());
+            }
         }
 
         let opt = resvg::usvg::Options::default();
@@ -632,7 +643,9 @@ impl SystemService {
 
         resvg::render(&tree, transform, &mut pixmap.as_mut());
         let buf = pixmap.take();
-        cache.write().unwrap().insert(key, buf.clone());
+        if let Ok(mut guard) = cache.write() {
+            guard.insert(key, buf.clone());
+        }
         Ok(buf)
     }
 
