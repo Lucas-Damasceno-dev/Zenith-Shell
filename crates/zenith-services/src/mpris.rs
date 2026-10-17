@@ -104,6 +104,16 @@ impl MprisService {
 
     /// Dispatch media transport control command with rich error diagnostics.
     pub fn try_control(cmd: &str) -> Result<(), MprisError> {
+        let dbus_method = match cmd.to_ascii_lowercase().as_str() {
+            "play-pause" | "playpause" | "toggle" => "PlayPause",
+            "next" => "Next",
+            "prev" | "previous" => "Previous",
+            "stop" => "Stop",
+            "play" => "Play",
+            "pause" => "Pause",
+            _ => return Err(MprisError::UnknownCommand(cmd.to_string())),
+        };
+
         let bus_name = {
             let cache_arc = CACHE.get_or_init(|| {
                 Arc::new(RwLock::new(CachedState {
@@ -128,16 +138,6 @@ impl MprisService {
                     None => return Err(MprisError::NoPlayerActive),
                 }
             }
-        };
-
-        let dbus_method = match cmd.to_lowercase().as_str() {
-            "play-pause" | "playpause" | "toggle" => "PlayPause",
-            "next" => "Next",
-            "prev" | "previous" => "Previous",
-            "stop" => "Stop",
-            "play" => "Play",
-            "pause" => "Pause",
-            other => return Err(MprisError::UnknownCommand(other.to_string())),
         };
 
         let conn = Self::get_session_connection()

@@ -284,10 +284,10 @@ impl AudioService {
             snap.volume = clamped;
         });
         Self::notify_change();
-        Self::get_volume_worker()
-            .try_send(clamped)
-            .map_err(|_| AudioError::ChannelDisconnected)?;
-        Ok(())
+        match Self::get_volume_worker().try_send(clamped) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
+        }
     }
 
     /// Set volume percentage on default audio sink instantly with coalesced worker execution.
@@ -300,15 +300,15 @@ impl AudioService {
         let mut new_vol = 0;
         crate::SystemService::update_audio_cache(|snap| {
             let cur = snap.volume as i32;
-            let target = (cur + delta).clamp(0, 100) as u8;
+            let target = cur.saturating_add(delta).clamp(0, 100) as u8;
             snap.volume = target;
             new_vol = target;
         });
         Self::notify_change();
-        Self::get_volume_worker()
-            .try_send(new_vol)
-            .map_err(|_| AudioError::ChannelDisconnected)?;
-        Ok(())
+        match Self::get_volume_worker().try_send(new_vol) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
+        }
     }
 
     /// Adjust volume by relative delta percentage instantly with coalesced worker execution.
