@@ -93,7 +93,11 @@ impl EglContext {
 
         let context = egl.create_context(display, config, None, &ctx_attribs)?;
 
-        let gl = {
+        // Ensure EGL context is current so OpenGL queries (e.g. GL_VERSION in glow, shader compilation) succeed.
+        egl.make_current(display, None, None, Some(context))
+            .map_err(|e| format!("Failed to make EGL context current (surfaceless): {:?}", e))?;
+
+        let gl_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let egl_clone = egl.clone();
             glow::Context::from_loader_function(move |name| {
                 egl_clone
@@ -101,6 +105,15 @@ impl EglContext {
                     .map(|p| p as *const _)
                     .unwrap_or(std::ptr::null())
             })
+        }));
+
+        let gl = match gl_res {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = egl.make_current(display, None, None, None);
+                let _ = egl.destroy_context(display, context);
+                return Err(format!("glow::Context initialization panicked: {:?}", e).into());
+            }
         };
 
         let swap_damage_fn: Option<EglSwapBuffersWithDamageFn> = {
