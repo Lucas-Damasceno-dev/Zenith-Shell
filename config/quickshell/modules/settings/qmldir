@@ -1,6 +1,0 @@
-singleton SettingsConfig 1.0 SettingsConfig.qml
-singleton SettingsRegistry 1.0 SettingsRegistry.qml
-SettingsNav 1.0 SettingsNav.qml
-SettingsContent 1.0 SettingsContent.qml
-SettingsWindow 1.0 SettingsWindow.qml
-SettingsOverlay 1.0 SettingsOverlay.qml
