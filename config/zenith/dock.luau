@@ -1,3 +1,5 @@
--- Zenith Standalone Dock Entrypoint
-local Dock = Zenith.import("overlays/Dock")
-return Dock
+--!strict
+-- Zenith Desktop Shell — Bottom Dock Entrypoint
+
+local Dock = Zenith.import("dock/init")
+return Dock()

@@ -73,7 +73,11 @@ trigger_profile() {
     local focused
     focused="$(hyprctl -j monitors 2>/dev/null | jq -r '.[] | select(.focused == true) | .name' 2>/dev/null | head -n1)" || true
     [[ -n "$focused" ]] && hyprctl dispatch focusmonitor "$focused" >/dev/null 2>&1 || true
-    quickshell -p "${config_dir}/quickshell" ipc --any-display call ipcHandler onMonitorsChanged >/dev/null 2>&1 || quickshell ipc --any-display call ipcHandler onMonitorsChanged >/dev/null 2>&1 || true
+    if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/zenith.sock" ]] || pgrep -x zenith >/dev/null 2>&1; then
+        zenith reload >/dev/null 2>&1 || true
+    else
+        quickshell -p "${config_dir}/quickshell" ipc --any-display call ipcHandler onMonitorsChanged >/dev/null 2>&1 || quickshell ipc --any-display call ipcHandler onMonitorsChanged >/dev/null 2>&1 || true
+    fi
 }
 
 while true; do

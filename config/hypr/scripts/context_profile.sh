@@ -5,11 +5,12 @@ export PATH="/run/current-system/sw/bin:${HOME}/.nix-profile/bin:${PATH:-}"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/hypr"
 script_dir="${config_dir}/hypr/scripts"
+[[ -d "$script_dir" ]] || script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 state_file="${state_dir}/context-profile"
 
 if [[ "${1:-}" == "--self-test" ]]; then
     command -v powerprofilesctl >/dev/null 2>&1 || exit 1
-    command -v quickshell >/dev/null 2>&1 || exit 1
+    command -v zenith >/dev/null 2>&1 || command -v quickshell >/dev/null 2>&1 || exit 1
     command -v systemctl >/dev/null 2>&1 || exit 1
     [[ -x "${script_dir}/scene_preset.sh" ]] || exit 1
     echo "ok"
@@ -41,7 +42,11 @@ done
 case "$profile" in
     work)
         powerprofilesctl set balanced >/dev/null 2>&1 || true
-        quickshell ipc call ipcHandler setDndOff >/dev/null 2>&1 || true
+        if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/zenith.sock" ]] || pgrep -x zenith >/dev/null 2>&1; then
+            zenith eval 'Zenith.Services.set_dnd(false)' >/dev/null 2>&1 || true
+        else
+            quickshell ipc call ipcHandler setDndOff >/dev/null 2>&1 || true
+        fi
         systemctl --user start hypridle.service >/dev/null 2>&1 || true
         ;;
     study)

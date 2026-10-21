@@ -4,7 +4,7 @@ set -euo pipefail
 export PATH="/run/current-system/sw/bin:${HOME}/.nix-profile/bin:${PATH:-}"
 
 if [[ "${1:-}" == "--self-test" ]]; then
-    command -v quickshell >/dev/null 2>&1 || exit 1
+    command -v zenith >/dev/null 2>&1 || [[ -x "${HOME}/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/target/release/zenith" ]] || command -v quickshell >/dev/null 2>&1 || exit 1
     echo "ok"
     exit 0
 fi
@@ -27,6 +27,19 @@ fi
 # if hyprctl dispatch global quickshell:launcher >/dev/null 2>&1; then
 #     exit 0
 # fi
+
+ZENITH_REPO="${HOME}/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell"
+ZENITH_BIN="${ZENITH_REPO}/target/release/zenith"
+ZENITH_SOCKET="${runtime_dir}/zenith.sock"
+
+# Prioritize native Zenith-Shell daemon if active
+if [[ -S "$ZENITH_SOCKET" ]] || pgrep -x zenith >/dev/null 2>&1; then
+    if [[ -x "$ZENITH_BIN" ]]; then
+        exec "$ZENITH_BIN" toggle Launcher
+    elif command -v zenith >/dev/null 2>&1; then
+        exec zenith toggle Launcher
+    fi
+fi
 
 QS_CANDIDATES=(
     "$(command -v quickshell 2>/dev/null || true)"

@@ -209,6 +209,12 @@ resolve_quickshell_bin() {
 }
 
 notify_quickshell_colors_changed() {
+    # If Zenith Shell daemon is active, hot-reload theme and active trees
+    if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/zenith.sock" ]] || pgrep -x zenith >/dev/null 2>&1; then
+        zenith reload >/dev/null 2>&1 || true
+        return 0
+    fi
+
     local quickshell_bin=""
     quickshell_bin="$(resolve_quickshell_bin)"
     [[ -n "$quickshell_bin" ]] || return 0

@@ -13,6 +13,8 @@ export type PaddingSpec = number | {
     right: number?,
     top: number?,
     bottom: number?,
+    x: number?,
+    y: number?,
 }
 
 export type ShadowSpec = {
@@ -23,10 +25,66 @@ export type ShadowSpec = {
     spread: number?,
 }
 
+export type AutoHideMode = "none" | "hover" | "overlap" | "always"
+
+export type AutoHideConfig = {
+    mode: AutoHideMode,
+    reveal_delay_ms: number?,
+    hide_delay_ms: number?,
+    peek_size: number?,
+    sensor_thickness: number?,
+    on_visibility_change: ((visible: boolean) -> ())?,
+}
+
+export type WindowLayer = "background" | "bottom" | "top" | "overlay"
+
+export type LayerShellAnchor = {
+    top: boolean?,
+    bottom: boolean?,
+    left: boolean?,
+    right: boolean?,
+}
+
+export type WindowProps = {
+    id: string?,
+    layer: WindowLayer?,
+    exclusive_zone: number?,
+    anchor: LayerShellAnchor?,
+    margin: PaddingSpec?,
+    margins: PaddingSpec?,
+    auto_hide: AutoHideConfig?,
+    keyboard_interactivity: ("none" | "exclusive" | "on_demand")?,
+    children: { any }?,
+}
+
+export type SpringSpec = {
+    stiffness: number,
+    damping: number,
+    mass: number?,
+    precision: number?,
+}
+
+export type PointerEvent = {
+    x: number,
+    y: number,
+    relative_x: number,
+    relative_y: number,
+    button: ("left" | "right" | "middle" | "none")?,
+    timestamp: number,
+}
+
+export type MagnificationSpec = {
+    scale_max: number,
+    radius: number,
+    spring: SpringSpec?,
+    on_scale_change: ((scale: number) -> ())?,
+}
+
 export type BoxProps = {
     id: string?,
     width: (number | string)?,
     height: (number | string)?,
+    direction: FlexDirection?,
     flex_direction: FlexDirection?,
     justify_content: JustifyContent?,
     align_items: AlignItems?,
@@ -40,9 +98,15 @@ export type BoxProps = {
     shader: string?,
     uniforms: { [string]: number }?,
     opacity: number?,
+    scale: (number | any)?,
     cursor: CursorType?,
+    magnification: MagnificationSpec?,
+    auto_hide: AutoHideConfig?,
     on_click: (() -> ())?,
     on_right_click: (() -> ())?,
+    on_pointer_enter: ((event: PointerEvent?) -> ())?,
+    on_pointer_leave: ((event: PointerEvent?) -> ())?,
+    on_pointer_move: ((event: PointerEvent) -> ())?,
     children: { any }?,
 }
 
@@ -71,11 +135,14 @@ export type ImageProps = {
 export type ShaderProps = {
     id: string?,
     fragment: string,
+    vertex: string?,
     width: (number | string)?,
     height: (number | string)?,
-    uniforms: { [string]: number }?,
+    uniforms: { [string]: (number | { number }) }?,
+    textures: { [string]: string }?,
     border_radius: number?,
     opacity: number?,
+    sdf_primitive: ("rounded_box" | "circle" | "drop_shadow" | "frosted_glass")?,
 }
 
 export type TextInputProps = {
@@ -209,6 +276,33 @@ export type Promise<T> = {
     finally: (self: Promise<T>, onFinally: () -> ()) -> Promise<T>,
 }
 
+export type ToplevelState = {
+    active: boolean,
+    minimized: boolean,
+    maximized: boolean,
+    fullscreen: boolean,
+}
+
+export type ToplevelHandle = {
+    id: string,
+    title: string,
+    app_id: string,
+    workspace: number?,
+    state: ToplevelState,
+    thumbnail_uri: string?,
+    thumbnail_texture_id: number?,
+}
+
+export type CanvasWidget = {
+    id: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    pinned: boolean?,
+    render: () -> any,
+}
+
 declare class ZenithStatic {
     Box: (props: BoxProps) -> any
     Text: (props: TextProps) -> any
@@ -218,6 +312,8 @@ declare class ZenithStatic {
     Slider: (props: SliderProps) -> any
     Switch: (props: SwitchProps) -> any
     VirtualList: (props: VirtualListProps) -> any
+    Window: (props: WindowProps) -> any
+    CanvasWidget: (props: CanvasWidget) -> any
     
     Theme: () -> ThemeTokens
     Spring: (from: number, to: number, stiffness: number?, damping: number?) -> any
@@ -227,6 +323,9 @@ declare class ZenithStatic {
     signal: <T>(initial: T) -> (Signal<T>, (newValue: T) -> ())
     Signal: <T>(initial: T) -> Signal<T>
     effect: (callback: () -> ()) -> ()
+    Effect: (callback: () -> ()) -> ()
+    batch: (callback: () -> ()) -> ()
+    Batch: (callback: () -> ()) -> ()
     
     Signals: {
         Time: () -> string,
@@ -268,6 +367,17 @@ declare class ZenithStatic {
     dispatch: (dispatcher: string, argument: string | number) -> ()
     set_brightness: (percent: number) -> ()
     set_idle: (idle: boolean) -> ()
+    get_search_query: () -> string
+    set_search_query: (query: string) -> ()
+    get_selected_index: () -> number
+    set_selected_index: (index: number) -> ()
+    lock_pass_len: () -> number
+    get_lock_password_len: () -> number
+    lock_pass_display: () -> string
+    is_locked_out: () -> boolean
+    lockout_remaining_secs: () -> number
+    close: () -> ()
+    reload_popup: (id: string?) -> ()
     
     Services: {
         -- System Tray (StatusNotifierItem)
@@ -315,6 +425,18 @@ declare class ZenithStatic {
         focus_window: (address: string) -> (),
         HyprlandGaps: () -> { inner: number, outer: number, gaps_in: number?, gaps_out: number? },
         hyprland_gaps: () -> { inner: number, outer: number, gaps_in: number?, gaps_out: number? },
+
+        -- Wayland Foreign Toplevel Management (zwlr_foreign_toplevel_management_v1)
+        Toplevels: () -> { ToplevelHandle },
+        toplevels: () -> { ToplevelHandle },
+        ToplevelActivate: (id: string) -> (),
+        toplevel_activate: (id: string) -> (),
+        ToplevelClose: (id: string) -> (),
+        toplevel_close: (id: string) -> (),
+        ToplevelSetMinimized: (id: string, minimized: boolean) -> (),
+        toplevel_set_minimized: (id: string, minimized: boolean) -> (),
+        ToplevelSetMaximized: (id: string, maximized: boolean) -> (),
+        toplevel_set_maximized: (id: string, maximized: boolean) -> (),
 
         -- Network & Connectivity
         Network: () -> { connected: boolean, ssid: string?, strength: number?, ethernet: boolean },

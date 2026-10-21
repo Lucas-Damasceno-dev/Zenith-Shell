@@ -22,6 +22,10 @@ case "$current" in
 esac
 
 powerprofilesctl set "$next"
-quickshell ipc --any-display call ipcHandler triggerPowerProfileOsd "$next" >/dev/null 2>&1 || true
+if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/zenith.sock" ]] || pgrep -x zenith >/dev/null 2>&1; then
+    zenith open OSD >/dev/null 2>&1 || true
+else
+    quickshell ipc --any-display call ipcHandler triggerPowerProfileOsd "$next" >/dev/null 2>&1 || true
+fi
 notify-send -a "Hyprland" "Power profile" "Perfil: ${next}"
 
