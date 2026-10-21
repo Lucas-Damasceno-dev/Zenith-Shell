@@ -9,7 +9,7 @@
 
 Zenith-Shell is an ultra-high-performance, standalone Wayland desktop shell engine written in **Rust** with **Luau** (embedded Roblox Luau engine via `mlua`) as its declarative configuration and scripting language.
 
-> 📘 **Especificação Normativa v3:** Para o roteiro de evolução arquitetural completo (OpenGL ES 3.0 / EGL, Sinais Reativos em Luau, D-Bus com `zbus` e tipagem estática), consulte [`docs/CORE_ARCHITECTURE_EVOLUTION.md`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/docs/CORE_ARCHITECTURE_EVOLUTION.md).
+> 📘 **Especificação Normativa v3:** Para o roteiro de evolução arquitetural completo (OpenGL ES 3.0 / EGL, Sinais Reativos em Luau, D-Bus com `zbus`, TextEditorEngine e renderização GLES), consulte [`docs/CORE_ARCHITECTURE_EVOLUTION.md`](CORE_ARCHITECTURE_EVOLUTION.md).
 
 ### Core Principle: Decoupling Engine Base from User Shell
 A arquitetura do Zenith separa categoricamente a **Engine Base** (framework estável e agnóstico de UI) da **Shell de Usuário** (scripts declarativos de widgets). O desenvolvimento foca na maturidade da base em Rust antes da portagem de superfícies cosméticas complexas.
@@ -28,7 +28,7 @@ A arquitetura do Zenith separa categoricamente a **Engine Base** (framework est�
 
 ## 2. Workspace Crate Architecture
 
-The repository is structured as a modular Cargo workspace in [`crates/`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/):
+The repository is structured as a modular Cargo workspace in [`crates/`](../crates/):
 
 ```
 crates/
@@ -71,7 +71,7 @@ graph TD
 3. **`wl_seat`, `wl_pointer` & `wl_keyboard`:** Mouse motion, button press/release, scroll events, and keyboard typing/navigation for overlays.
 
 ### Event Loop Architecture (`calloop` + SCTK 0.19)
-- Located in [`crates/zenith-cli/src/main.rs`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/zenith-cli/src/main.rs).
+- Located in [`crates/zenith-cli/src/main.rs`](../crates/zenith-cli/src/main.rs).
 - `calloop::EventLoop` drives both:
   - **Wayland Connection Source:** `calloop_wayland_source::WaylandSource` handles socket readiness and dispatches SCTK queue.
   - **File Watcher (`notify` 8.0):** Watches `config/zenith/**/*.luau`. On change, sends a channel event to trigger instant VM reload and surface redraw in **6.8 ms**.
@@ -81,7 +81,7 @@ graph TD
 
 ## 4. Two-Pass Vector Rendering Pipeline
 
-Rendering is implemented in [`crates/zenith-wayland/src/lib.rs`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/zenith-wayland/src/lib.rs) without OpenGL or Vulkan dependencies, operating directly on shared memory (SHM) buffers with zero CPU-GPU copy bottlenecks for simple 2D bars.
+Rendering is implemented in [`crates/zenith-wayland/src/lib.rs`](../crates/zenith-wayland/src/lib.rs) with dual rendering backends: a direct shared memory (SHM) double-buffer pipeline via `tiny-skia` + `cosmic-text` and an accelerated OpenGL ES 3.0 / EGL pipeline via `glow`.
 
 ### The Borrow Checker & Two-Pass Solution
 **Problem:** `tiny_skia::PixmapMut::from_bytes(canvas)` takes a mutable reference to the raw SHM slice `&mut [u8]`. Simultaneously, `cosmic_text::Buffer::draw(&mut font_cache, ...)` takes a closure mutating pixel bytes in `canvas`. Doing both simultaneously causes Rust compiler error `E0499` (cannot borrow canvas as mutable more than once at a time).
@@ -120,7 +120,7 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia
 
 ## 5. Layout Engine (`taffy` 0.14)
 
-Implemented in [`crates/zenith-layout/src/lib.rs`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/zenith-layout/src/lib.rs):
+Implemented in [`crates/zenith-layout/src/lib.rs`](../crates/zenith-layout/src/lib.rs):
 - Translates the declarative AST from Luau into a Taffy Flexbox tree.
 - Flex direction (`Row`, `Column`), justify-content, align-items, flex-grow, margins, padding, and gaps.
 - Text nodes are measured dynamically using `cosmic-text` buffer bounds so parent containers hug text content accurately without hardcoded pixel widths.
@@ -142,7 +142,7 @@ Implemented in [`crates/zenith-layout/src/lib.rs`](file:///home/lucas/Documents/
 
 ## 6. Luau Runtime & Declarative Scripting
 
-Implemented in [`crates/zenith-runtime/src/lib.rs`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/zenith-runtime/src/lib.rs) using `mlua 0.12` with Luau features.
+Implemented in [`crates/zenith-runtime/src/lib.rs`](../crates/zenith-runtime/src/lib.rs) using `mlua 0.12` with Luau features.
 
 ### Declarative AST Elements
 ```luau
@@ -224,7 +224,7 @@ local theme = Zenith.Theme()
 
 ## 7. Input Handling & Pointer Hit-Testing
 
-Integrated in [`crates/zenith-wayland/src/lib.rs`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/crates/zenith-wayland/src/lib.rs):
+Integrated in [`crates/zenith-wayland/src/lib.rs`](../crates/zenith-wayland/src/lib.rs):
 1. **Seat & Pointer Handlers:** SCTK's `SeatHandler` registers seats and instantiates pointer objects.
 2. **Motion Tracking:** Tracks `(pointer_x, pointer_y)` on `wl_pointer.motion`.
 3. **Hit-Testing:** On `wl_pointer.button` (button press `0x110` / `BTN_LEFT` with state `Pressed`):
@@ -237,7 +237,7 @@ Integrated in [`crates/zenith-wayland/src/lib.rs`](file:///home/lucas/Documents/
 ## 8. Development & Operational Guide
 
 ### NixOS Flake DevShell
-All tools are pinned in [`flake.nix`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/flake.nix). To build or run:
+All tools are pinned in [`flake.nix`](../flake.nix). To build or run:
 ```bash
 # Enter devShell or execute directly:
 nix develop . --command cargo build

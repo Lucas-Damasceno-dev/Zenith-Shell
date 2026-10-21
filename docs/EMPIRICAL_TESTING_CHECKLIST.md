@@ -1,4 +1,4 @@
-# 🧪 Zenith-Shell (Engine v2) — Checklist de Verificação Empírica
+# 🧪 Zenith-Shell (Engine Base v3) — Checklist de Verificação Empírica
 
 Este documento estabelece o roteiro exaustivo e sequencial para testes práticos no seu ambiente desktop Wayland (Hyprland / Sway).
 A ordem foi priorizada da infraestrutura mais crítica (Core Wayland e IPC) até as superfícies contextuais e periféricas.

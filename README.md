@@ -2,16 +2,16 @@
 
 # ⚡ ZENITH-SHELL
 ### Next-Generation Linux Desktop Shell & Standalone Wayland Engine
-*Powered by **Hyprland**, **Rust (Engine v2)** & **Luau Scripting***
+*Powered by **Hyprland**, **Rust (Engine v3)** & **Luau Scripting***
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hyprland](https://img.shields.io/badge/Hyprland-Wayland-00c8ff.svg)](https://hyprland.org)
-[![Rust Engine](https://img.shields.io/badge/Engine-Rust_v2-red.svg)](crates/)
+[![Rust Engine](https://img.shields.io/badge/Engine-Rust_v3-red.svg)](crates/)
 [![Luau](https://img.shields.io/badge/Scripting-Luau-blue.svg)](config/zenith/)
 [![Memory](https://img.shields.io/badge/Memory-12.9_MB_VmRSS-brightgreen.svg)](#)
 [![Reload](https://img.shields.io/badge/Reload-6.8_ms-brightgreen.svg)](#)
 
-**Zenith-Shell** é uma interface e engine de desktop de altíssima performance para Wayland. Construída em Rust com estilização declarativa em Luau, consome menos de 15 MB de RAM, suporta recarga sub-10ms e oferece paridade total de recursos: launcher inteligente, docking interativa, painel dinâmico (dynamic island), lock screen de alta segurança, roteamento PipeWire e telemetria de hardware em tempo real.
+**Zenith-Shell** é uma interface e engine de desktop de altíssima performance para Wayland. Construída em Rust com estilização e lógica declarativa em Luau, consome menos de 15 MB de RAM, suporta recarga sub-10ms e oferece paridade total e independente: launcher inteligente, docking interativa com magnificação e auto-hide, painel dinâmico (dynamic island), lock screen de alta segurança, aceleração gráfica GLES 3.0 com blur Kawase, roteamento PipeWire e telemetria de hardware em tempo real sem qualquer dependência de runtimes pesados (zero Qt/Electron).
 
 </div>
 
@@ -19,14 +19,15 @@
 
 ## 🌟 Principais Recursos
 
-- ⚡ **Standalone Rust Engine (v2) & Luau:** Sub-10ms hot-reload (`6.8ms`), consumo ínfimo de memória (`~12.9 MB VmRSS`) e zero dependências de runtimes pesados (zero Qt/Electron).
-- 🎨 **Sincronização Dinâmica de Cores (Material You):** Integração com **Matugen** e Stylix gerando paletas tonais em tempo real.
-- 🔍 **Launcher Inteligente:** Busca rápida de aplicativos XDG com fuzzy search, atalhos de teclado, cursor interativo e botão de limpeza (`search:clear`).
-- 🖥️ **Multi-Monitor Cloning & Workspace Filtering:** Renderização independente e double-buffering damage tracking por monitor, filtrando workspaces automaticamente via `Zenith.current_output()`.
+- ⚡ **Standalone Rust Engine (v3) & Luau Reativo:** Sub-10ms hot-reload (`6.8ms`), consumo ínfimo de memória (`~12.9 MB VmRSS`), sistema de sinais reativos (`Zenith.signal`, `Zenith.computed`, `Zenith.effect`) e persistência atômica chave-valor (`Zenith.Storage`).
+- 🚀 **Pipeline Gráfico Dual (GLES 3.0 & SHM):** Renderizador acelerado por hardware via Wayland EGL + OpenGL ES 3.0 com shader Dual-Pass Kawase Blur, Texture Atlas para `cosmic-text` e damage tracking por monitor, com fallback eficiente em memória compartilhada via `tiny-skia`.
+- 🎨 **Sincronização Dinâmica de Cores (Material You):** Integração com **Matugen** e Stylix gerando paletas tonais em tempo real com recarga automática via `theme_watcher`.
+- 🔍 **Launcher Inteligente & Editor Interativo:** Busca rápida de aplicativos XDG com fuzzy search, navegação por teclado e editor de texto multilinhas integrado em `zenith-layout` com cursor, seleção e histórico undo/redo.
+- 🖥️ **Multi-Monitor Cloning & Foreign Toplevel:** Renderização independente por monitor filtrando workspaces via `Zenith.current_output()`, com tracking global de janelas via protocolo `zwlr_foreign_toplevel_manager_v1`.
 - 🔒 **Screen Locker Nativo (`LockScreen.luau`):** Overlay em tela cheia com proteção exclusiva de teclado (`Layer::Overlay`), relógio digital, previsão do tempo, avatar do usuário e ações de energia (`zenith lock`).
-- 🎛️ **Audio Sink Switcher:** Seletor interativo de saída de áudio PipeWire via `wpctl status` integrado no `AudioPopup.luau`.
-- 🌦️ **Weather & Recorder Telemetry:** Previsão do tempo assíncrona em cache e indicador de gravação de tela (`wf-recorder`) com ferramenta de recorte (`grim` + `slurp`).
-- 🪟 **Interactive Dock & Dynamic Island:** Dock flutuante inferior com rastreamento de janelas e Dynamic Island no topo animada com física de molas (Springs).
+- 🎛️ **Audio Sink Switcher & Cliphist:** Seletor interativo de saída de áudio PipeWire via `wpctl status` integrado no `AudioPopup.luau` e histórico de clipboard com preview rápido.
+- 🌦️ **Weather, CAVA & Recorder Telemetry:** Previsão do tempo assíncrona em cache, analisador de espectro de áudio CAVA e indicador de gravação de tela (`wf-recorder`) com ferramenta de recorte (`grim` + `slurp`).
+- 🪟 **Interactive Dock com Magnificação & Dynamic Island:** Dock flutuante inferior com física de magnificação parabólica/gaussiana, detecção de colisão com janelas, auto-hide dinâmico e Dynamic Island expansível no topo animada com física de molas (Springs).
 - 🔔 **Serviço de Notificações Integrado:** Daemon nativo D-Bus (`org.freedesktop.Notifications`) com central de notificações expansível.
 
 ---
@@ -35,18 +36,26 @@
 
 ```text
 Zenith-Shell/
-├── crates/                     # Rust Engine v2 (Standalone Shell)
-│   ├── zenith-core/            # Tipos compartilhados e física de molas (Springs)
-│   ├── zenith-services/        # Telemetria, Hyprland, Audio sinks, Bluetooth, Weather, Recorder
-│   ├── zenith-layout/          # Flexbox Taffy 0.14 e medição tipográfica
-│   ├── zenith-runtime/         # VM Luau (mlua 0.12) e bindings de ecossistema
-│   ├── zenith-wayland/         # SCTK 0.19, wlr-layer-shell multi-monitor e renderizador 2-pass
-│   └── zenith-cli/             # Daemon principal, watcher e controle IPC via socket
+├── crates/                     # Rust Engine Base v3 (Standalone Shell)
+│   ├── zenith-core/            # Tipos compartilhados, física de molas (Springs) e modelo de magnificação
+│   ├── zenith-services/        # Telemetria, Hyprland IPC, Audio PipeWire, Bluetooth, Weather, Recorder, CAVA, Cliphist
+│   ├── zenith-layout/          # Flexbox Taffy 0.14, medição tipográfica cosmic-text e editor de texto
+│   ├── zenith-runtime/         # VM Luau (mlua 0.12), sinais reativos, motor de armazenamento em disco e worker threads
+│   ├── zenith-wayland/         # SCTK 0.19, wlr-layer-shell, renderizador dual (GLES 3.0 hardware blur / SHM tiny-skia), foreign toplevel e IME
+│   └── zenith-cli/             # Daemon principal, watcher inotify, CLI avançada e controle IPC via socket UNIX
 ├── config/
-│   ├── zenith/                 # Configuração declarativa Luau (bar.luau, widgets, overlays)
-│   ├── hypr/                   # Configurações Hyprland
-│   └── quickshell/             # Configuração legada QML (opcional)
-├── flake.nix                   # Flake NixOS com pacotes e devShell
+│   ├── zenith/                 # Configuração declarativa Luau modular
+│   │   ├── bar/                # Módulos e clusters da barra superior (left, center, right, island, pill)
+│   │   ├── dock/               # Dock interativa (magnificação, colisão, auto-hide, running apps, menu de contexto)
+│   │   ├── canvas/             # Desktop canvas e widgets sobre o wallpaper
+│   │   ├── island/             # Dynamic island com notificações e status de mídia
+│   │   ├── overlays/           # 22 overlays completos (Launcher, ControlCenter, AudioPopup, LockScreen, etc.)
+│   │   ├── widgets/            # Catálogo modular de widgets (desktop, media, shared, system, tools)
+│   │   ├── core/               # Popup manager, serviços Luau, motor de temas e componentes UI
+│   │   ├── config.json         # Estado persistente de configurações da shell
+│   │   └── zenith.d.luau       # Definições estáticas de tipos para Luau LSP
+│   └── hypr/                   # Configurações do compositor Hyprland e scripts de integração
+├── flake.nix                   # Flake NixOS com pacotes e devShell reproduzível
 └── nix/home-manager.nix        # Módulo declarativo para Home Manager
 ```
 
@@ -55,13 +64,21 @@ Zenith-Shell/
 ## 💻 CLI & Controle IPC (`zenith`)
 
 ```bash
-zenith daemon [path]    # Inicia o daemon do shell (default: config/zenith/bar.luau)
-zenith reload           # Recarrega a configuração Luau em sub-10ms
-zenith toggle <popup>   # Alterna overlay (ex: Launcher, AudioPopup, CalendarPopup)
-zenith open <popup>     # Abre overlay especificado
-zenith close            # Fecha o overlay ativo
-zenith lock             # Bloqueia a sessão com o Lock Screen nativo
-zenith inspect          # Exibe telemetria em tempo real (VmRSS, heap, popups)
+zenith daemon [path] [--inspect]  # Inicia o daemon do shell (default: config/zenith/bar.luau)
+zenith reload                     # Recarrega a configuração Luau em sub-10ms
+zenith toggle <popup_id>          # Alterna overlay (ex: Launcher, AudioPopup, CalendarPopup)
+zenith open <popup_id>            # Abre overlay especificado
+zenith close                      # Fecha o overlay ativo
+zenith lock                       # Bloqueia a sessão com o Lock Screen nativo
+zenith inspect                    # Exibe telemetria em tempo real (VmRSS, heap, popups)
+zenith inspect:toggle             # Alterna bounding boxes visuais na tela para debug
+zenith settings get <key>         # Obtém valor de configuração via IPC
+zenith settings set <key> <val>   # Altera configuração e persiste atomicamente em disco
+zenith settings list              # Lista todas as configurações como JSON
+zenith settings sync              # Força flush e persistência de configurações no config.json
+zenith settings reload            # Recarrega configurações do config.json no estado em tempo real
+zenith eval <code>                # Avalia expressão Luau arbitrária no daemon
+zenith repl                       # Inicia sessão interativa Luau REPL conectada ao daemon
 ```
 
 ---
@@ -75,7 +92,7 @@ git clone https://github.com/Lucas-Damasceno-dev/Zenith-Shell.git
 cd Zenith-Shell
 ./install.sh
 ```
-*O instalador detectará seu gerenciador de pacotes (`pacman`, `dnf`, `apt`), instalará as dependências e configurará os links simbólicos ou arquivos em `~/.config/hypr` e `~/.config/quickshell`.*
+*O instalador detectará seu gerenciador de pacotes (`pacman`, `dnf`, `apt`), instalará as dependências e configurará os arquivos em `~/.config/hypr` e `~/.config/zenith`.*
 
 ---
 

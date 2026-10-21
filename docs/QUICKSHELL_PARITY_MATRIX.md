@@ -2,7 +2,7 @@
 
 This document maps all features from the existing Quickshell configuration (`/etc/nixos/home/lucas/modules/desktop/quickshell`) to Zenith-Shell components, tracking porting progress and implementation plans.
 
-> 📖 **Guia Operacional para IA:** Para instruções passo a passo de desenvolvimento e SOP de migração entre sessões, consulte o [QUICKSHELL_MIGRATION_PLAYBOOK.md](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/docs/QUICKSHELL_MIGRATION_PLAYBOOK.md).
+> 📖 **Guia Operacional para IA:** Para instruções passo a passo de desenvolvimento e SOP de migração entre sessões, consulte o [QUICKSHELL_MIGRATION_PLAYBOOK.md](QUICKSHELL_MIGRATION_PLAYBOOK.md).
 
 ---
 
@@ -48,8 +48,8 @@ This document maps all features from the existing Quickshell configuration (`/et
 | **Disk Storage Service** | `services/DiskAnalyzerService.qml` | ✅ **Implemented** (`disk.rs`, libc `statvfs`) | **Milestone 12** |
 | **Power Profile Switching** | Power profiles daemon in QML | ✅ **Implemented** (`power.rs`, `powerprofilesctl`) | **Milestone 12** |
 | **Settings Hub & Center** | `modules/settings/` | ✅ **Implemented** (`overlays/Settings.luau` + `settings_store.luau`) | **Milestone 13** |
-| **Modular Bar Architecture**| `Bar.qml` + `RightBarModules.qml` | ✅ **Implemented** (`bar.luau` + 26 `lib/widgets/*`) | **Milestone 13** |
-| **UI Kit & Design System** | Reusable QML Controls | ✅ **Implemented** (`config/zenith/lib/ui_kit.luau`) | **Milestone 13** |
+| **Modular Bar Architecture**| `Bar.qml` + `RightBarModules.qml` | ✅ **Implemented** (`config/zenith/bar/` + `widgets/*`) | **Milestone 13** |
+| **UI Kit & Design System** | Reusable QML Controls | ✅ **Implemented** (`config/zenith/ui_kit.luau` + `core/ui/*`) | **Milestone 13** |
 | **Control Center**          | `overlays/ControlCenterPopup.qml` | ✅ **Implemented** (`overlays/ControlCenter.luau`) | **Milestone 15 (Onda 5.1)** |
 | **Clipboard Popup (Cliphist)**| `overlays/ClipboardPopup.qml` | ✅ **Implemented** (`overlays/ClipboardPopup.luau` + `lib/widgets/clipboard.luau`) | **Milestone 14 (Onda 2.1)** |
 | **System Monitor Popup**    | `modules/system_monitor/` / `SystemMonitorUtils.js` | ✅ **Implemented** (`overlays/SystemMonitorPopup.luau`) | **Milestone 14 (Onda 2.2)** |
@@ -103,11 +103,12 @@ This document maps all features from the existing Quickshell configuration (`/et
 - **Scratchpad Drawer (`overlays/ScratchpadDrawer.luau`):** Gerenciador visual dedicado de janelas em workspaces especiais do Hyprland.
 - **Screen Draw & Annotation (`overlays/ScreenDrawOverlay.luau`):** Barra flutuante de ferramentas de marcação vetorial livre e anotação em tempo real.
 
-### 5. Custom Luau Validation Suite & Paridade Sintática
-- **Validador Oficial:** `tests/validate_custom_suite.py`
-- **Cobertura:** 61 arquivos Luau declarativos em `config/zenith/` (100% aprovados com 0 erros de sintaxe e delimitadores perfeitamente balanceados).
+### 5. Arquitetura Modular Luau & Paridade Sintática
+- **Validador Oficial:** `tests/test_luau_syntax.py`
+- **Cobertura:** 100+ arquivos Luau modulares em `config/zenith/` (100% aprovados com 0 erros de sintaxe e delimitadores perfeitamente balanceados).
 - **Inventário Auditado:**
-  - 22 Overlays em `config/zenith/overlays/`
-  - 26 Widgets de barra em `config/zenith/lib/widgets/`
-  - 8 Bibliotecas de componentes UI em `config/zenith/lib/`
-  - 5 Configurações principais (`bar.luau`, `dock.luau`, `canvas.luau`, `island.luau`, `zenith.d.luau`)
+  - Overlays em `config/zenith/overlays/` (`AudioPopup`, `BatteryPopup`, `ControlCenter`, `Dock`, `Launcher`, `LockScreen`, `OSD`, `PowerMenu`, `Settings`, etc.)
+  - Widgets modulares categorizados em `config/zenith/widgets/` (`desktop/`, `media/`, `shared/`, `system/`, `tools/`)
+  - Módulos de subsistemas dedicados: `config/zenith/bar/`, `dock/`, `canvas/`, `launcher/`, `osd/`, `settings/`
+  - Design tokens, serviços e UI Kit em `config/zenith/core/` e `ui_kit.luau`
+  - Ponto de entrada e contratos de tipos: `bar.luau`, `dock.luau`, `canvas.luau`, `island.luau`, `zenith.d.luau`

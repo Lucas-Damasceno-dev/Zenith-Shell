@@ -57,7 +57,7 @@ Quando a IA receber uma tarefa de portar ou aprimorar um componente, **deve segu
   * Validar compilação: `cargo check --workspace`.
 
 ### Passo 3: Implementação / Refatoração em Luau
-* Se for módulo da barra: criar/editar em `config/zenith/lib/widgets/<modulo>.luau` e incluir em `config/zenith/bar.luau`.
+* Se for módulo da barra: criar/editar em `config/zenith/widgets/<categoria>/<modulo>/init.luau` ou `config/zenith/bar/clusters/`.
 * Se for overlay/janela/popup: criar/editar em `config/zenith/overlays/<Nome>.luau`.
 * Utilizar sempre `Zenith.Theme()` para garantir paridade com Matugen / Material You.
 * Garantir retorno de uma tabela de nó UI (`return Zenith.Box({ ... })`).
@@ -82,7 +82,7 @@ just test
 ```
 
 ### Passo 5: Atualização da Matriz de Paridade
-* Atualizar a linha correspondente em [QUICKSHELL_PARITY_MATRIX.md](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/docs/QUICKSHELL_PARITY_MATRIX.md).
+* Atualizar a linha correspondente em [QUICKSHELL_PARITY_MATRIX.md](QUICKSHELL_PARITY_MATRIX.md).
 
 ---
 

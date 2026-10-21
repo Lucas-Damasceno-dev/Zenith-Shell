@@ -177,7 +177,7 @@ Zenith-Shell is an ultra-lightweight, high-performance Wayland desktop shell eng
 ---
 
 ### Milestone 13: Zenith Base v3 Architecture Evolution ✅
-*(Consulte a especificação normativa completa em [`docs/CORE_ARCHITECTURE_EVOLUTION.md`](file:///home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/docs/CORE_ARCHITECTURE_EVOLUTION.md))*
+*(Consulte a especificação normativa completa em [`docs/CORE_ARCHITECTURE_EVOLUTION.md`](CORE_ARCHITECTURE_EVOLUTION.md))*
 
 **Goal:** Transformar a engine em um framework de classe mundial desacoplado da shell de usuário, com zero CPU em repouso e aceleração de hardware nativa.
 
