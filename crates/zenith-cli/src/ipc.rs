@@ -35,8 +35,9 @@ pub enum ShellCommand {
 ///
 /// Precedence:
 /// 1. `ZENITH_SOCKET_PATH` environment variable (ideal for isolated integration tests).
-/// 2. `$XDG_RUNTIME_DIR/zenith.sock`.
-/// 3. `/tmp/zenith.sock` fallback.
+/// 2. `/run/user/<uid>/zenith-shell.sock` (standard POSIX runtime path).
+/// 3. `$XDG_RUNTIME_DIR/zenith-shell.sock` (with legacy fallback).
+/// 4. `~/.cache/zenith/run/zenith-shell.sock` (permission-restricted 0700 fallback).
 pub fn resolve_socket_path() -> PathBuf {
     if let Ok(custom) = std::env::var("ZENITH_SOCKET_PATH") {
         if !custom.trim().is_empty() {
@@ -44,12 +45,47 @@ pub fn resolve_socket_path() -> PathBuf {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        let uid = unsafe { libc::getuid() };
+        let modern = PathBuf::from(format!("/run/user/{}/zenith-shell.sock", uid));
+        let legacy = PathBuf::from(format!("/run/user/{}/zenith.sock", uid));
+        if modern.exists() {
+            return modern;
+        }
+        if legacy.exists() {
+            return legacy;
+        }
+        if modern.parent().map(|p| p.exists()).unwrap_or(false) {
+            return modern;
+        }
+    }
+
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("zenith.sock")
+        let p = PathBuf::from(dir);
+        let modern = p.join("zenith-shell.sock");
+        let legacy = p.join("zenith.sock");
+        if legacy.exists() && !modern.exists() {
+            legacy
+        } else {
+            modern
+        }
     } else {
-        PathBuf::from("/tmp/zenith.sock")
+        if let Ok(home) = std::env::var("HOME") {
+            let safe_dir = PathBuf::from(home).join(".cache/zenith/run");
+            let _ = fs::create_dir_all(&safe_dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&safe_dir, fs::Permissions::from_mode(0o700));
+            }
+            safe_dir.join("zenith-shell.sock")
+        } else {
+            PathBuf::from("/tmp/zenith-shell.sock")
+        }
     }
 }
+
 
 /// Reads current process memory metrics from Linux `/proc/self/status` and `/proc/self/statm`.
 ///
@@ -96,6 +132,38 @@ pub fn read_vmrss_kb() -> Option<u64> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn verify_peer_credentials(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        let current_uid = unsafe { libc::getuid() };
+        ucred.uid == current_uid
+    } else {
+        false
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_peer_credentials(_stream: &UnixStream) -> bool {
+    true
+}
+
 /// Sends a single command to the Zenith IPC socket at a custom path and returns the response string.
 pub fn send_socket_command_to(
     sock_path: &Path,
@@ -110,8 +178,8 @@ pub fn send_socket_command_to(
     }
 
     let mut stream = UnixStream::connect(sock_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(1000)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(1000)))?;
 
     stream.write_all(format!("{}\n", cmd.trim()).as_bytes())?;
     stream.flush()?;
@@ -176,6 +244,14 @@ where
     }
 
     let listener = UnixListener::bind(&sock_path)?;
+
+    // Security Hardening: Enforce strict 0600 POSIX permissions immediately after bind
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+    }
+
     info!("IPC control socket listening at: {}", sock_path.display());
 
     let running = Arc::new(AtomicBool::new(true));
@@ -199,12 +275,31 @@ where
                 break;
             }
 
+            // Security Hardening: Strict I/O timeouts (1.0s) to prevent Slowloris / thread exhaustion
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(1000)));
+
+            // Security Hardening: Enforce kernel-level SO_PEERCRED check (uid == getuid())
+            if !verify_peer_credentials(&stream) {
+                tracing::warn!("Unauthorized IPC connection attempt rejected by SO_PEERCRED check");
+                let _ = stream.write_all(b"ERR: unauthorized peer credentials\n");
+                continue;
+            }
+
             let handler_ref = handler.clone();
             let inspect_path = thread_sock_path.clone();
 
-            let mut reader = BufReader::new(&stream);
+            // Security Hardening: Strict 64KB payload buffer limit to prevent memory exhaustion DoS
+            use std::io::Read;
+            let mut limited_reader = BufReader::new(&stream).take(65536);
             let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
+            if limited_reader.read_line(&mut line).is_err() {
+                continue;
+            }
+
+            if line.len() >= 65536 && !line.ends_with('\n') {
+                tracing::warn!("IPC payload exceeded 64KB limit, rejecting stream");
+                let _ = stream.write_all(b"ERR: payload exceeds 64KB limit\n");
                 continue;
             }
 

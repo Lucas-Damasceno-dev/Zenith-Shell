@@ -27,6 +27,7 @@ pub struct ClipboardManager {
     pub copy_source: Option<CopyPasteSource>,
     pub ram_buffer: Arc<Mutex<String>>,
     pub last_serial: u32,
+    pub is_locked: bool,
 }
 
 impl std::fmt::Debug for ClipboardManager {
@@ -34,6 +35,7 @@ impl std::fmt::Debug for ClipboardManager {
         f.debug_struct("ClipboardManager")
             .field("has_data_device", &self.data_device.is_some())
             .field("last_serial", &self.last_serial)
+            .field("is_locked", &self.is_locked)
             .finish()
     }
 }
@@ -53,11 +55,31 @@ impl ClipboardManager {
             copy_source: None,
             ram_buffer: Arc::new(Mutex::new(String::new())),
             last_serial: 0,
+            is_locked: false,
         }
+    }
+
+    /// Sets session lock state to prevent clipboard exfiltration during screen lock.
+    pub fn set_locked(&mut self, locked: bool) {
+        self.is_locked = locked;
+        if locked {
+            // Scrub in-process RAM buffer when entering lock state
+            if let Ok(mut lock) = self.ram_buffer.lock() {
+                lock.clear();
+            }
+        }
+    }
+
+    /// Returns whether the clipboard is currently locked down.
+    pub fn is_locked(&self) -> bool {
+        self.is_locked
     }
 
     /// Stores text into in-process clipboard buffer without spawning external processes.
     pub fn copy(&mut self, text: &str) {
+        if self.is_locked {
+            return;
+        }
         if let Ok(mut lock) = self.ram_buffer.lock() {
             *lock = text.to_string();
         }
@@ -68,6 +90,9 @@ impl ClipboardManager {
     where
         D: wayland_client::Dispatch<WlDataSource, smithay_client_toolkit::data_device_manager::data_source::DataSourceData> + 'static,
     {
+        if self.is_locked {
+            return;
+        }
         self.copy(text);
         self.last_serial = serial;
 
@@ -80,14 +105,19 @@ impl ClipboardManager {
 
     /// Reads text from active system clipboard or RAM fallback without deadlocks, optionally flushing connection.
     pub fn paste_with_conn(&self, conn: Option<&wayland_client::Connection>) -> String {
-        // Return immediately from pre-fetched RAM buffer if populated
+        // Lockdown: Never return clipboard data while session is locked
+        if self.is_locked {
+            return String::new();
+        }
+
+        // Fast-path O(1): If ram_buffer is not empty, return immediately without blocking main thread
         if let Ok(lock) = self.ram_buffer.lock() {
             if !lock.is_empty() {
                 return lock.clone();
             }
         }
 
-        // Try fast reading from native Wayland selection offer only for supported MIME types
+        // Fallback reading from native Wayland selection offer only if ram_buffer is empty
         if let Some(ref device) = self.data_device {
             if let Some(offer) = device.data().selection_offer() {
                 let mime_match = offer.with_mime_types(|types| {
@@ -95,7 +125,7 @@ impl ClipboardManager {
                 });
 
                 if let Some(mime) = mime_match {
-                    if let Ok(mut read_pipe) = offer.receive(mime.to_string()) {
+                    if let Ok(read_pipe) = offer.receive(mime.to_string()) {
                         if let Some(c) = conn {
                             let _ = c.flush();
                         }
@@ -103,7 +133,7 @@ impl ClipboardManager {
                         std::thread::spawn(move || {
                             use std::io::Read;
                             let mut content = String::new();
-                            let _ = read_pipe.read_to_string(&mut content);
+                            let _ = read_pipe.take(4 * 1024 * 1024).read_to_string(&mut content);
                             let _ = tx.send(content);
                         });
                         if let Ok(content) = rx.recv_timeout(std::time::Duration::from_millis(20)) {
@@ -130,6 +160,9 @@ impl ClipboardManager {
 
     /// Handles a paste request from an external Wayland client writing into pipe.
     pub fn handle_send_request(&self, mime: &str, mut pipe: WritePipe) {
+        if self.is_locked {
+            return;
+        }
         if TEXT_MIME_TYPES.contains(&mime) {
             use std::io::Write;
             if let Ok(lock) = self.ram_buffer.lock() {
@@ -151,4 +184,22 @@ mod tests {
         *mgr.ram_buffer.lock().unwrap() = "zenith_zero_fork".to_string();
         assert_eq!(mgr.paste(), "zenith_zero_fork");
     }
+
+    #[test]
+    fn test_clipboard_lockdown() {
+        let mut mgr = ClipboardManager::new();
+        mgr.copy("secret_token_123");
+        assert_eq!(mgr.paste(), "secret_token_123");
+
+        mgr.set_locked(true);
+        assert!(mgr.is_locked());
+        assert_eq!(mgr.paste(), "");
+
+        mgr.copy("another_attempt");
+        assert_eq!(mgr.paste(), "");
+
+        mgr.set_locked(false);
+        assert_eq!(mgr.paste(), ""); // Ram buffer was scrubbed
+    }
 }
+

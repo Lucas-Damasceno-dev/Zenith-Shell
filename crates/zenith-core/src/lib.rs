@@ -5,6 +5,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 pub mod clamp;
 pub mod errors;
 pub mod kinetic_scroll;
+pub mod magnification;
 pub mod math {
     pub use crate::clamp::*;
 }
@@ -15,6 +16,7 @@ pub mod traits;
 pub use clamp::{clamp, clamp_nan_safe, clamp_safe, ClampExt, ClampRange};
 pub use errors::{CoreError, KineticScrollError, SpringError};
 pub use kinetic_scroll::{KineticScroll, KineticScrollEngine};
+pub use magnification::{MagnificationConfig, MagnificationCurve, MagnificationModel, MagnificationSpringTracker};
 pub use spring::{SpringAnimation, SpringConfig};
 pub use sync::{SharedKineticScroll, SharedSpringAnimation};
 pub use traits::{Animation, ConcurrentAnimation, ConcurrentScrollEngine, ScrollEngine};

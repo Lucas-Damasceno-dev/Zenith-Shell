@@ -44,6 +44,17 @@ impl SurfaceScaleTracker {
     }
 }
 
+impl Drop for SurfaceScaleTracker {
+    fn drop(&mut self) {
+        if let Some(fs) = self.fractional_scale.take() {
+            fs.destroy();
+        }
+        if let Some(vp) = self.viewport.take() {
+            vp.destroy();
+        }
+    }
+}
+
 /// Global manager binding fractional scaling and viewporter protocols.
 pub struct FractionalScaleManager {
     pub manager: Option<WpFractionalScaleManagerV1>,

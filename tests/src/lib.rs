@@ -189,3 +189,110 @@ return Zenith.Box({{
         search_query, slider_val, switch_val, slider_val, switch_val
     )
 }
+
+/// Generates a realistic Desktop Canvas Luau script for off-screen rendering and regression tests.
+pub fn realistic_canvas_script(time_str: &str, cpu_usage: f32, ram_usage: f32) -> String {
+    format!(
+        r##"
+return Zenith.Box({{
+    width = 460,
+    height = 320,
+    background = Zenith.rgba(22, 25, 34, 192),
+    border_radius = 24,
+    padding = 20,
+    gap = 16,
+    children = {{
+        Zenith.Box({{
+            direction = "row",
+            spacing = 16,
+            children = {{
+                Zenith.Text({{
+                    text = "{}",
+                    color = Zenith.hex("#ffffff"),
+                    font_size = 40,
+                }}),
+                Zenith.Text({{
+                    text = "Ambient Canvas Widget",
+                    color = Zenith.hex("#89b4fa"),
+                    font_size = 14,
+                }}),
+            }}
+        }}),
+        Zenith.Box({{
+            direction = "column",
+            spacing = 8,
+            children = {{
+                Zenith.Text({{
+                    text = "Hardware Telemetry: CPU {:.1}% | RAM {:.1}%",
+                    color = Zenith.hex("#cdd6f4"),
+                    font_size = 13,
+                }}),
+                Zenith.Slider({{
+                    id = "cpu_telemetry_bar",
+                    min = 0,
+                    max = 100,
+                    value = {:.1},
+                    track_height = 6,
+                    thumb_radius = 0,
+                }}),
+            }}
+        }})
+    }}
+}})
+"##,
+        time_str, cpu_usage, ram_usage, cpu_usage
+    )
+}
+
+/// Generates a realistic Dock Luau script with Gaussian-magnified icon slots.
+pub fn realistic_dock_magnified_script(active_scale: f32, neighbor_scale: f32) -> String {
+    let active_w = (44.0 * active_scale).round();
+    let neighbor_w = (44.0 * neighbor_scale).round();
+    format!(
+        r##"
+return Zenith.Box({{
+    width = 600,
+    height = 64,
+    background = Zenith.rgba(17, 19, 24, 220),
+    border_radius = 20,
+    padding = 8,
+    direction = "row",
+    spacing = 8,
+    children = {{
+        Zenith.Box({{
+            width = 44,
+            height = 44,
+            background = Zenith.hex("#1e232a"),
+            border_radius = 12,
+        }}),
+        Zenith.Box({{
+            width = {},
+            height = {},
+            background = Zenith.hex("#313244"),
+            border_radius = 14,
+        }}),
+        Zenith.Box({{
+            width = {},
+            height = {},
+            background = Zenith.hex("#89b4fa"),
+            border_radius = 16,
+        }}),
+        Zenith.Box({{
+            width = {},
+            height = {},
+            background = Zenith.hex("#313244"),
+            border_radius = 14,
+        }}),
+        Zenith.Box({{
+            width = 44,
+            height = 44,
+            background = Zenith.hex("#1e232a"),
+            border_radius = 12,
+        }}),
+    }}
+}})
+"##,
+        neighbor_w, neighbor_w, active_w, active_w, neighbor_w, neighbor_w
+    )
+}
+

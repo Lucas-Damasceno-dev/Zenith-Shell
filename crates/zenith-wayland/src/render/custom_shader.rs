@@ -26,12 +26,21 @@ void main() {
 }
 "#;
 
+pub struct CompiledCustomShader {
+    pub program: glow::NativeProgram,
+    pub loc_resolution: Option<glow::UniformLocation>,
+    pub loc_bounds: Option<glow::UniformLocation>,
+    pub loc_time: Option<glow::UniformLocation>,
+    pub custom_uniforms: HashMap<String, Option<glow::UniformLocation>>,
+}
+
 pub struct CustomShaderPipeline {
     gl: Arc<glow::Context>,
     start_time: Instant,
     vao: glow::NativeVertexArray,
     vbo: glow::NativeBuffer,
-    program_cache: HashMap<String, glow::NativeProgram>,
+    pub vbo_capacity: usize,
+    program_cache: HashMap<String, CompiledCustomShader>,
     failed_shaders: HashMap<String, String>,
 }
 
@@ -60,6 +69,7 @@ impl CustomShaderPipeline {
             start_time: Instant::now(),
             vao,
             vbo,
+            vbo_capacity: 0,
             program_cache: HashMap::new(),
             failed_shaders: HashMap::new(),
         })
@@ -86,30 +96,34 @@ impl CustomShaderPipeline {
             return Ok(());
         }
 
-        let program = match self.get_or_compile(&shader.fragment) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        if self.get_or_compile(&shader.fragment).is_none() {
+            return Ok(());
+        }
 
         let gl = &self.gl;
-        gl.use_program(Some(program));
+        let shader_entry = self.program_cache.get_mut(&shader.fragment).unwrap();
+        gl.use_program(Some(shader_entry.program));
 
-        // Bind standard uniforms
-        if let Some(loc) = gl.get_uniform_location(program, "u_resolution") {
-            gl.uniform_2_f32(Some(&loc), screen_w as f32, screen_h as f32);
+        // Bind standard pre-resolved uniforms (zero driver query overhead)
+        if let Some(ref loc) = shader_entry.loc_resolution {
+            gl.uniform_2_f32(Some(loc), screen_w as f32, screen_h as f32);
         }
-        if let Some(loc) = gl.get_uniform_location(program, "u_bounds") {
-            gl.uniform_4_f32(Some(&loc), x, y, w, h);
+        if let Some(ref loc) = shader_entry.loc_bounds {
+            gl.uniform_4_f32(Some(loc), x, y, w, h);
         }
-        if let Some(loc) = gl.get_uniform_location(program, "u_time") {
+        if let Some(ref loc) = shader_entry.loc_time {
             let elapsed = self.start_time.elapsed().as_secs_f32();
-            gl.uniform_1_f32(Some(&loc), elapsed);
+            gl.uniform_1_f32(Some(loc), elapsed);
         }
 
-        // Bind user-supplied custom scalar uniforms
+        // Bind user-supplied custom scalar uniforms with cached locations
+        let program = shader_entry.program;
         for (name, val) in &shader.uniforms {
-            if let Some(loc) = gl.get_uniform_location(program, name) {
-                gl.uniform_1_f32(Some(&loc), *val);
+            let loc = shader_entry.custom_uniforms.entry(name.clone()).or_insert_with(|| {
+                gl.get_uniform_location(program, name)
+            });
+            if let Some(ref l) = loc {
+                gl.uniform_1_f32(Some(l), *val);
             }
         }
 
@@ -127,11 +141,16 @@ impl CustomShaderPipeline {
 
         gl.bind_vertex_array(Some(self.vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-        gl.buffer_data_u8_slice(
-            glow::ARRAY_BUFFER,
-            bytemuck_cast_slice(&vertices),
-            glow::DYNAMIC_DRAW,
-        );
+        let slice = bytemuck_cast_slice(&vertices);
+        let needed_bytes = slice.len();
+        if needed_bytes <= self.vbo_capacity {
+            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, slice);
+        } else {
+            let new_cap = needed_bytes.next_power_of_two().max(256);
+            gl.buffer_data_size(glow::ARRAY_BUFFER, new_cap as i32, glow::DYNAMIC_DRAW);
+            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, slice);
+            self.vbo_capacity = new_cap;
+        }
 
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
 
@@ -143,8 +162,8 @@ impl CustomShaderPipeline {
     }
 
     unsafe fn get_or_compile(&mut self, fragment_source: &str) -> Option<glow::NativeProgram> {
-        if let Some(&program) = self.program_cache.get(fragment_source) {
-            return Some(program);
+        if let Some(entry) = self.program_cache.get(fragment_source) {
+            return Some(entry.program);
         }
 
         if self.failed_shaders.contains_key(fragment_source) {
@@ -175,9 +194,9 @@ out vec4 frag_color;
 
         // Bound cache size to prevent leak across dynamic scripts (VmRSS ceiling < 15MB)
         if self.program_cache.len() >= 64 {
-            if let Some((first_key, _)) = self.program_cache.iter().next().map(|(k, &p)| (k.clone(), p)) {
-                if let Some(old_prog) = self.program_cache.remove(&first_key) {
-                    self.gl.delete_program(old_prog);
+            if let Some((first_key, _)) = self.program_cache.iter().next().map(|(k, e)| (k.clone(), e.program)) {
+                if let Some(old_entry) = self.program_cache.remove(&first_key) {
+                    self.gl.delete_program(old_entry.program);
                 }
             }
         }
@@ -186,9 +205,19 @@ out vec4 frag_color;
         }
 
         match self.compile_program(SHADER_QUAD_VS, &full_fs) {
-            Ok(prog) => {
-                self.program_cache.insert(fragment_source.to_string(), prog);
-                Some(prog)
+            Ok((prog, loc_res, loc_bounds, loc_time)) => {
+                let program = prog;
+                self.program_cache.insert(
+                    fragment_source.to_string(),
+                    CompiledCustomShader {
+                        program: prog,
+                        loc_resolution: loc_res,
+                        loc_bounds,
+                        loc_time,
+                        custom_uniforms: HashMap::new(),
+                    },
+                );
+                Some(program)
             }
             Err(e) => {
                 tracing::warn!("[zenith-shader] Failed to compile custom GLSL shader: {}", e);
@@ -198,7 +227,19 @@ out vec4 frag_color;
         }
     }
 
-    unsafe fn compile_program(&self, vs_src: &str, fs_src: &str) -> Result<glow::NativeProgram, String> {
+    unsafe fn compile_program(
+        &self,
+        vs_src: &str,
+        fs_src: &str,
+    ) -> Result<
+        (
+            glow::NativeProgram,
+            Option<glow::UniformLocation>,
+            Option<glow::UniformLocation>,
+            Option<glow::UniformLocation>,
+        ),
+        String,
+    > {
         let gl = &self.gl;
 
         let vs = gl.create_shader(glow::VERTEX_SHADER).map_err(|e| e.to_string())?;
@@ -234,15 +275,19 @@ out vec4 frag_color;
             return Err(format!("Shader Program Link Error: {}", log));
         }
 
-        Ok(program)
+        let loc_resolution = gl.get_uniform_location(program, "u_resolution");
+        let loc_bounds = gl.get_uniform_location(program, "u_bounds");
+        let loc_time = gl.get_uniform_location(program, "u_time");
+
+        Ok((program, loc_resolution, loc_bounds, loc_time))
     }
 }
 
 impl Drop for CustomShaderPipeline {
     fn drop(&mut self) {
         unsafe {
-            for (_, prog) in self.program_cache.drain() {
-                self.gl.delete_program(prog);
+            for (_, entry) in self.program_cache.drain() {
+                self.gl.delete_program(entry.program);
             }
             self.gl.delete_buffer(self.vbo);
             self.gl.delete_vertex_array(self.vao);

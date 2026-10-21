@@ -287,6 +287,7 @@ pub struct BarInstance {
     pub width: u32,
     pub height: u32,
     pub configured: bool,
+    pub is_hidden: bool,
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
     pub canvas_cache: Vec<u8>,
     pub egl_surface: Option<crate::egl::EglSurface>,
@@ -364,6 +365,7 @@ pub struct WaylandApp {
     pub needs_redraw_bars: bool,
     pub needs_redraw_popup: bool,
     pub needs_redraw_dock: bool,
+    pub dock_magnification: zenith_core::MagnificationModel,
 }
 
 impl WaylandApp {
@@ -482,7 +484,7 @@ impl WaylandApp {
             pointer_pos: (0.0, 0.0),
             computed_boxes: Vec::new(),
             width: 1920,
-            height: 44,
+            height: 42,
             screen_width: 1366,
             screen_height: 768,
             configured: false,
@@ -514,16 +516,43 @@ impl WaylandApp {
             needs_redraw_bars: false,
             needs_redraw_popup: false,
             needs_redraw_dock: false,
+            dock_magnification: zenith_core::MagnificationModel::new(zenith_core::MagnificationConfig::default()),
         };
 
+        app.height = app.get_bar_height();
         app.create_bar(&qh)?;
 
         Ok((app, conn, event_queue))
     }
 
+    /// Returns the target bar height from runtime storage schema (supporting compact mode).
+    pub fn get_bar_height(&self) -> u32 {
+        let val_to_u32 = |v: &serde_json::Value| -> Option<u32> {
+            v.as_u64().map(|n| n as u32).or_else(|| v.as_f64().map(|f| f.round() as u32))
+        };
+        let is_compact = self.runtime.storage.get("barCompactMode").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_compact {
+            self.runtime.storage.get("barCompactHeight").as_ref().and_then(val_to_u32).unwrap_or(36)
+        } else {
+            self.runtime.storage.get("barHeight").as_ref().and_then(val_to_u32).unwrap_or(42)
+        }
+    }
+
+    /// Returns the target dock height from runtime storage schema.
+    pub fn get_dock_height(&self) -> u32 {
+        let val_to_u32 = |v: &serde_json::Value| -> Option<u32> {
+            v.as_u64().map(|n| n as u32).or_else(|| v.as_f64().map(|f| f.round() as u32))
+        };
+        self.runtime.storage.get("dockHeight").as_ref().and_then(val_to_u32).unwrap_or(58)
+    }
+
     /// Securely locks the Wayland desktop session via `ext-session-lock-v1` if supported,
     /// falling back to exclusive overlay popup.
     pub fn lock_session(&mut self) {
+        self.clipboard_manager.set_locked(true);
+        self.runtime.set_focused_input(None);
+        self.destroy_popup_immediately();
+
         if let Some(ref mgr) = self.session_lock.manager {
             if self.session_lock.lock.is_none() {
                 info!("Requesting compositor session lock via ext-session-lock-v1");
@@ -555,6 +584,7 @@ impl WaylandApp {
 
     /// Unlocks the session, destroying compositor lock and dismissing lockscreen.
     pub fn unlock_session(&mut self) {
+        self.clipboard_manager.set_locked(false);
         if let Some(lock) = self.session_lock.lock.take() {
             info!("Unlocking and destroying ext-session-lock-v1 session");
             lock.unlock_and_destroy();
@@ -571,8 +601,9 @@ impl WaylandApp {
         output: Option<&wl_output::WlOutput>,
         output_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let autohide = Self::read_bar_autohide_setting();
+        let autohide = self.runtime.storage.get("barAutoHide").and_then(|v| v.as_bool()).unwrap_or_else(Self::read_bar_autohide_setting);
         self.bar_autohide = autohide;
+        self.height = self.get_bar_height();
         self.bar_hovered = false;
         self.bar_hidden = false;
         self.bar_last_leave = None;
@@ -586,11 +617,9 @@ impl WaylandApp {
             output,
         );
 
-        let initial_exclusive = if autohide { 0 } else { self.height as i32 };
-
         layer_surface.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
         layer_surface.set_size(0, self.height);
-        layer_surface.set_exclusive_zone(initial_exclusive);
+        layer_surface.set_exclusive_zone(self.height as i32);
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
 
         // Bar spans the full screen width (edge-to-edge status bar)
@@ -608,6 +637,7 @@ impl WaylandApp {
             width: self.width,
             height: self.height,
             configured: false,
+            is_hidden: false,
             computed_boxes: Vec::new(),
             canvas_cache: Vec::new(),
             egl_surface: None,
@@ -646,9 +676,13 @@ impl WaylandApp {
             if let Ok(success) = rx.try_recv() {
                 self.pam_auth_rx = None;
                 if success {
+                    self.runtime.record_lock_success();
+                    self.runtime.clear_lock_password();
                     self.runtime.set_search_query("");
                     self.unlock_session();
                 } else {
+                    self.runtime.record_lock_failure();
+                    self.runtime.clear_lock_password();
                     self.runtime.set_search_query("");
                     if self.session_lock.locked {
                         let _ = self.draw_lock_surfaces();
@@ -751,6 +785,10 @@ impl WaylandApp {
 
         let mut bars_need_draw = false;
         for bar in &mut self.bars {
+            if !bar.configured {
+                bar.frame_callback_pending = false;
+                continue;
+            }
             if !bar.frame_callback_pending {
                 bar.frame_callback_pending = true;
                 bars_need_draw = true;
@@ -760,31 +798,43 @@ impl WaylandApp {
         }
         if bars_need_draw {
             self.needs_redraw_bars = false;
-            let _ = self.update_bar_visibility();
-            let _ = self.draw();
+            let redrawn = self.update_bar_visibility().unwrap_or(false);
+            if !redrawn {
+                let _ = self.draw();
+            }
         }
 
         if let Some(ref mut popup) = self.popup {
-            if !popup.frame_callback_pending {
-                popup.frame_callback_pending = true;
-                self.needs_redraw_popup = false;
-                let _ = self.draw_popup();
-            } else {
-                self.needs_redraw_popup = true;
+            if popup.configured {
+                if !popup.frame_callback_pending {
+                    popup.frame_callback_pending = true;
+                    self.needs_redraw_popup = false;
+                    if !popup.closing {
+                        let id = popup.id.clone();
+                        let _ = self.reload_popup(&id);
+                    } else {
+                        let _ = self.draw_popup();
+                    }
+                } else {
+                    self.needs_redraw_popup = true;
+                }
             }
         }
 
         if let Some(ref mut dock) = self.dock {
-            if !dock.frame_callback_pending {
-                dock.frame_callback_pending = true;
-                self.needs_redraw_dock = false;
-                let _ = self.update_dock_visibility();
-                if !self.dock_hidden {
-                    let _ = self.reload_dock();
+            if dock.configured {
+                if !dock.frame_callback_pending {
+                    dock.frame_callback_pending = true;
+                    self.needs_redraw_dock = false;
+                    let _ = self.update_dock_visibility();
+                    if !self.dock_hidden {
+                        let _ = self.reload_dock();
+                    } else {
+                        let _ = self.draw_dock();
+                    }
+                } else {
+                    self.needs_redraw_dock = true;
                 }
-                let _ = self.draw_dock();
-            } else {
-                self.needs_redraw_dock = true;
             }
         }
 
@@ -979,9 +1029,9 @@ impl WaylandApp {
         }
 
         let (script_name, anchor, mut width, mut height, margin_top, margin_right, margin_bottom, margin_left) = match id.to_lowercase().as_str() {
-            "dock" => ("Dock", Anchor::BOTTOM, 640, 68, 0, 0, 12, 0),
+            "dock" => ("Dock", Anchor::BOTTOM, 640, self.get_dock_height(), 0, 0, 12, 0),
             "island" | "dynamicisland" => ("DynamicIsland", Anchor::TOP, 380, 52, 8, 0, 0, 0),
-            "launcher" => ("Launcher", Anchor::TOP, 520, 620, 16, 0, 0, 0),
+            "launcher" => ("Launcher", Anchor::TOP, 680, 520, 16, 0, 0, 0),
             "media" | "mediapopup" => ("MediaPopup", Anchor::TOP, 360, 360, 48, 0, 0, 0),
             "notifications" | "notificationcenter" => ("NotificationCenter", Anchor::TOP | Anchor::RIGHT, 420, 600, 48, 14, 0, 0),
             "audio" | "audiopopup" => ("AudioPopup", Anchor::TOP | Anchor::RIGHT, 360, 480, 48, 14, 0, 0),
@@ -995,7 +1045,14 @@ impl WaylandApp {
             "canvas" | "desktopcanvas" => ("DesktopCanvas", Anchor::TOP | Anchor::LEFT, 380, 340, 16, 0, 0, 24),
             "settings" | "settingsmenu" => ("Settings", Anchor::TOP, 1040, 660, 48, 0, 0, 0),
             "lock" | "lockscreen" => ("LockScreen", Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT, 0, 0, 0, 0, 0, 0),
-            _ => (id, Anchor::TOP | Anchor::RIGHT, 340, 380, 8, 14, 0, 0),
+            "expose" | "exposepopup" => ("ExposePopup", Anchor::TOP, 780, 480, 48, 0, 0, 0),
+            "cheatsheet" => ("CheatSheet", Anchor::TOP, 460, 560, 48, 0, 0, 0),
+            "weather" | "weatherpopup" => ("WeatherPopup", Anchor::TOP | Anchor::RIGHT, 360, 420, 48, 14, 0, 0),
+            "pomodoro" | "pomodoropopup" => ("PomodoroPopup", Anchor::TOP | Anchor::RIGHT, 340, 380, 48, 14, 0, 0),
+            "clipboard" | "clipboardpopup" => ("ClipboardPopup", Anchor::TOP | Anchor::RIGHT, 380, 500, 48, 14, 0, 0),
+            "systemmonitor" | "systemmonitorpopup" => ("SystemMonitorPopup", Anchor::TOP | Anchor::RIGHT, 420, 520, 48, 14, 0, 0),
+            "usb" | "usbpopup" => ("USBPopup", Anchor::TOP | Anchor::RIGHT, 340, 340, 48, 14, 0, 0),
+            _ => (id, Anchor::TOP | Anchor::RIGHT, 340, 380, 48, 14, 0, 0),
         };
 
         let content = self.resolve_overlay_script(id, script_name)?;
@@ -1010,7 +1067,7 @@ impl WaylandApp {
             self.runtime.set_current_output_geometry("default", width, height);
         }
 
-        let root_ui = self.runtime.eval_ui(&content)?;
+        let root_ui = self.runtime.eval_ui_for_tree(&format!("popup_{}", id), &content)?;
 
         // Apply dynamic window metadata if defined in the Luau script
         let (mut anchor, mut margin_top, mut margin_right, mut margin_bottom, mut margin_left) = (anchor, margin_top, margin_right, margin_bottom, margin_left);
@@ -1022,7 +1079,7 @@ impl WaylandApp {
         } else {
             KeyboardInteractivity::OnDemand
         };
-        let mut exclusive = if id.eq_ignore_ascii_case("dock") { 68 } else { 0 };
+        let mut exclusive = if id.eq_ignore_ascii_case("dock") { self.get_dock_height() as i32 } else { 0 };
 
         if let Some(meta) = root_ui.window_meta() {
             let mut dynamic_anchor = Anchor::empty();
@@ -1074,11 +1131,15 @@ impl WaylandApp {
         if !is_lock {
             match &root_ui {
                 UiNode::Box { style, .. } | UiNode::Window { style, .. } => {
-                    if let Some(w) = style.width {
-                        width = width.max(w.ceil() as u32 + 24);
+                    if let Some(dim) = style.width {
+                        if let zenith_layout::ExpandedDimension::Length(w) = dim.expand() {
+                            width = width.max(w.ceil() as u32 + 24);
+                        }
                     }
-                    if let Some(h) = style.height {
-                        height = height.max(h.ceil() as u32 + 30);
+                    if let Some(dim) = style.height {
+                        if let zenith_layout::ExpandedDimension::Length(h) = dim.expand() {
+                            height = height.max(h.ceil() as u32 + 30);
+                        }
                     }
                 }
                 _ => {}
@@ -1144,13 +1205,13 @@ impl WaylandApp {
     }
 
     /// Re-evaluates open popup Luau script with current reactive state and redraws.
-    pub fn reload_popup(&mut self, _id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn reload_popup(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let script = match self.popup.as_ref() {
             Some(p) => p.script.clone(),
             None => return Ok(()),
         };
 
-        let root_ui = self.runtime.eval_ui(&script)?;
+        let root_ui = self.runtime.eval_ui_for_tree(&format!("popup_{}", id), &script)?;
         if let Some(ref mut popup) = self.popup {
             popup.root_ui = root_ui;
             popup.computed_boxes.clear();
@@ -1221,12 +1282,28 @@ impl WaylandApp {
             .unwrap_or(true)
     }
 
-    /// Evaluates whether any window on the active workspace collides with the top bar area.
-    pub fn has_bar_window_collision(&self) -> bool {
+    /// Evaluates whether any window on a specific output collides with the top bar area.
+    pub fn has_bar_window_collision_for_output(&self, output_name: &str) -> bool {
+        let monitors = zenith_services::HyprlandService::monitors();
+        let mon = monitors.iter().find(|m| m.name == output_name || output_name.is_empty() || output_name == "default");
+        let (mon_x, mon_y, mon_w) = if let Some(m) = mon {
+            (m.x, m.y, m.width as i32)
+        } else {
+            (0, 0, self.screen_width as i32)
+        };
+
         let ws = zenith_services::HyprlandService::workspaces_snapshot();
-        let active_ws = ws.active;
+        let active_ws = ws
+            .workspaces
+            .iter()
+            .find(|w| (w.monitor == output_name || output_name == "default") && w.active)
+            .map(|w| w.id)
+            .unwrap_or(ws.active);
         let clients = zenith_services::HyprlandService::clients_snapshot();
-        let bar_height = self.height as i32;
+        let bar_height = self.get_bar_height() as i32;
+        let gaps = zenith_services::HyprlandService::gaps_out() as i32;
+        // Compensa o deslocamento causado pelo exclusive_zone quando a barra está visível
+        let active_exclusive = if self.bar_hidden { 0 } else { bar_height };
 
         for c in clients {
             if c.hidden || c.workspace_id < 0 || c.workspace_name.starts_with("special") {
@@ -1238,25 +1315,43 @@ impl WaylandApp {
             if c.fullscreen {
                 return true;
             }
+            let win_top = c.at.1 - mon_y;
+            let win_bottom = win_top + c.size.1;
+            let win_left = c.at.0 - mon_x;
+            let win_right = win_left + c.size.0;
+            let overlap_x = win_left < mon_w && win_right > 0;
+
+            if !overlap_x {
+                continue;
+            }
+
+            // Janelas em modo tile (!c.floating) no workspace ativo sempre ocupam o topo quando a barra recolhe
             if !c.floating {
                 return true;
             }
-            // Floating window intersection with top bar area
-            let win_top = c.at.1;
-            let win_bottom = c.at.1 + c.size.1;
-            let win_left = c.at.0;
-            let win_right = c.at.0 + c.size.0;
 
-            let bar_bottom = bar_height + 8;
-            let screen_w = self.screen_width as i32;
-
-            let overlap_y = win_top < bar_bottom && win_bottom > 0;
-            let overlap_x = win_left < screen_w && win_right > 0;
-            if overlap_y && overlap_x {
+            let bar_bottom = bar_height + active_exclusive + gaps + 16;
+            if win_top < bar_bottom && win_bottom > 0 {
                 return true;
             }
         }
         false
+    }
+
+    /// Evaluates whether any window on the active workspace collides with the top bar area.
+    pub fn has_bar_window_collision(&self) -> bool {
+        if self.bars.is_empty() {
+            return self.has_bar_window_collision_for_output("");
+        }
+        self.bars.iter().any(|b| self.has_bar_window_collision_for_output(&b.output_name))
+    }
+
+    /// Returns the auto-hide delay duration from storage or default 450ms.
+    pub fn get_autohide_delay(&self) -> std::time::Duration {
+        let ms = self.runtime.storage.get("barAutoHideDelayMs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(450);
+        std::time::Duration::from_millis(ms)
     }
 
     /// Evaluates whether the top bar should automatically hide based on overlapping windows.
@@ -1267,66 +1362,106 @@ impl WaylandApp {
         if self.bar_hovered {
             return false;
         }
-        if self.popup.is_some() {
-            return false;
+        if let Some(ref p) = self.popup {
+            if !p.id.eq_ignore_ascii_case("desktopcanvas") && !p.id.eq_ignore_ascii_case("canvas") && !p.id.eq_ignore_ascii_case("osd") {
+                return false;
+            }
         }
         if let Some(leave_time) = self.bar_last_leave {
-            if leave_time.elapsed() < std::time::Duration::from_millis(300) {
+            if leave_time.elapsed() < self.get_autohide_delay() {
                 return false;
             }
         }
         self.has_bar_window_collision()
     }
 
+    /// Synchronizes internal auto-hide state with StorageEngine.
+    pub fn sync_autohide_settings(&mut self) {
+        if let Some(val) = self.runtime.storage.get("barAutoHide").and_then(|v| v.as_bool()) {
+            self.bar_autohide = val;
+        }
+        if let Some(val) = self.runtime.storage.get("dockAutoHide").and_then(|v| v.as_bool()) {
+            self.dock_autohide = val;
+        }
+    }
+
     /// Updates the bar surface geometry and visibility based on intelligent auto-hide and dynamic window resizing.
-    pub fn update_bar_visibility(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.bar_autohide = self.runtime.storage.get("barAutoHide")
-            .and_then(|v| v.as_bool())
-            .unwrap_or_else(Self::read_bar_autohide_setting);
+    pub fn update_bar_visibility(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        self.sync_autohide_settings();
+        let target_bar_h = self.get_bar_height();
+        self.height = target_bar_h;
         let should_hide = self.should_bar_hide();
         let autohide = self.bar_autohide;
         let is_hidden = self.bar_hidden;
 
         if !autohide {
-            if is_hidden {
+            self.bar_last_leave = None;
+            if is_hidden || self.bars.iter().any(|b| b.height != target_bar_h) {
                 self.bar_hidden = false;
                 for bar in &mut self.bars {
+                    bar.is_hidden = false;
+                    bar.height = target_bar_h;
                     bar.computed_boxes.clear();
-                    bar.surface.set_size(0, self.height);
-                    bar.surface.set_exclusive_zone(self.height as i32);
+                    bar.damage_ring.reset();
+                    bar.surface.set_size(0, target_bar_h);
+                    bar.surface.set_exclusive_zone(target_bar_h as i32);
+                    bar.surface.wl_surface().set_input_region(None);
                     bar.surface.commit();
-                    bar.surface.wl_surface().commit();
                 }
                 self.draw()?;
+                return Ok(true);
             }
-            return Ok(());
+            return Ok(false);
         }
 
         if should_hide && !is_hidden {
             self.bar_hidden = true;
             for bar in &mut self.bars {
+                bar.is_hidden = true;
+                bar.height = 12;
                 bar.computed_boxes.clear();
-                bar.surface.set_size(0, 6);
+                bar.damage_ring.reset();
+                bar.surface.set_size(0, 12);
                 bar.surface.set_exclusive_zone(0);
+
+                let region = self.compositor_state.wl_compositor().create_region(&self.qh, ());
+                region.add(0, 0, bar.width.max(self.screen_width).max(1920) as i32, 3);
+                bar.surface.wl_surface().set_input_region(Some(&region));
+                region.destroy();
                 bar.surface.commit();
-                bar.surface.wl_surface().commit();
             }
             self.draw()?;
+            return Ok(true);
         } else if !should_hide && is_hidden {
             self.bar_hidden = false;
-            let has_collision = self.has_bar_window_collision();
-            let exclusive = if has_collision { 0 } else { self.height as i32 };
             for bar in &mut self.bars {
+                bar.is_hidden = false;
+                bar.height = target_bar_h;
                 bar.computed_boxes.clear();
-                bar.surface.set_size(0, self.height);
-                bar.surface.set_exclusive_zone(exclusive);
+                bar.damage_ring.reset();
+                bar.surface.set_size(0, target_bar_h);
+                // Reserva exclusive_zone dinamicamente para redimensionar as janelas tile ao revelar a barra
+                bar.surface.set_exclusive_zone(target_bar_h as i32);
+                bar.surface.wl_surface().set_input_region(None);
                 bar.surface.commit();
-                bar.surface.wl_surface().commit();
             }
             self.draw()?;
+            return Ok(true);
+        } else if !should_hide && !is_hidden && self.bars.iter().any(|b| b.height != target_bar_h) {
+            for bar in &mut self.bars {
+                bar.height = target_bar_h;
+                bar.computed_boxes.clear();
+                bar.damage_ring.reset();
+                bar.surface.set_size(0, target_bar_h);
+                bar.surface.set_exclusive_zone(target_bar_h as i32);
+                bar.surface.wl_surface().set_input_region(None);
+                bar.surface.commit();
+            }
+            self.draw()?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Reads dock auto-hide preference from zenith config.json.
@@ -1355,12 +1490,25 @@ impl WaylandApp {
 
     /// Evaluates whether any window on the active workspace collides with the bottom dock area.
     pub fn has_dock_window_collision(&self) -> bool {
+        let monitors = zenith_services::HyprlandService::monitors();
+        let mon = monitors.iter().find(|m| m.focused).or_else(|| monitors.first());
+        let (mon_x, mon_y, mon_w, mon_h) = if let Some(m) = mon {
+            (m.x, m.y, m.width as i32, m.height as i32)
+        } else {
+            (0, 0, self.screen_width as i32, self.screen_height as i32)
+        };
+
         let ws = zenith_services::HyprlandService::workspaces_snapshot();
-        let active_ws = ws.active;
+        let active_ws = mon
+            .and_then(|m| ws.workspaces.iter().find(|w| w.monitor == m.name && w.active).map(|w| w.id))
+            .unwrap_or(ws.active);
         let clients = zenith_services::HyprlandService::clients_snapshot();
 
-        let expected_dock_h = 88i32; // 68px + 20px extra buffer matching Quickshell
-        let dock_top = (self.screen_height as i32).saturating_sub(expected_dock_h);
+        let dock_h = self.get_dock_height() as i32;
+        let gaps = zenith_services::HyprlandService::gaps_out() as i32;
+        // Compensa o deslocamento causado pelo exclusive_zone quando a dock está visível
+        let active_exclusive = if self.dock_hidden { 0 } else { dock_h };
+        let dock_top = mon_h.saturating_sub(dock_h + active_exclusive + gaps + 16);
 
         for c in clients {
             if c.hidden || c.workspace_id < 0 || c.workspace_name.starts_with("special") {
@@ -1372,17 +1520,22 @@ impl WaylandApp {
             if c.fullscreen {
                 return true;
             }
+            let win_top = c.at.1 - mon_y;
+            let win_bottom = win_top + c.size.1;
+            let win_left = c.at.0 - mon_x;
+            let win_right = win_left + c.size.0;
+            let overlap_x = win_left < mon_w && win_right > 0;
+
+            if !overlap_x {
+                continue;
+            }
+
+            // Janelas em modo tile (!c.floating) no workspace ativo sempre ocupam a base quando a dock recolhe
             if !c.floating {
                 return true;
             }
-            let win_top = c.at.1;
-            let win_bottom = c.at.1 + c.size.1;
-            let win_left = c.at.0;
-            let win_right = c.at.0 + c.size.0;
 
-            let screen_w = self.screen_width as i32;
-            let overlap_x = win_left < screen_w && win_right > 0;
-            if win_bottom >= dock_top && win_top < self.screen_height as i32 && overlap_x {
+            if win_bottom >= dock_top && win_top < mon_h {
                 return true;
             }
         }
@@ -1398,7 +1551,7 @@ impl WaylandApp {
             return false;
         }
         if let Some(leave_time) = self.dock_last_leave {
-            if leave_time.elapsed() < std::time::Duration::from_millis(300) {
+            if leave_time.elapsed() < self.get_autohide_delay() {
                 return false;
             }
         }
@@ -1407,25 +1560,37 @@ impl WaylandApp {
 
     /// Updates the dock surface geometry and visibility based on intelligent auto-hide and dynamic window resizing.
     pub fn update_dock_visibility(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.dock_autohide = self.runtime.storage.get("dockAutoHide")
-            .and_then(|v| v.as_bool())
-            .unwrap_or_else(Self::read_dock_autohide_setting);
+        let dock_enabled = self.runtime.storage.get("dockEnabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        if !dock_enabled {
+            if self.dock.is_some() {
+                self.destroy_dock();
+            }
+            return Ok(());
+        } else if self.dock.is_none() {
+            return self.open_dock();
+        }
+
+        self.sync_autohide_settings();
+        let target_dock_h = self.get_dock_height();
         let should_hide = self.should_dock_hide();
         let autohide = self.dock_autohide;
         let is_hidden = self.dock_hidden;
 
         if !autohide {
-            if is_hidden || self.dock.as_ref().is_some_and(|d| d.height != 68) {
+            self.dock_last_leave = None;
+            if is_hidden || self.dock.as_ref().is_some_and(|d| d.height != target_dock_h) {
                 self.dock_hidden = false;
                 if let Some(ref mut dock) = self.dock {
+                    dock.height = target_dock_h;
                     dock.computed_boxes.clear();
-                    dock.surface.set_size(0, 68);
+                    dock.damage_ring.reset();
+                    dock.surface.set_size(0, target_dock_h);
                     dock.surface.set_margin(0, 0, 0, 0);
-                    dock.surface.set_exclusive_zone(68);
+                    dock.surface.set_exclusive_zone(target_dock_h as i32);
+                    dock.surface.wl_surface().set_input_region(None);
                     dock.surface.commit();
-                    dock.surface.wl_surface().commit();
                 }
-                self.draw_dock()?;
+                self.reload_dock()?;
             }
             return Ok(());
         }
@@ -1433,27 +1598,46 @@ impl WaylandApp {
         if should_hide && !is_hidden {
             self.dock_hidden = true;
             if let Some(ref mut dock) = self.dock {
+                dock.height = 16;
                 dock.computed_boxes.clear();
-                dock.surface.set_size(0, 12);
+                dock.damage_ring.reset();
+                dock.surface.set_size(0, 16);
                 dock.surface.set_margin(0, 0, 0, 0);
                 dock.surface.set_exclusive_zone(0);
+
+                let region = self.compositor_state.wl_compositor().create_region(&self.qh, ());
+                region.add(0, 13, dock.width.max(self.screen_width).max(1920) as i32, 3);
+                dock.surface.wl_surface().set_input_region(Some(&region));
+                region.destroy();
                 dock.surface.commit();
-                dock.surface.wl_surface().commit();
             }
             self.draw_dock()?;
         } else if !should_hide && is_hidden {
             self.dock_hidden = false;
-            let has_collision = self.has_dock_window_collision();
-            let exclusive = if has_collision { 0 } else { 68 };
             if let Some(ref mut dock) = self.dock {
+                dock.height = target_dock_h;
                 dock.computed_boxes.clear();
-                dock.surface.set_size(0, 68);
+                dock.damage_ring.reset();
+                dock.surface.set_size(0, target_dock_h);
                 dock.surface.set_margin(0, 0, 0, 0);
-                dock.surface.set_exclusive_zone(exclusive);
+                // Reserva exclusive_zone dinamicamente para redimensionar as janelas tile ao revelar a dock
+                dock.surface.set_exclusive_zone(target_dock_h as i32);
+                dock.surface.wl_surface().set_input_region(None);
                 dock.surface.commit();
-                dock.surface.wl_surface().commit();
             }
-            self.draw_dock()?;
+            self.reload_dock()?;
+        } else if !should_hide && !is_hidden && self.dock.as_ref().is_some_and(|d| d.height != target_dock_h) {
+            if let Some(ref mut dock) = self.dock {
+                dock.height = target_dock_h;
+                dock.computed_boxes.clear();
+                dock.damage_ring.reset();
+                dock.surface.set_size(0, target_dock_h);
+                dock.surface.set_margin(0, 0, 0, 0);
+                dock.surface.set_exclusive_zone(target_dock_h as i32);
+                dock.surface.wl_surface().set_input_region(None);
+                dock.surface.commit();
+            }
+            self.reload_dock()?;
         }
 
         Ok(())
@@ -1489,10 +1673,10 @@ impl WaylandApp {
         }
 
         let content = script_content.ok_or("Cannot find Dock.luau overlay script")?;
-        let root_ui = self.runtime.eval_ui(&content)?;
+        let root_ui = self.runtime.eval_ui_for_tree("dock", &content)?;
 
         let width = 0u32;
-        let height = 68u32;
+        let height = self.get_dock_height();
         let margin_bottom = 0i32;
 
         let autohide = self.runtime.storage.get("dockAutoHide")
@@ -1515,8 +1699,7 @@ impl WaylandApp {
         layer_surface.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer_surface.set_margin(0, 0, margin_bottom, 0);
         layer_surface.set_size(width, height);
-        let exclusive_zone = if autohide { 0 } else { 68 };
-        layer_surface.set_exclusive_zone(exclusive_zone);
+        layer_surface.set_exclusive_zone(height as i32);
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer_surface.commit();
 
@@ -1612,10 +1795,14 @@ impl WaylandApp {
         let phys_h = ((height as f32) * scale_factor).round().max(1.0) as u32;
 
         if let Some(ref egl_ctx) = egl_context {
-            if egl_surface.is_none() {
-                if let Ok(egl_surf) = egl_ctx.create_surface(wl_surface, phys_w, phys_h) {
-                    *egl_surface = Some(egl_surf);
+            if let Some(ref mut egl_surf) = egl_surface {
+                if egl_surf.width() != phys_w || egl_surf.height() != phys_h {
+                    egl_surf.resize(phys_w, phys_h);
+                    damage_ring.reset();
                 }
+            } else if let Ok(egl_surf) = egl_ctx.create_surface(wl_surface, phys_w, phys_h) {
+                *egl_surface = Some(egl_surf);
+                damage_ring.reset();
             }
         }
 
@@ -1657,6 +1844,7 @@ impl WaylandApp {
                         font_system,
                         swash_cache,
                         calculated_dmg,
+                        scale_factor,
                     ).is_ok() {
                         let _ = egl_surf.swap_buffers_with_damage(calculated_dmg);
                         if attach_frame_callback {
@@ -1711,6 +1899,7 @@ impl WaylandApp {
                 font_system,
                 swash_cache,
                 dmg_rect,
+                scale_factor,
             )?;
 
             let (buffer, canvas) = pool.create_buffer(
@@ -1777,16 +1966,16 @@ impl WaylandApp {
 
         let script = self.resolve_overlay_script("lockscreen", "LockScreen").unwrap_or_else(|_| {
             r##"
-            local Ui = Zenith.Ui
-            return Ui.Column {
+            return Zenith.Box {
+                direction = "column",
                 width = "100%",
                 height = "100%",
                 align_items = "center",
                 justify_content = "center",
-                background_color = "#101216",
+                background = "#101216",
                 children = {
-                    Ui.Text { text = "Zenith Desktop Locked", font_size = 28, color = "#FFFFFF" },
-                    Ui.TextInput { id = "password", placeholder = "Enter password to unlock...", active = true }
+                    Zenith.Text { text = "Zenith Desktop Locked", font_size = 28, color = "#FFFFFF" },
+                    Zenith.TextInput { id = "password", placeholder = "Enter password to unlock...", active = true }
                 }
             }
             "##.to_string()
@@ -1801,7 +1990,7 @@ impl WaylandApp {
             let height = surf.height;
 
             self.runtime.set_current_output_geometry("lock", width, height);
-            let root_ui = match self.runtime.eval_ui(&script) {
+            let root_ui = match self.runtime.eval_ui_for_tree("lockscreen", &script) {
                 Ok(ui) => ui,
                 Err(e) => {
                     tracing::error!("Failed to evaluate LockScreen UI: {}", e);
@@ -1852,56 +2041,82 @@ impl WaylandApp {
         let is_hidden = self.dock_hidden;
         let dock = match self.dock.as_mut() {
             Some(d) if d.configured => d,
+            Some(d) => {
+                d.frame_callback_pending = false;
+                return Ok(());
+            }
             _ => return Ok(()),
         };
 
         let width = dock.width.max(1);
         let height = dock.height.max(1);
-        let stride = width * 4;
-        let target_len = (width * height * 4) as usize;
 
-        if is_hidden || height <= 12 {
-            if dock.canvas_cache.len() != target_len {
-                dock.canvas_cache = vec![0u8; target_len];
-            } else {
-                dock.canvas_cache.fill(0);
+        if is_hidden {
+            let pill_w = (width as f32 * 0.18).clamp(80.0, 240.0);
+            let pill_h = 2.0f32;
+            let pill_x = (width as f32 - pill_w) * 0.5;
+            let pill_y = (height as f32 - pill_h).max(0.0);
+            let new_boxes = vec![zenith_layout::ComputedBox {
+                x: pill_x,
+                y: pill_y,
+                width: pill_w,
+                height: pill_h,
+                background_color: zenith_layout::Color::rgba(130, 170, 255, 120),
+                border_radius: 1.0,
+                ..Default::default()
+            }];
+            if dock.computed_boxes == new_boxes {
+                dock.frame_callback_pending = false;
+                return Ok(());
+            }
+            dock.computed_boxes = new_boxes;
+
+            let scale_factor = dock.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
+            if let Some(ref tracker) = dock.scale_tracker {
+                tracker.apply_destination(width as i32, height as i32);
             }
 
-            {
-                if let Some(mut pixmap) = tiny_skia::PixmapMut::from_bytes(&mut dock.canvas_cache, width, height) {
-                    let pill_w = (width as f32 * 0.18).clamp(80.0, 240.0);
-                    let pill_h = 2.0f32;
-                    let pill_x = (width as f32 - pill_w) * 0.5;
-                    let pill_y = (height as f32 - pill_h).max(0.0);
-                    if let Some(path) = Self::build_rounded_rect_path(pill_x, pill_y, pill_w, pill_h, 1.0) {
-                        let mut paint = tiny_skia::Paint::default();
-                        paint.set_color_rgba8(130, 170, 255, 120);
-                        paint.anti_alias = true;
-                        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-                    }
-                }
-            }
+            let wl_surf = dock.surface.wl_surface().clone();
+            let egl_surf = &mut dock.egl_surface;
+            let damage_ring = &mut dock.damage_ring;
+            let canvas_cache = &mut dock.canvas_cache;
+            let attach_frame = dock.frame_callback_pending;
 
-            let (buffer, canvas) = self.pool.create_buffer(
-                width as i32,
-                height as i32,
-                stride as i32,
-                wl_shm::Format::Argb8888,
+            Self::render_surface_pipeline_helper(
+                &self.egl_context,
+                &mut self.gles_renderer,
+                &mut self.font_system,
+                &mut self.swash_cache,
+                &mut self.pool,
+                &self.qh,
+                &wl_surf,
+                egl_surf,
+                damage_ring,
+                canvas_cache,
+                &dock.computed_boxes,
+                Some((0, 0, width as i32, height as i32)),
+                scale_factor,
+                width,
+                height,
+                1.0,
+                attach_frame,
             )?;
-
-            copy_rgba_to_argb8888(canvas, &dock.canvas_cache);
-
-            buffer.attach_to(dock.surface.wl_surface())?;
-            dock.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-            dock.surface.commit();
 
             return Ok(());
         }
 
-        let new_boxes = self.layout_engine.compute(&dock.root_ui, width as f32, height as f32);
+        let mut new_boxes = self.layout_engine.compute(&dock.root_ui, width as f32, height as f32);
+        let mag_enabled = self.runtime.storage.get("dockMagnification").and_then(|v| v.as_bool()).unwrap_or(true);
+        let pointer_x = if self.dock_hovered && mag_enabled {
+            Some(self.pointer_pos.0 as f32)
+        } else {
+            None
+        };
+        zenith_layout::apply_dock_magnification(&mut new_boxes, &self.dock_magnification, pointer_x, true);
         let damage = Self::compute_damage_rect(&dock.computed_boxes, &new_boxes, width, height);
 
         if damage.is_none() && !dock.computed_boxes.is_empty() {
+            dock.frame_callback_pending = false;
             return Ok(());
         }
 
@@ -1912,7 +2127,6 @@ impl WaylandApp {
             tracker.apply_destination(width as i32, height as i32);
         }
 
-        let render_boxes = Self::scale_computed_boxes(&dock.computed_boxes, scale_factor);
         let wl_surf = dock.surface.wl_surface().clone();
         let egl_surf = &mut dock.egl_surface;
         let damage_ring = &mut dock.damage_ring;
@@ -1930,7 +2144,7 @@ impl WaylandApp {
             egl_surf,
             damage_ring,
             canvas_cache,
-            &render_boxes,
+            &dock.computed_boxes,
             damage,
             scale_factor,
             width,
@@ -1949,7 +2163,7 @@ impl WaylandApp {
             None => return Ok(()),
         };
 
-        let root_ui = self.runtime.eval_ui(&script)?;
+        let root_ui = self.runtime.eval_ui_for_tree("dock", &script)?;
         if let Some(ref mut dock) = self.dock {
             dock.root_ui = root_ui;
         }
@@ -2005,9 +2219,10 @@ impl WaylandApp {
         } else if action == "lock" || action == "system:lock" {
             self.lock_session();
         } else if action == "lock:unlock" {
-            let query = self.runtime.get_search_query();
-            self.runtime.set_search_query("");
-            self.start_pam_auth(&query);
+            if !self.runtime.is_locked_out() {
+                let pwd = self.runtime.take_lock_password();
+                self.start_pam_auth(&pwd);
+            }
         } else if action == "bar:toggle_autohide" {
             let cur = self.runtime.storage.get("barAutoHide").and_then(|v| v.as_bool()).unwrap_or_else(Self::read_bar_autohide_setting);
             let next = !cur;
@@ -2021,6 +2236,11 @@ impl WaylandApp {
             let _ = self.runtime.storage.set("dockAutoHide", serde_json::Value::Bool(next));
             self.dock_autohide = next;
             let _ = self.update_dock_visibility();
+            let _ = self.request_redraw();
+        } else if action == "bar:toggle_compact" {
+            let cur = self.runtime.storage.get("barCompactMode").and_then(|v| v.as_bool()).unwrap_or(false);
+            let _ = self.runtime.storage.set("barCompactMode", serde_json::Value::Bool(!cur));
+            let _ = self.update_bar_visibility();
             let _ = self.request_redraw();
         } else if let Some(id) = action.strip_prefix("popup:open:") {
             let _ = self.open_popup(id);
@@ -2049,7 +2269,7 @@ impl WaylandApp {
         } else {
             // Dismiss popup on outside actions, except audio tweaks, media controls, dock, settings, and notification actions
             if self.popup.is_some()
-                && self.popup.as_ref().map(|p| p.id != "LockScreen" && p.id != "lock" && p.id != "dock" && !p.id.eq_ignore_ascii_case("settings")).unwrap_or(true)
+                && self.popup.as_ref().map(|p| !p.id.eq_ignore_ascii_case("lock") && !p.id.eq_ignore_ascii_case("lockscreen") && p.id != "dock" && !p.id.eq_ignore_ascii_case("settings")).unwrap_or(true)
                 && !action.starts_with("cmd:wpctl")
                 && !action.starts_with("media:")
                 && !action.starts_with("notification:")
@@ -2058,12 +2278,24 @@ impl WaylandApp {
                 && !action.starts_with("storage:")
                 && !action.starts_with("idle:")
                 && !action.starts_with("window:toggle_minimize:")
+                && !action.starts_with("expose:")
+                && !action.starts_with("bluetooth:")
+                && !action.starts_with("wifi:")
+                && !action.starts_with("power:profile:")
+                && !action.starts_with("brightness:")
+                && !action.starts_with("dispatch:closewindow:")
             {
                 self.close_popup();
             }
             if let Err(e) = self.runtime.trigger_click(action) {
                 error!("Error executing on_click action: {}", e);
             }
+            if self.runtime.check_close_requested() {
+                self.close_popup();
+            }
+            self.sync_autohide_settings();
+            let _ = self.update_bar_visibility();
+            let _ = self.update_dock_visibility();
             if let Some(ref p) = self.popup {
                 let id = p.id.clone();
                 let _ = self.reload_popup(&id);
@@ -2083,51 +2315,67 @@ impl WaylandApp {
         let is_hidden = self.bar_hidden;
         for bar in &mut self.bars {
             if !bar.configured {
+                bar.frame_callback_pending = false;
                 continue;
             }
 
             let width = bar.width.max(1);
             let height = bar.height.max(1);
-            let stride = width * 4;
-            let target_len = (width * height * 4) as usize;
 
-            if is_hidden || height <= 8 {
-                bar.computed_boxes.clear();
-                if bar.canvas_cache.len() != target_len {
-                    bar.canvas_cache = vec![0u8; target_len];
-                } else {
-                    bar.canvas_cache.fill(0);
+            if is_hidden {
+                let line_w = (width as f32 * 0.25).clamp(80.0, 300.0);
+                let line_h = 2.0f32;
+                let line_x = (width as f32 - line_w) * 0.5;
+                let new_boxes = vec![zenith_layout::ComputedBox {
+                    x: line_x,
+                    y: 0.0,
+                    width: line_w,
+                    height: line_h,
+                    background_color: zenith_layout::Color::rgba(130, 170, 255, 100),
+                    border_radius: 1.0,
+                    ..Default::default()
+                }];
+                if bar.computed_boxes == new_boxes {
+                    bar.frame_callback_pending = false;
+                    continue;
                 }
+                bar.computed_boxes = new_boxes;
 
-                {
-                    if let Some(mut pixmap) = tiny_skia::PixmapMut::from_bytes(&mut bar.canvas_cache, width, height) {
-                        let line_w = (width as f32 * 0.25).clamp(80.0, 300.0);
-                        let line_h = 2.0f32;
-                        let line_x = (width as f32 - line_w) * 0.5;
-                        if let Some(path) = Self::build_rounded_rect_path(line_x, 0.0, line_w, line_h, 1.0) {
-                            let mut paint = tiny_skia::Paint::default();
-                            paint.set_color_rgba8(130, 170, 255, 100);
-                            paint.anti_alias = true;
-                            pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-                        }
-                    }
+                let scale_factor = bar.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
+                if let Some(ref tracker) = bar.scale_tracker {
+                    tracker.apply_destination(width as i32, height as i32);
                 }
+                let wl_surf = bar.surface.wl_surface().clone();
+                let egl_surf = &mut bar.egl_surface;
+                let damage_ring = &mut bar.damage_ring;
+                let canvas_cache = &mut bar.canvas_cache;
+                let attach_frame = bar.frame_callback_pending;
 
-                let (buffer, canvas) = self.pool.create_buffer(
-                    width as i32,
-                    height as i32,
-                    stride as i32,
-                    wl_shm::Format::Argb8888,
+                Self::render_surface_pipeline_helper(
+                    &self.egl_context,
+                    &mut self.gles_renderer,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &mut self.pool,
+                    &self.qh,
+                    &wl_surf,
+                    egl_surf,
+                    damage_ring,
+                    canvas_cache,
+                    &bar.computed_boxes,
+                    Some((0, 0, width as i32, height as i32)),
+                    scale_factor,
+                    width,
+                    height,
+                    1.0,
+                    attach_frame,
                 )?;
-                copy_rgba_to_argb8888(canvas, &bar.canvas_cache);
-                buffer.attach_to(bar.surface.wl_surface())?;
-                bar.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-                bar.surface.commit();
                 continue;
             }
 
             if let Some(m) = self.monitor_manager.monitors.get(&bar.output_name) {
                 if !m.dpms_awake {
+                    bar.frame_callback_pending = false;
                     continue;
                 }
             }
@@ -2140,7 +2388,13 @@ impl WaylandApp {
             };
             self.runtime.set_current_output_geometry(&bar.output_name, screen_w, screen_h);
 
-            let bar_ui = self.runtime.eval_ui(&self.bar_script).unwrap_or_else(|_| self.root_ui.clone());
+            let bar_ui = match self.runtime.eval_ui_for_tree("bar", &self.bar_script) {
+                Ok(ui) => ui,
+                Err(e) => {
+                    tracing::error!("BAR EVAL ERROR: {}", e);
+                    self.root_ui.clone()
+                }
+            };
 
             // Compute Taffy layout on the Luau tree
             let new_boxes = self.layout_engine.compute(&bar_ui, width as f32, height as f32);
@@ -2148,6 +2402,7 @@ impl WaylandApp {
 
             // Frame-skip optimization: if nothing changed in the computed boxes, avoid redrawing and committing!
             if damage.is_none() && !bar.computed_boxes.is_empty() {
+                bar.frame_callback_pending = false;
                 continue;
             }
 
@@ -2158,7 +2413,6 @@ impl WaylandApp {
                 tracker.apply_destination(width as i32, height as i32);
             }
 
-            let render_boxes = Self::scale_computed_boxes(&bar.computed_boxes, scale_factor);
             let wl_surf = bar.surface.wl_surface().clone();
             let egl_surf = &mut bar.egl_surface;
             let damage_ring = &mut bar.damage_ring;
@@ -2176,7 +2430,7 @@ impl WaylandApp {
                 egl_surf,
                 damage_ring,
                 canvas_cache,
-                &render_boxes,
+                &bar.computed_boxes,
                 damage,
                 scale_factor,
                 width,
@@ -2196,24 +2450,30 @@ impl WaylandApp {
         }
         let popup = match self.popup.as_mut() {
             Some(p) if p.configured => p,
+            Some(p) => {
+                p.frame_callback_pending = false;
+                return Ok(());
+            }
             _ => return Ok(()),
         };
 
         let width = popup.width.max(1);
         let height = popup.height.max(1);
 
-        let (spring_val, is_animating) = if let Some(ref s) = popup.spring {
+        let (spring_val, is_spring_animating) = if let Some(ref s) = popup.spring {
             (s.current, !s.is_settled())
         } else {
             (1.0, false)
         };
+        let is_scroll_animating = !self.gestures_manager.is_scroll_settled();
+        let is_animating = is_spring_animating || is_scroll_animating;
 
         if popup.closing && (spring_val <= 0.04 || !is_animating) {
             self.popup = None;
             return Ok(());
         }
 
-        let new_boxes = if is_animating && !popup.computed_boxes.is_empty() {
+        let new_boxes = if is_spring_animating && !is_scroll_animating && !popup.computed_boxes.is_empty() {
             popup.computed_boxes.clone()
         } else {
             self.layout_engine.compute(&popup.root_ui, width as f32, height as f32)
@@ -2226,6 +2486,7 @@ impl WaylandApp {
 
         // Frame-skip optimization: skip popup redraw if unchanged and not animating
         if !is_animating && damage.is_none() && !popup.computed_boxes.is_empty() {
+            popup.frame_callback_pending = false;
             return Ok(());
         }
 
@@ -2236,7 +2497,6 @@ impl WaylandApp {
             tracker.apply_destination(width as i32, height as i32);
         }
 
-        let render_boxes = Self::scale_computed_boxes(&popup.computed_boxes, scale_factor);
         let wl_surf = popup.surface.wl_surface().clone();
         let egl_surf = &mut popup.egl_surface;
         let damage_ring = &mut popup.damage_ring;
@@ -2254,7 +2514,7 @@ impl WaylandApp {
             egl_surf,
             damage_ring,
             canvas_cache,
-            &render_boxes,
+            &popup.computed_boxes,
             damage,
             scale_factor,
             width,
@@ -2280,6 +2540,7 @@ impl WaylandApp {
             .map(|d| (d.x, d.y, d.width, d.height))
     }
 
+    #[allow(dead_code)]
     fn build_rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
         if w <= 0.0 || h <= 0.0 {
             return None;
@@ -2313,6 +2574,7 @@ impl WaylandApp {
         font_system: &mut cosmic_text::FontSystem,
         swash_cache: &mut cosmic_text::SwashCache,
         damage_rect: Option<crate::render::damage::DamageRect>,
+        scale_factor: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         crate::render::ShmFallbackRenderer::render_boxes(
             canvas,
@@ -2323,6 +2585,7 @@ impl WaylandApp {
             font_system,
             swash_cache,
             damage_rect,
+            scale_factor,
         )
     }
 
@@ -2352,6 +2615,7 @@ delegate_pointer!(WaylandApp);
 delegate_keyboard!(WaylandApp);
 delegate_registry!(WaylandApp);
 delegate_data_device!(WaylandApp);
+wayland_client::delegate_noop!(WaylandApp: ignore wayland_client::protocol::wl_region::WlRegion);
 
 impl AsMut<DataDeviceManagerState> for WaylandApp {
     fn as_mut(&mut self) -> &mut DataDeviceManagerState {
@@ -2576,10 +2840,12 @@ impl Dispatch<ZwpPointerGestureSwipeV1, ()> for WaylandApp {
             zwp_pointer_gesture_swipe_v1::Event::Update { dx, dy, .. } => {
                 let fingers = state.gestures_manager.active_swipe.as_ref().map(|s| s.fingers).unwrap_or(2);
                 let _evt = state.gestures_manager.handle_swipe_update(fingers, dx, dy);
+                let new_scroll = state.gestures_manager.kinetic_scroll.offset();
                 if let Some(ref mut popup) = state.popup {
+                    zenith_layout::set_scroll_offset_in_tree(&mut popup.root_ui, new_scroll);
                     for b in &mut popup.computed_boxes {
                         if b.overflow == zenith_layout::Overflow::Scroll {
-                            b.scroll_offset_y = state.gestures_manager.kinetic_scroll.offset();
+                            b.scroll_offset_y = new_scroll;
                         }
                     }
                 }
@@ -2862,6 +3128,8 @@ impl PointerHandler for WaylandApp {
                         self.dock_last_leave = None;
                         if self.dock_hidden {
                             let _ = self.update_dock_visibility();
+                        } else {
+                            let _ = self.draw_dock();
                         }
                     }
                     if is_bar {
@@ -3041,7 +3309,9 @@ impl PointerHandler for WaylandApp {
                             if let Some(ref mut popup) = self.popup {
                                 for b in &mut popup.computed_boxes {
                                     if let Some(ref mut sl) = b.slider {
-                                        if sl.id.as_deref() == Some(dragging_id) || dragging_id == "slider" {
+                                        let is_match = sl.id.as_deref() == Some(dragging_id)
+                                            || (sl.id.is_none() && sl.on_change.as_deref() == Some(dragging_id));
+                                        if is_match {
                                             let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
                                             let fraction = if b.width > 0.0 { rel_x / b.width } else { 0.0 };
                                             let new_val = fraction * (sl.max - sl.min) + sl.min;
@@ -3059,7 +3329,9 @@ impl PointerHandler for WaylandApp {
                                 for bar in &mut self.bars {
                                     for b in &mut bar.computed_boxes {
                                         if let Some(ref mut sl) = b.slider {
-                                            if sl.id.as_deref() == Some(dragging_id) || dragging_id == "slider" {
+                                            let is_match = sl.id.as_deref() == Some(dragging_id)
+                                                || (sl.id.is_none() && sl.on_change.as_deref() == Some(dragging_id));
+                                            if is_match {
                                                 let rel_x = (px - b.x as f64).clamp(0.0, b.width as f64) as f32;
                                                 let fraction = if b.width > 0.0 { rel_x / b.width } else { 0.0 };
                                                 let new_val = fraction * (sl.max - sl.min) + sl.min;
@@ -3080,6 +3352,8 @@ impl PointerHandler for WaylandApp {
                                 if let Some(cb) = change_cb {
                                     let _ = self.runtime.trigger_callback_with_arg(&cb, &val.to_string());
                                 }
+                                let _ = self.update_bar_visibility();
+                                let _ = self.update_dock_visibility();
                                 let _ = self.request_redraw();
                             }
                         }
@@ -3089,6 +3363,8 @@ impl PointerHandler for WaylandApp {
                     self.pointer_pressed = false;
                     if self.active_dragging_slider.is_some() {
                         self.active_dragging_slider = None;
+                        let _ = self.update_bar_visibility();
+                        let _ = self.update_dock_visibility();
                         if let Some(ref p) = self.popup {
                             let id = p.id.clone();
                             let _ = self.reload_popup(&id);
@@ -3131,6 +3407,9 @@ impl PointerHandler for WaylandApp {
                     if is_dock {
                         self.dock_hovered = false;
                         self.dock_last_leave = Some(std::time::Instant::now());
+                        if !self.dock_hidden {
+                            let _ = self.draw_dock();
+                        }
                     }
                     let is_bar = self.bars.iter().any(|b| event.surface == *b.surface.wl_surface());
                     if is_bar {
@@ -3143,6 +3422,32 @@ impl PointerHandler for WaylandApp {
                     let is_right = button == BTN_RIGHT;
                     let (px, py) = self.pointer_pos;
                     let mut target_action: Option<String> = None;
+
+                    // Check if click was on ext-session-lock surface
+                    if self.session_lock.locked {
+                        for s in &mut self.session_lock.surfaces {
+                            if event.surface == s.wl_surface {
+                                for b in s.computed_boxes.iter().rev() {
+                                    if px >= b.x as f64
+                                        && px <= (b.x + b.width) as f64
+                                        && py >= b.y as f64
+                                        && py <= (b.y + b.height) as f64
+                                    {
+                                        let action_opt = if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
+                                        if let Some(action) = action_opt {
+                                            target_action = Some(action.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(action) = target_action {
+                                    self.execute_action(&action);
+                                    let _ = self.draw_lock_surfaces();
+                                }
+                                return;
+                            }
+                        }
+                    }
 
                     // Check if click was on dock
                     if let Some(ref dock) = self.dock {
@@ -3239,11 +3544,13 @@ impl PointerHandler for WaylandApp {
                         }
 
                         if let Some((new_val, id_opt, cb_opt)) = clicked_slider {
-                            let slider_id = id_opt.unwrap_or_else(|| "slider".to_string());
+                            let slider_id = id_opt.or(cb_opt.clone()).unwrap_or_else(|| "slider".to_string());
                             self.active_dragging_slider = Some(slider_id);
                             if let Some(cb) = cb_opt {
                                 let _ = self.runtime.trigger_callback_with_arg(&cb, &new_val.to_string());
                             }
+                            let _ = self.update_bar_visibility();
+                            let _ = self.update_dock_visibility();
                             let _ = self.request_redraw();
                             return;
                         }
@@ -3253,7 +3560,7 @@ impl PointerHandler for WaylandApp {
                             if let Some(ref mut p) = self.popup {
                                 for pb in p.computed_boxes.iter_mut() {
                                     if let Some(ref mut inp) = pb.text_input {
-                                        let is_target = inp.id.as_deref() == Some(&input_id);
+                                        let is_target = inp.id.as_deref().unwrap_or("text_input") == input_id;
                                         inp.active = is_target;
                                         if is_target {
                                             inp.cursor_pos = cursor_pos;
@@ -3274,7 +3581,7 @@ impl PointerHandler for WaylandApp {
                         }
                         return;
                     } else if let Some(ref popup) = self.popup {
-                        if popup.id != "lock" && popup.id != "lockscreen" && popup.id != "dock" {
+                        if !popup.id.eq_ignore_ascii_case("lock") && !popup.id.eq_ignore_ascii_case("lockscreen") && popup.id != "dock" {
                             // Click was OUTSIDE the popup surface - close the popup!
                             self.close_popup();
                         }
@@ -3330,11 +3637,13 @@ impl PointerHandler for WaylandApp {
                             }
 
                             if let Some((new_val, id_opt, cb_opt)) = bar_clicked_slider {
-                                let slider_id = id_opt.unwrap_or_else(|| "slider".to_string());
+                                let slider_id = id_opt.or(cb_opt.clone()).unwrap_or_else(|| "slider".to_string());
                                 self.active_dragging_slider = Some(slider_id);
                                 if let Some(cb) = cb_opt {
                                     let _ = self.runtime.trigger_callback_with_arg(&cb, &new_val.to_string());
                                 }
+                                let _ = self.update_bar_visibility();
+                                let _ = self.update_dock_visibility();
                                 let _ = self.request_redraw();
                                 return;
                             }
@@ -3345,8 +3654,8 @@ impl PointerHandler for WaylandApp {
                                     if !action.to_lowercase().contains(&toggle_needle)
                                         && !action.to_lowercase().contains(&p.id.to_lowercase())
                                         && p.id != "dock"
-                                        && p.id != "lock"
-                                        && p.id != "lockscreen"
+                                        && !p.id.eq_ignore_ascii_case("lock")
+                                        && !p.id.eq_ignore_ascii_case("lockscreen")
                                     {
                                         self.close_popup();
                                     }
@@ -3354,7 +3663,7 @@ impl PointerHandler for WaylandApp {
                                 self.execute_action(&action);
                             } else if self.popup.is_some()
                                 && !is_right
-                                && self.popup.as_ref().is_some_and(|p| p.id != "dock" && p.id != "lock" && p.id != "lockscreen")
+                                && self.popup.as_ref().is_some_and(|p| p.id != "dock" && !p.id.eq_ignore_ascii_case("lock") && !p.id.eq_ignore_ascii_case("lockscreen"))
                             {
                                 self.close_popup();
                             }
@@ -3385,7 +3694,7 @@ impl PointerHandler for WaylandApp {
                                     if b.overflow == zenith_layout::Overflow::Scroll {
                                         let delta = if is_up { -28.0 } else { 28.0 };
                                         zenith_layout::update_scroll_offset_in_tree(&mut popup.root_ui, delta);
-                                        self.gestures_manager.kinetic_scroll.add_impulse(delta);
+                                        self.gestures_manager.kinetic_scroll.on_scroll(delta);
                                         b.scroll_offset_y = self.gestures_manager.kinetic_scroll.offset();
                                         handled_scroll = true;
                                         break;
@@ -3479,7 +3788,55 @@ impl KeyboardHandler for WaylandApp {
         _serial: u32,
         event: KeyEvent,
     ) {
-        if self.popup.is_none() {
+        if self.popup.is_none() && !self.session_lock.locked {
+            return;
+        }
+
+        let is_lock = self.session_lock.locked
+            || self.popup.as_ref().map(|p| p.id.eq_ignore_ascii_case("lock") || p.id.eq_ignore_ascii_case("lockscreen")).unwrap_or(false);
+
+        if is_lock {
+            match event.keysym {
+                Keysym::Return => {
+                    let pwd = self.runtime.take_lock_password();
+                    self.start_pam_auth(&pwd);
+                }
+                Keysym::BackSpace => {
+                    self.runtime.pop_lock_password();
+                    if self.session_lock.locked {
+                        let _ = self.draw_lock_surfaces();
+                    } else if let Some(ref p) = self.popup {
+                        let id = p.id.clone();
+                        let _ = self.reload_popup(&id);
+                        let _ = self.draw_popup();
+                    }
+                }
+                Keysym::Escape => {
+                    self.runtime.clear_lock_password();
+                    if self.session_lock.locked {
+                        let _ = self.draw_lock_surfaces();
+                    } else if let Some(ref p) = self.popup {
+                        let id = p.id.clone();
+                        let _ = self.reload_popup(&id);
+                        let _ = self.draw_popup();
+                    }
+                }
+                _ => {
+                    if let Some(text) = event.utf8 {
+                        let text = text.trim_matches(|c: char| c.is_control());
+                        if !text.is_empty() {
+                            self.runtime.push_lock_password(text);
+                            if self.session_lock.locked {
+                                let _ = self.draw_lock_surfaces();
+                            } else if let Some(ref p) = self.popup {
+                                let id = p.id.clone();
+                                let _ = self.reload_popup(&id);
+                                let _ = self.draw_popup();
+                            }
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -3565,6 +3922,10 @@ impl KeyboardHandler for WaylandApp {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(ref p) = self.popup {
+                                let id = p.id.clone();
+                                let _ = self.reload_popup(&id);
                             }
                             let _ = self.request_redraw();
                             return;
@@ -3685,32 +4046,32 @@ impl KeyboardHandler for WaylandApp {
                     }
                 }
 
+                if let Some(ref p) = self.popup {
+                    let id = p.id.clone();
+                    let _ = self.reload_popup(&id);
+                }
+
                 let _ = self.request_redraw();
                 return;
             }
         }
 
+        if self.popup.is_none() {
+            return;
+        }
         let popup_id = self.popup.as_ref().unwrap().id.clone();
 
         match event.keysym {
             Keysym::Escape => {
-                if !popup_id.eq_ignore_ascii_case("lock") && !popup_id.eq_ignore_ascii_case("lockscreen") {
-                    if let Some(ref p) = self.popup {
-                        if p.closing {
-                            self.destroy_popup_immediately();
-                        } else {
-                            self.close_popup();
-                        }
+                if let Some(ref p) = self.popup {
+                    if p.closing {
+                        self.destroy_popup_immediately();
+                    } else {
+                        self.close_popup();
                     }
                 }
             }
             Keysym::Return => {
-                if popup_id.eq_ignore_ascii_case("lock") || popup_id.eq_ignore_ascii_case("lockscreen") || self.session_lock.locked {
-                    let query = self.runtime.get_search_query();
-                    self.runtime.set_search_query("");
-                    self.start_pam_auth(&query);
-                    return;
-                }
                 if popup_id.eq_ignore_ascii_case("launcher") {
                     let selected_idx = self.runtime.get_selected_index();
                     let query = self.runtime.get_search_query();
@@ -3862,6 +4223,7 @@ impl CompositorHandler for WaylandApp {
                 }
                 if !self.gestures_manager.is_scroll_settled() {
                     let new_scroll = self.gestures_manager.step_scroll(0.016);
+                    zenith_layout::set_scroll_offset_in_tree(&mut popup.root_ui, new_scroll);
                     for b in &mut popup.computed_boxes {
                         if b.overflow == zenith_layout::Overflow::Scroll {
                             b.scroll_offset_y = new_scroll;
@@ -3870,8 +4232,14 @@ impl CompositorHandler for WaylandApp {
                     should_draw = true;
                 }
                 if should_draw {
+                    let needs_reload = self.needs_redraw_popup && !popup.closing;
                     self.needs_redraw_popup = false;
-                    let _ = self.draw_popup();
+                    if needs_reload {
+                        let id = popup.id.clone();
+                        let _ = self.reload_popup(&id);
+                    } else {
+                        let _ = self.draw_popup();
+                    }
                 }
                 return;
             }
@@ -3886,8 +4254,9 @@ impl CompositorHandler for WaylandApp {
                     let _ = self.update_dock_visibility();
                     if !self.dock_hidden {
                         let _ = self.reload_dock();
+                    } else {
+                        let _ = self.draw_dock();
                     }
-                    let _ = self.draw_dock();
                 }
                 return;
             }
@@ -3978,12 +4347,10 @@ impl OutputHandler for WaylandApp {
             return;
         }
 
-        // If we only had the unassigned default bar, replace it with an explicit bar for this output
+        // If we only had the unassigned default bar, adopt this explicit output directly
         if self.bars.len() == 1 && self.bars[0].output.is_none() {
-            self.bars.remove(0);
-            if let Err(e) = self.create_bar_for_output(Some(&output), &name) {
-                error!("Failed to initialize bar for first output '{}': {}", name, e);
-            }
+            self.bars[0].output = Some(output);
+            self.bars[0].output_name = name.to_string();
             return;
         }
 
@@ -4392,8 +4759,8 @@ mod tests {
             inactive_color: Color::rgb(40, 50, 60),
             thumb_color: Color::rgb(255, 255, 255),
             style: NodeStyle {
-                width: Some(60.0),
-                height: Some(30.0),
+                width: Some(zenith_layout::length(60.0)),
+                height: Some(zenith_layout::length(30.0)),
                 ..Default::default()
             },
             on_toggle: Some("my_toggle_action".to_string()),

@@ -77,11 +77,42 @@ void main() {
     float fill_a = clamp(0.5 - d, 0.0, 1.0) * v_bg_color.a;
     vec4 col = vec4(v_bg_color.rgb * fill_a, fill_a);
 
-    // Stroke border with premultiplied alpha
-    if (v_border_width > 0.0 && v_border_color.a > 0.0) {
+    // Stroke border with analytical physical micro-bevel & Fresnel lighting
+    if (v_border_width > 0.0 && v_border_color.a > 0.0 && d <= 1.0 && d >= -v_border_width - 1.5) {
         float b_dist = abs(d + v_border_width * 0.5) - v_border_width * 0.5;
         float border_a = clamp(0.5 - b_dist, 0.0, 1.0) * v_border_color.a;
-        vec4 border = vec4(v_border_color.rgb * border_a, border_a);
+
+        // Analytical 2D gradient / surface normal: n = normalize(grad(sd_round_box))
+        vec2 q = abs(v_local_pos) - (v_box_half_size - vec2(r));
+        vec2 grad;
+        if (max(q.x, q.y) > 0.0) {
+            grad = sign(v_local_pos) * max(q, vec2(0.0));
+        } else {
+            grad = (q.x > q.y) ? vec2(sign(v_local_pos.x), 0.0) : vec2(0.0, sign(v_local_pos.y));
+        }
+        float grad_len = length(grad);
+        vec2 normal = (grad_len > 0.001) ? (grad / grad_len) : vec2(0.0, -1.0);
+
+        // Directional key light from top: L = (0.0, -1.0)
+        // Upper edge (normal.y < 0) catches physical highlight; lower edge receives ambient occlusion
+        float light_factor = -normal.y; // 1.0 at top, -1.0 at bottom
+        vec3 border_rgb = v_border_color.rgb;
+        if (light_factor > 0.0) {
+            // Specular Fresnel / Top light highlight (tactile acrylic glass micro-edge)
+            float specular = pow(light_factor, 1.8);
+            border_rgb = mix(border_rgb, vec3(1.0), specular * 0.35);
+        } else {
+            // Ambient occlusion attenuation at bottom edge
+            border_rgb *= (1.0 + light_factor * 0.22);
+        }
+
+        // Inner micro-chamfer bevel reflection when within the inner stroke boundary
+        if (d <= 0.0 && d >= -v_border_width - 1.0 && light_factor > 0.2) {
+            float inner_bevel = smoothstep(-v_border_width - 1.0, -v_border_width, d) * light_factor * 0.15;
+            col.rgb += vec3(inner_bevel * col.a);
+        }
+
+        vec4 border = vec4(border_rgb * border_a, border_a);
         col = border + col * (1.0 - border.a);
     }
 
@@ -159,6 +190,7 @@ pub struct SdfRectShader {
     vao: glow::NativeVertexArray,
     quad_vbo: glow::NativeBuffer,
     instance_vbo: glow::NativeBuffer,
+    pub instance_vbo_capacity: std::cell::Cell<usize>,
     loc_resolution: glow::UniformLocation,
 }
 
@@ -187,7 +219,7 @@ impl SdfRectShader {
             -1.0,  1.0,
             -1.0,  1.0,
              1.0, -1.0,
-             1.0,  1.0,
+              1.0,  1.0,
         ];
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck_slice(&unit_quad), glow::STATIC_DRAW);
         gl.enable_vertex_attrib_array(0);
@@ -220,6 +252,7 @@ impl SdfRectShader {
             vao,
             quad_vbo,
             instance_vbo,
+            instance_vbo_capacity: std::cell::Cell::new(0),
             loc_resolution,
         })
     }
@@ -240,20 +273,34 @@ impl SdfRectShader {
         self.gl.uniform_2_f32(Some(&self.loc_resolution), resolution.0, resolution.1);
 
         self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instance_vbo));
-        self.gl.buffer_data_u8_slice(
-            glow::ARRAY_BUFFER,
-            std::slice::from_raw_parts(
-                instances.as_ptr() as *const u8,
-                instances.len() * std::mem::size_of::<SdfInstance>(),
-            ),
-            glow::DYNAMIC_DRAW,
+        let needed_bytes = instances.len() * std::mem::size_of::<SdfInstance>();
+        let slice = std::slice::from_raw_parts(
+            instances.as_ptr() as *const u8,
+            needed_bytes,
         );
+        let cur_cap = self.instance_vbo_capacity.get();
+        if needed_bytes <= cur_cap {
+            self.gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, slice);
+        } else {
+            let new_cap = needed_bytes.next_power_of_two().max(1024);
+            self.gl.buffer_data_size(glow::ARRAY_BUFFER, new_cap as i32, glow::DYNAMIC_DRAW);
+            self.gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, slice);
+            self.instance_vbo_capacity.set(new_cap);
+        }
 
         self.gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, instances.len() as i32);
 
         self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
         self.gl.bind_vertex_array(None);
         self.gl.use_program(None);
+
+        // Restore standard straight alpha blend mode used across other rendering passes
+        self.gl.blend_func_separate(
+            glow::SRC_ALPHA,
+            glow::ONE_MINUS_SRC_ALPHA,
+            glow::ONE,
+            glow::ONE_MINUS_SRC_ALPHA,
+        );
     }
 
     /// Convenience draw call for a single rounded rectangle box.

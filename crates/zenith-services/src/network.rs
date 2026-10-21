@@ -45,8 +45,7 @@ struct NetworkCache {
 }
 
 static CACHE: OnceLock<Arc<Mutex<NetworkCache>>> = OnceLock::new();
-static IS_SCANNING_STATUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static IS_SCANNING_WIFI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MONITOR_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct NetworkService;
 
@@ -56,52 +55,70 @@ impl NetworkService {
             Arc::new(Mutex::new(NetworkCache {
                 status: NetworkStatus::default(),
                 wifi_list: Self::fallback_wifi_list(),
-                last_status_scan: Instant::now() - Duration::from_secs(10),
-                last_wifi_scan: Instant::now() - Duration::from_secs(10),
+                last_status_scan: Instant::now() - Duration::from_secs(120),
+                last_wifi_scan: Instant::now() - Duration::from_secs(120),
             }))
         })
     }
 
+    fn ensure_signal_monitor_spawned() {
+        if !MONITOR_INITIALIZED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::thread::Builder::new()
+                .name("zenith-network-monitor".into())
+                .spawn(|| {
+                    if let Ok(conn) = crate::dbus::get_system_connection() {
+                        let _ = conn.call_method(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            Some("org.freedesktop.DBus"),
+                            "AddMatch",
+                            &("type='signal',sender='org.freedesktop.NetworkManager'"),
+                        );
+
+                        for _msg in zbus::blocking::MessageIterator::from(&conn) {
+                            let fresh = Self::query_system_status();
+                            let fresh_wifi = Self::query_system_wifi();
+                            let cache_arc = Self::cache();
+                            if let Ok(mut g) = cache_arc.lock() {
+                                g.status = fresh;
+                                g.wifi_list = fresh_wifi;
+                                g.last_status_scan = Instant::now();
+                                g.last_wifi_scan = Instant::now();
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
+
     /// Retrieve current network connectivity status with non-blocking cache.
     pub fn status() -> NetworkStatus {
+        Self::ensure_signal_monitor_spawned();
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
-        if guard.last_status_scan.elapsed() > Duration::from_millis(3000) {
+        if guard.last_status_scan.elapsed() > Duration::from_secs(30) {
+            guard.status = Self::query_system_status();
             guard.last_status_scan = Instant::now();
-            if !IS_SCANNING_STATUS.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let c_arc = cache_arc.clone();
-                std::thread::spawn(move || {
-                    let fresh = Self::query_system_status();
-                    if let Ok(mut g) = c_arc.lock() {
-                        g.status = fresh;
-                        g.last_status_scan = Instant::now();
-                    }
-                    IS_SCANNING_STATUS.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
-            }
         }
         guard.status.clone()
     }
 
     /// Scan and return nearby Wi-Fi networks non-blockingly.
     pub fn scan_wifi() -> Vec<WifiNetwork> {
+        Self::ensure_signal_monitor_spawned();
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
-        if guard.last_wifi_scan.elapsed() > Duration::from_millis(5000) {
+        if guard.last_wifi_scan.elapsed() > Duration::from_secs(30) {
+            guard.wifi_list = Self::query_system_wifi();
             guard.last_wifi_scan = Instant::now();
-            if !IS_SCANNING_WIFI.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let c_arc = cache_arc.clone();
-                std::thread::spawn(move || {
-                    let fresh = Self::query_system_wifi();
-                    if let Ok(mut g) = c_arc.lock() {
-                        g.wifi_list = fresh;
-                        g.last_wifi_scan = Instant::now();
-                    }
-                    IS_SCANNING_WIFI.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
-            }
         }
         guard.wifi_list.clone()
+    }
+
+    /// Retrieve current network bandwidth throughput without subprocess forks.
+    pub fn bandwidth() -> crate::NetworkBandwidthSnapshot {
+        crate::SystemService::network_bandwidth_snapshot()
     }
 
     /// Connect to a Wi-Fi access point via native D-Bus NetworkManager.

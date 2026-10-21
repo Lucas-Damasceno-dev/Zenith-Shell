@@ -4,10 +4,20 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+static RECORDER_CACHE: std::sync::OnceLock<std::sync::RwLock<(bool, std::time::Instant)>> = std::sync::OnceLock::new();
 
 pub struct RecorderService;
 
 impl RecorderService {
+    fn set_cached_recording(active: bool) {
+        if let Some(cache) = RECORDER_CACHE.get() {
+            if let Ok(mut guard) = cache.write() {
+                guard.0 = active;
+                guard.1 = std::time::Instant::now();
+            }
+        }
+    }
+
     fn find_recorder_pid() -> Option<i32> {
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
@@ -17,6 +27,18 @@ impl RecorderService {
                         let comm_path = entry.path().join("comm");
                         if let Ok(comm) = std::fs::read_to_string(comm_path) {
                             if comm.trim() == "wf-recorder" {
+                                // Check if process is a zombie (state 'Z' in /proc/<pid>/stat)
+                                let stat_path = entry.path().join("stat");
+                                if let Ok(stat) = std::fs::read_to_string(stat_path) {
+                                    if let Some(idx) = stat.rfind(')') {
+                                        let rest = &stat[idx + 1..];
+                                        if let Some(state) = rest.split_whitespace().next() {
+                                            if state == "Z" {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Ok(pid) = s.parse::<i32>() {
                                     return Some(pid);
                                 }
@@ -31,16 +53,23 @@ impl RecorderService {
 
     /// Whether screen recording is currently active.
     pub fn is_recording() -> bool {
-        if IS_RECORDING.load(Ordering::SeqCst) {
-            return true;
+        let cache_lock = RECORDER_CACHE.get_or_init(|| {
+            std::sync::RwLock::new((false, std::time::Instant::now() - std::time::Duration::from_secs(10)))
+        });
+
+        if let Ok(guard) = cache_lock.read() {
+            if guard.1.elapsed() < std::time::Duration::from_millis(1000) {
+                return guard.0;
+            }
         }
 
-        if Self::find_recorder_pid().is_some() {
-            IS_RECORDING.store(true, Ordering::SeqCst);
-            return true;
+        let active = Self::find_recorder_pid().is_some();
+        if let Ok(mut guard) = cache_lock.write() {
+            guard.0 = active;
+            guard.1 = std::time::Instant::now();
         }
-
-        false
+        IS_RECORDING.store(active, Ordering::SeqCst);
+        active
     }
 
     /// Toggle screen recording via `wf-recorder`.
@@ -50,6 +79,7 @@ impl RecorderService {
                 libc::kill(pid, libc::SIGINT);
             }
             IS_RECORDING.store(false, Ordering::SeqCst);
+            Self::set_cached_recording(false);
             false
         } else {
             let now = std::time::SystemTime::now()
@@ -57,11 +87,24 @@ impl RecorderService {
                 .unwrap_or_default()
                 .as_secs();
             let path = format!("/tmp/zenith-record-{}.mp4", now);
-            let _ = Command::new("wf-recorder")
+            if let Ok(mut child) = Command::new("wf-recorder")
                 .args(["-f", &path])
-                .spawn();
-            IS_RECORDING.store(true, Ordering::SeqCst);
-            true
+                .spawn()
+            {
+                std::thread::Builder::new()
+                    .name("wf-recorder-wait".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                        IS_RECORDING.store(false, Ordering::SeqCst);
+                        Self::set_cached_recording(false);
+                    })
+                    .ok();
+                IS_RECORDING.store(true, Ordering::SeqCst);
+                Self::set_cached_recording(true);
+                true
+            } else {
+                false
+            }
         }
     }
 

@@ -1,7 +1,8 @@
 //! Zenith Layout - Taffy Flexbox tree and cosmic-text layout calculations.
 
 use taffy::prelude::*;
-pub use taffy::prelude::{AlignItems, FlexDirection, JustifyContent};
+pub use taffy::style::ExpandedDimension;
+pub use taffy::prelude::{AlignItems, Dimension, FlexDirection, JustifyContent, auto, length, percent};
 
 /// Color representation in RGBA (0-255).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,8 +127,8 @@ pub struct CustomShaderStyle {
 /// Node style properties for Zenith UI elements.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeStyle {
-    pub width: Option<f32>,
-    pub height: Option<f32>,
+    pub width: Option<Dimension>,
+    pub height: Option<Dimension>,
     pub padding: [f32; 4], // top, right, bottom, left
     pub margin: [f32; 4],
     pub flex_direction: FlexDirection,
@@ -140,11 +141,13 @@ pub struct NodeStyle {
     pub border_radius: f32,
     pub flex_grow: f32,
     pub flex_shrink: f32,
-    pub max_width: Option<f32>,
+    pub max_width: Option<Dimension>,
     pub shadow: Option<ShadowStyle>,
     pub custom_shader: Option<CustomShaderStyle>,
     pub overflow: Overflow,
     pub scroll_offset_y: f32,
+    pub opacity: Option<f32>,
+    pub scale: Option<f32>,
 }
 
 
@@ -170,6 +173,8 @@ impl Default for NodeStyle {
             custom_shader: None,
             overflow: Overflow::Visible,
             scroll_offset_y: 0.0,
+            opacity: None,
+            scale: None,
         }
     }
 }
@@ -282,6 +287,262 @@ pub struct ComputedBox {
     pub tooltip_active: bool,
 }
 
+impl Default for ComputedBox {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            background_color: Color::transparent(),
+            border_color: Color::transparent(),
+            border_width: 0.0,
+            border_radius: 0.0,
+            shadow: None,
+            custom_shader: None,
+            text: None,
+            image: None,
+            text_input: None,
+            slider: None,
+            switch: None,
+            overflow: Overflow::Visible,
+            scroll_offset_y: 0.0,
+            clip_rect: None,
+            on_click: None,
+            on_right_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+            tooltip_active: false,
+        }
+    }
+}
+
+impl ComputedBox {
+    /// Computes horizontal center of this box.
+    #[inline]
+    pub fn center_x(&self) -> f32 {
+        self.x + self.width * 0.5
+    }
+
+    /// Computes vertical center of this box.
+    #[inline]
+    pub fn center_y(&self) -> f32 {
+        self.y + self.height * 0.5
+    }
+
+    /// Scales box dimensions in-place, anchoring either to bottom shelf or center.
+    pub fn apply_magnification_scale(&mut self, scale: f32, anchor_bottom: bool) {
+        if (scale - 1.0).abs() < 0.0001 {
+            return;
+        }
+        let original_w = self.width;
+        let original_h = self.height;
+        let new_w = original_w * scale;
+        let new_h = original_h * scale;
+
+        if anchor_bottom {
+            let baseline = self.y + original_h;
+            self.y = baseline - new_h;
+        } else {
+            self.y -= (new_h - original_h) * 0.5;
+        }
+
+        self.width = new_w;
+        self.height = new_h;
+        self.border_radius = (self.border_radius * scale).min(new_h * 0.5);
+    }
+}
+
+/// Applies smooth in-place dock magnification across a sequence of computed item boxes.
+///
+/// Modifies box dimensions and horizontal positions in-place without triggering a full
+/// Taffy flexbox re-layout pass, enabling sub-microsecond deformation at 120Hz/240Hz with
+/// zero heap allocation.
+pub fn apply_dock_magnification(
+    boxes: &mut [ComputedBox],
+    model: &zenith_core::MagnificationModel,
+    pointer_x: Option<f32>,
+    anchor_bottom: bool,
+) {
+    if boxes.is_empty() {
+        return;
+    }
+
+    let n = boxes.len();
+    if n == 1 {
+        if let Some(px) = pointer_x {
+            let scale = model.compute_scale(px, boxes[0].center_x());
+            boxes[0].apply_magnification_scale(scale, anchor_bottom);
+        }
+        return;
+    }
+
+    // Detect if `boxes` is a hierarchical pre-order tree from LayoutEngine::compute
+    // (where boxes[0] is the root DockBar container encompassing boxes[1..])
+    let is_tree = n > 2
+        && boxes[1].x >= boxes[0].x
+        && (boxes[1].x + boxes[1].width) <= (boxes[0].x + boxes[0].width) + 1.0;
+
+    if is_tree {
+        // Identify top-level child subtrees [start_idx, end_idx) inside boxes[0]
+        let mut subtrees: [(usize, usize); 64] = [(0, 0); 64];
+        let mut count = 0usize;
+        let mut idx = 1usize;
+        while idx < n && count < 64 {
+            let p_x1 = boxes[idx].x - 0.5;
+            let p_y1 = boxes[idx].y - 0.5;
+            let p_x2 = boxes[idx].x + boxes[idx].width + 0.5;
+            let p_y2 = boxes[idx].y + boxes[idx].height + 0.5;
+            let mut end = idx + 1;
+            while end < n {
+                let c = &boxes[end];
+                if c.x >= p_x1 && c.y >= p_y1 && (c.x + c.width) <= p_x2 && (c.y + c.height) <= p_y2 {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            subtrees[count] = (idx, end);
+            count += 1;
+            idx = end;
+        }
+
+        if count == 0 {
+            return;
+        }
+
+        let first_idx = subtrees[0].0;
+        let last_idx = subtrees[count - 1].0;
+        let orig_first_x = boxes[first_idx].x;
+        let orig_last_end = boxes[last_idx].x + boxes[last_idx].width;
+        let orig_center_x = (orig_first_x + orig_last_end) * 0.5;
+
+        let mut scales = [1.0f32; 64];
+        let mut gaps = [0.0f32; 63];
+        let mut new_widths = [0.0f32; 64];
+        let mut total_new_width = 0.0f32;
+
+        for i in 0..count {
+            let root_i = subtrees[i].0;
+            if let Some(px) = pointer_x {
+                // Only magnify interactive dock app icons (skip 1px separators and wide widgets/pills)
+                if boxes[root_i].width > 4.0 && boxes[root_i].width <= 72.0 {
+                    scales[i] = model.compute_scale(px, boxes[root_i].center_x());
+                }
+            }
+            if i + 1 < count {
+                let next_i = subtrees[i + 1].0;
+                gaps[i] = (boxes[next_i].x - (boxes[root_i].x + boxes[root_i].width)).max(0.0);
+            }
+            new_widths[i] = boxes[root_i].width * scales[i];
+            total_new_width += new_widths[i];
+            if i + 1 < count {
+                total_new_width += gaps[i];
+            }
+        }
+
+        // Ajusta o container raiz (boxes[0]) ao redor dos itens como uma pílula centralizada
+        let dock_pad_x = 14.0f32;
+        let pill_w = (total_new_width + dock_pad_x * 2.0).min(boxes[0].width);
+        boxes[0].width = pill_w;
+        boxes[0].x = orig_center_x - pill_w * 0.5;
+
+        let mut cur_x = orig_center_x - (total_new_width * 0.5);
+        for i in 0..count {
+            let (start, end) = subtrees[i];
+            let s = scales[i];
+            let orig_px = boxes[start].x;
+            let orig_py = boxes[start].y;
+            let orig_ph = boxes[start].height;
+            let new_ph = orig_ph * s;
+            let new_py = if anchor_bottom {
+                (orig_py + orig_ph) - new_ph
+            } else {
+                orig_py - (new_ph - orig_ph) * 0.5
+            };
+
+            boxes[start].x = cur_x;
+            boxes[start].y = new_py;
+            boxes[start].width = new_widths[i];
+            boxes[start].height = new_ph;
+            boxes[start].border_radius = (boxes[start].border_radius * s).min(new_ph * 0.5);
+
+            // Transform all descendant boxes (inner background, icon glyph text, indicator dot)
+            for child in &mut boxes[(start + 1)..end] {
+                let rel_x = child.x - orig_px;
+                let rel_y = child.y - orig_py;
+                child.x = cur_x + rel_x * s;
+                child.y = new_py + rel_y * s;
+                child.width *= s;
+                child.height *= s;
+                child.border_radius = (child.border_radius * s).min(child.height * 0.5);
+                if let Some((_, _, ref mut fsize)) = child.text {
+                    *fsize *= s;
+                }
+            }
+
+            if i + 1 < count {
+                cur_x += new_widths[i] + gaps[i];
+            }
+        }
+        return;
+    }
+
+    // Flat slice path (used by unit tests with standalone sibling boxes)
+    let Some(px) = pointer_x else {
+        return;
+    };
+    let orig_first_x = boxes[0].x;
+    let orig_last_end = boxes[n - 1].x + boxes[n - 1].width;
+    let orig_center_x = (orig_first_x + orig_last_end) * 0.5;
+
+    let mut scales = [1.0f32; 64];
+    let count = n.min(64);
+    for i in 0..count {
+        scales[i] = model.compute_scale(px, boxes[i].center_x());
+    }
+
+    let mut gaps = [0.0f32; 63];
+    for i in 0..count.saturating_sub(1) {
+        let gap = boxes[i + 1].x - (boxes[i].x + boxes[i].width);
+        gaps[i] = gap.max(0.0);
+    }
+
+    let mut new_widths = [0.0f32; 64];
+    let mut total_new_width = 0.0f32;
+    for i in 0..count {
+        let nw = boxes[i].width * scales[i];
+        new_widths[i] = nw;
+        total_new_width += nw;
+        if i < count - 1 {
+            total_new_width += gaps[i];
+        }
+    }
+
+    let mut cur_x = orig_center_x - (total_new_width * 0.5);
+    for i in 0..count {
+        let original_h = boxes[i].height;
+        let new_h = original_h * scales[i];
+
+        if anchor_bottom {
+            let baseline = boxes[i].y + original_h;
+            boxes[i].y = baseline - new_h;
+        } else {
+            boxes[i].y -= (new_h - original_h) * 0.5;
+        }
+
+        boxes[i].x = cur_x;
+        boxes[i].width = new_widths[i];
+        boxes[i].height = new_h;
+        boxes[i].border_radius = (boxes[i].border_radius * scales[i]).min(new_h * 0.5);
+
+        if i < count - 1 {
+            cur_x += new_widths[i] + gaps[i];
+        }
+    }
+}
+
 /// Updates scroll_offset_y recursively in any UiNode with Overflow::Scroll
 pub fn update_scroll_offset_in_tree(root: &mut UiNode, delta: f32) -> bool {
     match root {
@@ -292,6 +553,25 @@ pub fn update_scroll_offset_in_tree(root: &mut UiNode, delta: f32) -> bool {
             }
             for child in children {
                 if update_scroll_offset_in_tree(child, delta) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Sets scroll_offset_y recursively in any UiNode with Overflow::Scroll
+pub fn set_scroll_offset_in_tree(root: &mut UiNode, offset: f32) -> bool {
+    match root {
+        UiNode::Box { style, children, .. } | UiNode::Window { style, children, .. } => {
+            if style.overflow == Overflow::Scroll {
+                style.scroll_offset_y = offset.max(0.0);
+                return true;
+            }
+            for child in children {
+                if set_scroll_offset_in_tree(child, offset) {
                     return true;
                 }
             }
@@ -318,6 +598,15 @@ pub struct LayoutEngine {
 impl Default for LayoutEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[inline]
+fn dim_to_lpa(dim: Dimension) -> LengthPercentageAuto {
+    match dim.expand() {
+        ExpandedDimension::Length(val) => LengthPercentageAuto::length(val),
+        ExpandedDimension::Percent(val) => LengthPercentageAuto::percent(val),
+        _ => LengthPercentageAuto::auto(),
     }
 }
 
@@ -348,6 +637,20 @@ impl LayoutEngine {
     /// Compute absolute bounding boxes for a UI tree given available viewport bounds.
     /// Recycles existing Taffy nodes across incremental mutations instead of clearing the tree.
     pub fn compute(&mut self, root: &UiNode, viewport_width: f32, viewport_height: f32) -> Vec<ComputedBox> {
+        let mut computed = Vec::with_capacity(32);
+        self.compute_into(root, viewport_width, viewport_height, &mut computed);
+        computed
+    }
+
+    /// Zero-allocation computation reusing an existing `Vec<ComputedBox>` buffer between frames.
+    pub fn compute_into(
+        &mut self,
+        root: &UiNode,
+        viewport_width: f32,
+        viewport_height: f32,
+        computed: &mut Vec<ComputedBox>,
+    ) {
+        computed.clear();
         let old_cache = self.cached_root.take();
         let mut root_cache = self.sync_node(root, old_cache);
 
@@ -375,13 +678,11 @@ impl LayoutEngine {
         if let Err(e) = self.taffy.compute_layout(root_cache.node_id, available_space) {
             tracing::error!("Failed to compute Taffy layout: {:?}", e);
             self.cached_root = Some(root_cache);
-            return Vec::new();
+            return;
         }
 
-        let mut computed = Vec::with_capacity(32);
-        self.collect_computed(root, root_cache.node_id, 0.0, 0.0, None, &mut computed);
+        self.collect_computed(root, root_cache.node_id, 0.0, 0.0, None, computed);
         self.cached_root = Some(root_cache);
-        computed
     }
 
     fn remove_cache_tree(&mut self, cache: LayoutNodeCache) {
@@ -431,23 +732,23 @@ impl LayoutEngine {
             UiNode::Shader { style, .. } => Self::convert_style(style),
             UiNode::Slider { style, .. } => {
                 let mut taffy_style = Self::convert_style(style);
-                let w = style.width.unwrap_or(160.0);
-                let h = style.height.unwrap_or(24.0);
-                taffy_style.size.width = length(w);
-                taffy_style.size.height = length(h);
-                taffy_style.min_size.width = length(w);
-                taffy_style.min_size.height = length(h);
+                let w_dim = style.width.unwrap_or_else(|| length(160.0));
+                let h_dim = style.height.unwrap_or_else(|| length(24.0));
+                taffy_style.size.width = w_dim;
+                taffy_style.size.height = h_dim;
+                taffy_style.min_size.width = dim_to_lpa(w_dim);
+                taffy_style.min_size.height = dim_to_lpa(h_dim);
                 taffy_style.flex_shrink = 0.0;
                 taffy_style
             }
             UiNode::Switch { style, .. } => {
                 let mut taffy_style = Self::convert_style(style);
-                let w = style.width.unwrap_or(44.0);
-                let h = style.height.unwrap_or(24.0);
-                taffy_style.size.width = length(w);
-                taffy_style.size.height = length(h);
-                taffy_style.min_size.width = length(w);
-                taffy_style.min_size.height = length(h);
+                let w_dim = style.width.unwrap_or_else(|| length(44.0));
+                let h_dim = style.height.unwrap_or_else(|| length(24.0));
+                taffy_style.size.width = w_dim;
+                taffy_style.size.height = h_dim;
+                taffy_style.min_size.width = dim_to_lpa(w_dim);
+                taffy_style.min_size.height = dim_to_lpa(h_dim);
                 taffy_style.flex_shrink = 0.0;
                 taffy_style
             }
@@ -484,10 +785,10 @@ impl LayoutEngine {
                     self.remove_cache_tree(leftover);
                 }
 
-                // Update child references if children composition changed
-                let new_child_ids: Vec<NodeId> = new_children_caches.iter().map(|c| c.node_id).collect();
+                // Update child references only if children composition actually changed
                 let current_child_ids = self.taffy.children(cache.node_id).unwrap_or_default();
-                if current_child_ids != new_child_ids {
+                if !current_child_ids.iter().copied().eq(new_children_caches.iter().map(|c| c.node_id)) {
+                    let new_child_ids: Vec<NodeId> = new_children_caches.iter().map(|c| c.node_id).collect();
                     let _ = self.taffy.set_children(cache.node_id, &new_child_ids);
                 }
 
@@ -522,12 +823,12 @@ impl LayoutEngine {
     fn convert_style(style: &NodeStyle) -> Style {
         Style {
             size: Size {
-                width: style.width.map(length).unwrap_or(auto()),
-                height: style.height.map(length).unwrap_or(auto()),
+                width: style.width.unwrap_or_else(auto),
+                height: style.height.unwrap_or_else(auto),
             },
             max_size: Size {
-                width: style.max_width.map(length).unwrap_or(auto()),
-                height: auto(),
+                width: style.max_width.map(dim_to_lpa).unwrap_or_else(LengthPercentageAuto::auto),
+                height: LengthPercentageAuto::auto(),
             },
             padding: Rect {
                 top: length(style.padding[0]),
@@ -898,14 +1199,14 @@ mod tests {
         let mut engine = LayoutEngine::new();
         let root = UiNode::Box {
             style: NodeStyle {
-                height: Some(44.0),
+                height: Some(length(44.0)),
                 ..Default::default()
             },
             children: vec![
                 UiNode::Box {
                     style: NodeStyle {
                         flex_grow: 1.0,
-                        height: Some(36.0),
+                        height: Some(length(36.0)),
                         ..Default::default()
                     },
                     children: vec![],
@@ -933,7 +1234,7 @@ mod tests {
         let mut engine = LayoutEngine::new();
         let root = UiNode::Box {
             style: NodeStyle {
-                height: Some(44.0),
+                height: Some(length(44.0)),
                 padding: [4.0, 12.0, 4.0, 12.0],
                 ..Default::default()
             },
@@ -941,13 +1242,13 @@ mod tests {
                 UiNode::Box {
                     style: NodeStyle {
                         flex_grow: 1.0,
-                        height: Some(36.0),
+                        height: Some(length(36.0)),
                         flex_direction: FlexDirection::Row,
                         ..Default::default()
                     },
                     children: vec![
                         UiNode::Box {
-                            style: NodeStyle { width: Some(100.0), height: Some(30.0), ..Default::default() },
+                            style: NodeStyle { width: Some(length(100.0)), height: Some(length(30.0)), ..Default::default() },
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
@@ -965,7 +1266,7 @@ mod tests {
                             tooltip: None,
                         },
                         UiNode::Box {
-                            style: NodeStyle { width: Some(80.0), height: Some(30.0), ..Default::default() },
+                            style: NodeStyle { width: Some(length(80.0)), height: Some(length(30.0)), ..Default::default() },
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
@@ -983,7 +1284,7 @@ mod tests {
                             tooltip: None,
                         },
                         UiNode::Box {
-                            style: NodeStyle { width: Some(120.0), height: Some(30.0), ..Default::default() },
+                            style: NodeStyle { width: Some(length(120.0)), height: Some(length(30.0)), ..Default::default() },
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
@@ -1019,8 +1320,8 @@ mod tests {
         let mut engine = LayoutEngine::new();
         let root = UiNode::Box {
             style: NodeStyle {
-                width: Some(400.0),
-                height: Some(300.0),
+                width: Some(length(400.0)),
+                height: Some(length(300.0)),
                 overflow: Overflow::Scroll,
                 scroll_offset_y: 50.0,
                 flex_direction: FlexDirection::Column,
@@ -1038,8 +1339,8 @@ mod tests {
                     cursor_pos: 5,
                     selection_range: None,
                     style: NodeStyle {
-                        width: Some(300.0),
-                        height: Some(36.0),
+                        width: Some(length(300.0)),
+                        height: Some(length(36.0)),
                         ..Default::default()
                     },
                     on_change: Some("change_cb".to_string()),
@@ -1048,8 +1349,8 @@ mod tests {
                 UiNode::Image {
                     src: "/tmp/icon.png".to_string(),
                     style: NodeStyle {
-                        width: Some(32.0),
-                        height: Some(32.0),
+                        width: Some(length(32.0)),
+                        height: Some(length(32.0)),
                         ..Default::default()
                     },
                 },
@@ -1081,8 +1382,8 @@ mod tests {
         let mut engine = LayoutEngine::new();
         let root = UiNode::Box {
             style: NodeStyle {
-                width: Some(200.0),
-                height: Some(40.0),
+                width: Some(length(200.0)),
+                height: Some(length(40.0)),
                 ..Default::default()
             },
             children: vec![],
@@ -1106,8 +1407,8 @@ mod tests {
         // 1. Initial UI Tree: Root Box with 2 children (Text + Box with child Image)
         let initial_root = UiNode::Box {
             style: NodeStyle {
-                width: Some(500.0),
-                height: Some(300.0),
+                width: Some(length(500.0)),
+                height: Some(length(300.0)),
                 ..Default::default()
             },
             children: vec![
@@ -1119,8 +1420,8 @@ mod tests {
                 },
                 UiNode::Box {
                     style: NodeStyle {
-                        width: Some(200.0),
-                        height: Some(50.0),
+                        width: Some(length(200.0)),
+                        height: Some(length(50.0)),
                         ..Default::default()
                     },
                     children: vec![
@@ -1152,8 +1453,8 @@ mod tests {
         // 2. Incremental Mutation: change text and width of the child box (preserving topology)
         let mutated_root = UiNode::Box {
             style: NodeStyle {
-                width: Some(500.0),
-                height: Some(300.0),
+                width: Some(length(500.0)),
+                height: Some(length(300.0)),
                 ..Default::default()
             },
             children: vec![
@@ -1165,8 +1466,8 @@ mod tests {
                 },
                 UiNode::Box {
                     style: NodeStyle {
-                        width: Some(220.0), // width mutated
-                        height: Some(50.0),
+                        width: Some(length(220.0)), // width mutated
+                        height: Some(length(50.0)),
                         background_color: Color::rgb(10, 20, 30),
                         ..Default::default()
                     },
@@ -1202,8 +1503,8 @@ mod tests {
         // 3. Child addition: add an extra box
         let expanded_root = UiNode::Box {
             style: NodeStyle {
-                width: Some(500.0),
-                height: Some(300.0),
+                width: Some(length(500.0)),
+                height: Some(length(300.0)),
                 ..Default::default()
             },
             children: vec![
@@ -1215,8 +1516,8 @@ mod tests {
                 },
                 UiNode::Box {
                     style: NodeStyle {
-                        width: Some(220.0),
-                        height: Some(50.0),
+                        width: Some(length(220.0)),
+                        height: Some(length(50.0)),
                         ..Default::default()
                     },
                     children: vec![
@@ -1233,8 +1534,8 @@ mod tests {
                 },
                 UiNode::Box {
                     style: NodeStyle {
-                        width: Some(80.0),
-                        height: Some(40.0),
+                        width: Some(length(80.0)),
+                        height: Some(length(40.0)),
                         ..Default::default()
                     },
                     children: vec![],

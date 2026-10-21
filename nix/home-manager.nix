@@ -1,4 +1,4 @@
-{ self, quickshell }:
+{ self, ... }:
 { config, pkgs, lib, ... }:
 
 with lib;
@@ -10,15 +10,8 @@ let
   zenith-pkg = (self.packages.${system}.zenith-shell or pkgs.zenith-shell);
 
   runtimeDeps = with pkgs; [
-    bash
-    coreutils
-    procps
-    systemd
-    networkmanager
-    playerctl
-    upower
+    # Minimal runtime dependencies: native engine handles D-Bus (zbus) and sockets directly
     pipewire
-    wireplumber
     hyprland
   ];
 in
@@ -30,6 +23,13 @@ in
       type = types.package;
       default = zenith-pkg;
       description = "Zenith shell package to install";
+    };
+
+    devPath = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/home/lucas/Documents/03_Desenvolvimento/code/projects/personal/portfolio/desktop/Zenith-Shell/config/zenith";
+      description = "Absolute path to local mutable Zenith repository config directory for sub-10ms hot-reload via mkOutOfStoreSymlink.";
     };
 
     configDir = mkOption {
@@ -54,12 +54,15 @@ in
   config = mkIf cfg.enable {
     home.packages = [ cfg.package ] ++ runtimeDeps;
 
-    xdg.configFile."zenith" = mkIf (cfg.configDir != null) {
-      source = if cfg.enableLiveSymlink then
-        config.lib.file.mkOutOfStoreSymlink cfg.configDir
-      else
-        cfg.configDir;
-      recursive = !cfg.enableLiveSymlink;
+    xdg.configFile."zenith" = mkIf (cfg.devPath != null || cfg.configDir != null) {
+      source =
+        if cfg.enableLiveSymlink && cfg.devPath != null then
+          config.lib.file.mkOutOfStoreSymlink cfg.devPath
+        else if cfg.configDir != null then
+          cfg.configDir
+        else
+          "${cfg.package}/share/zenith";
+      recursive = !(cfg.enableLiveSymlink && cfg.devPath != null);
     };
 
     systemd.user.services.zenith-shell = mkIf cfg.enableSystemd {
@@ -76,8 +79,8 @@ in
         Restart = "on-failure";
         RestartSec = 2;
         Slice = "session.slice";
-        MemoryMax = "50M";
-        MemoryHigh = "35M";
+        MemoryMax = "35M";
+        MemoryHigh = "25M";
         CPUWeight = 200;
         Environment = [
           "PATH=${cfg.package}/bin:${lib.makeBinPath runtimeDeps}"

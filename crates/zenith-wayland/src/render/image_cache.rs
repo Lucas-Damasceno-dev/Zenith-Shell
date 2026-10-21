@@ -46,13 +46,24 @@ struct TextureEntry {
     last_used: u64,
 }
 
+struct TextureVariant {
+    width: u32,
+    height: u32,
+    entry: Option<TextureEntry>,
+}
+
+struct ImageVariants {
+    variants: Vec<TextureVariant>,
+}
+
 pub struct ImageCache {
     gl: Arc<glow::Context>,
-    textures: HashMap<String, TextureEntry>,
+    textures: HashMap<String, ImageVariants>,
     access_counter: u64,
     program: glow::NativeProgram,
     vao: glow::NativeVertexArray,
     vbo: glow::NativeBuffer,
+    pub vbo_capacity: std::cell::Cell<usize>,
     loc_resolution: glow::UniformLocation,
     loc_texture: glow::UniformLocation,
     loc_opacity: glow::UniformLocation,
@@ -94,6 +105,7 @@ impl ImageCache {
             program,
             vao,
             vbo,
+            vbo_capacity: std::cell::Cell::new(0),
             loc_resolution,
             loc_texture,
             loc_opacity,
@@ -102,11 +114,11 @@ impl ImageCache {
 
     /// Number of textures currently allocated in VRAM cache.
     pub fn len(&self) -> usize {
-        self.textures.len()
+        self.textures.values().map(|iv| iv.variants.iter().filter(|v| v.entry.is_some()).count()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.textures.is_empty()
+        self.len() == 0
     }
 
     /// Retrieves an existing GPU texture or uploads from disk via ImageService with LRU eviction.
@@ -116,28 +128,56 @@ impl ImageCache {
         target_w: u32,
         target_h: u32,
     ) -> Option<(glow::NativeTexture, u32, u32)> {
-        let key = format!("{}::{}x{}", src, target_w, target_h);
         self.access_counter = self.access_counter.wrapping_add(1);
         let current_access = self.access_counter;
 
-        if let Some(entry) = self.textures.get_mut(&key) {
-            entry.last_used = current_access;
-            return Some((entry.texture, entry.width, entry.height));
+        // Zero-allocation cache lookup using &str directly without format!
+        if let Some(iv) = self.textures.get_mut(src) {
+            if let Some(variant) = iv.variants.iter_mut().find(|v| v.width == target_w && v.height == target_h) {
+                if let Some(ref mut entry) = variant.entry {
+                    entry.last_used = current_access;
+                    return Some((entry.texture, entry.width, entry.height));
+                } else {
+                    // Cached failure: never repeat disk I/O on invalid/missing images
+                    return None;
+                }
+            }
         }
 
-        let decoded = zenith_services::ImageService::load_image(src, Some(target_w), Some(target_h)).ok()?;
+        let decoded = match zenith_services::ImageService::load_image(src, Some(target_w), Some(target_h)) {
+            Ok(d) => d,
+            Err(_) => {
+                // Cache failure in memory so we do not attempt disk/decode operations again
+                let entry = self.textures.entry(src.to_string()).or_insert_with(|| ImageVariants { variants: Vec::new() });
+                entry.variants.push(TextureVariant {
+                    width: target_w,
+                    height: target_h,
+                    entry: None,
+                });
+                return None;
+            }
+        };
 
         unsafe {
             // LRU eviction: when exceeding MAX_TEXTURE_CAPACITY (256), delete the least recently used texture
-            if self.textures.len() >= MAX_TEXTURE_CAPACITY {
-                if let Some((oldest_key, _)) = self
-                    .textures
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(k, v)| (k.clone(), v.last_used))
-                {
-                    if let Some(evicted) = self.textures.remove(&oldest_key) {
-                        self.gl.delete_texture(evicted.texture);
+            if self.len() >= MAX_TEXTURE_CAPACITY {
+                let mut oldest: Option<(String, u32, u32, u64)> = None;
+                for (s, iv) in &self.textures {
+                    for v in &iv.variants {
+                        if let Some(ref e) = v.entry {
+                            if oldest.as_ref().map(|(_, _, _, lu)| e.last_used < *lu).unwrap_or(true) {
+                                oldest = Some((s.clone(), v.width, v.height, e.last_used));
+                            }
+                        }
+                    }
+                }
+                if let Some((old_src, old_w, old_h, _)) = oldest {
+                    if let Some(iv) = self.textures.get_mut(&old_src) {
+                        if let Some(pos) = iv.variants.iter().position(|v| v.width == old_w && v.height == old_h) {
+                            if let Some(evicted) = iv.variants.remove(pos).entry {
+                                self.gl.delete_texture(evicted.texture);
+                            }
+                        }
                     }
                 }
             }
@@ -163,15 +203,17 @@ impl ImageCache {
 
             self.gl.bind_texture(glow::TEXTURE_2D, None);
 
-            self.textures.insert(
-                key,
-                TextureEntry {
+            let entry = self.textures.entry(src.to_string()).or_insert_with(|| ImageVariants { variants: Vec::new() });
+            entry.variants.push(TextureVariant {
+                width: target_w,
+                height: target_h,
+                entry: Some(TextureEntry {
                     texture,
                     width: decoded.width,
                     height: decoded.height,
                     last_used: current_access,
-                },
-            );
+                }),
+            });
 
             Some((texture, decoded.width, decoded.height))
         }
@@ -216,11 +258,20 @@ impl ImageCache {
         self.gl.uniform_1_i32(Some(&self.loc_texture), 0);
 
         self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+        let needed_bytes = vertices.len() * std::mem::size_of::<f32>();
         let slice = std::slice::from_raw_parts(
             vertices.as_ptr() as *const u8,
-            vertices.len() * std::mem::size_of::<f32>(),
+            needed_bytes,
         );
-        self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, slice, glow::DYNAMIC_DRAW);
+        let cur_cap = self.vbo_capacity.get();
+        if needed_bytes <= cur_cap {
+            self.gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, slice);
+        } else {
+            let new_cap = needed_bytes.next_power_of_two().max(256);
+            self.gl.buffer_data_size(glow::ARRAY_BUFFER, new_cap as i32, glow::DYNAMIC_DRAW);
+            self.gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, slice);
+            self.vbo_capacity.set(new_cap);
+        }
 
         self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
 
@@ -233,8 +284,12 @@ impl ImageCache {
 impl Drop for ImageCache {
     fn drop(&mut self) {
         unsafe {
-            for entry in self.textures.values() {
-                self.gl.delete_texture(entry.texture);
+            for image_variants in self.textures.values() {
+                for variant in &image_variants.variants {
+                    if let Some(ref entry) = variant.entry {
+                        self.gl.delete_texture(entry.texture);
+                    }
+                }
             }
             self.gl.delete_program(self.program);
             self.gl.delete_vertex_array(self.vao);

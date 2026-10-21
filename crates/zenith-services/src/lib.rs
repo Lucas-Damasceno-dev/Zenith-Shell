@@ -11,12 +11,18 @@ static AUDIO_CACHE: OnceLock<RwLock<(AudioSnapshot, Instant)>> = OnceLock::new()
 static MEM_CACHE: OnceLock<RwLock<(MemorySnapshot, Instant)>> = OnceLock::new();
 static CPU_PREV: OnceLock<Mutex<(u64, u64, u8, Instant)>> = OnceLock::new();
 static THEME_CACHE: OnceLock<RwLock<(ThemePalette, Instant)>> = OnceLock::new();
+static CPU_HISTORY: OnceLock<RwLock<RingBuffer<u8, 60>>> = OnceLock::new();
+static MEM_HISTORY: OnceLock<RwLock<RingBuffer<u8, 60>>> = OnceLock::new();
+static NET_STATS: OnceLock<RwLock<(RingBuffer<f32, 60>, RingBuffer<f32, 60>, Instant, u64, u64)>> = OnceLock::new();
 
 pub mod error;
 pub use error::{AudioError, DbusError, MprisError, NotificationError, ServiceError};
 
 pub mod dbus;
-pub use dbus::{get_session_connection, get_system_connection, resolve_session_bus_address, DbusConnectionProvider, DbusManager};
+pub use dbus::{
+    get_session_connection, get_shared_session_connection, get_shared_system_connection,
+    get_system_connection, resolve_session_bus_address, DbusConnectionProvider, DbusManager,
+};
 
 pub mod hyprland;
 pub use hyprland::{ActiveWindowSnapshot, ClientItem, HyprlandService, MonitorItem, WorkspaceItem, WorkspacesSnapshot};
@@ -94,6 +100,10 @@ pub struct BatterySnapshot {
     pub percentage: u8,
     pub status: String,
     pub is_charging: bool,
+    pub cycle_count: i32,
+    pub health_pct: u8,
+    pub model_name: String,
+    pub uptime_str: String,
 }
 
 /// Snapshot of system audio status via Pipewire/wpctl.
@@ -115,6 +125,54 @@ pub struct NetworkSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct CpuSnapshot {
     pub percent: u8,
+}
+
+/// Fixed-size circular ring-buffer for sparkline history without heap allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct RingBuffer<T: Copy + Default, const N: usize> {
+    pub data: [T; N],
+    pub head: usize,
+    pub count: usize,
+}
+
+impl<T: Copy + Default, const N: usize> Default for RingBuffer<T, N> {
+    fn default() -> Self {
+        Self {
+            data: [T::default(); N],
+            head: 0,
+            count: 0,
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> RingBuffer<T, N> {
+    pub fn push(&mut self, item: T) {
+        self.data[self.head] = item;
+        self.head = (self.head + 1) % N;
+        if self.count < N {
+            self.count += 1;
+        }
+    }
+
+    /// Read historical entries in chronological order into a fixed array.
+    pub fn as_ordered_slice(&self) -> [T; N] {
+        let mut out = [T::default(); N];
+        if self.count == 0 {
+            return out;
+        }
+        let start = if self.count < N { 0 } else { self.head };
+        for i in 0..self.count {
+            out[i] = self.data[(start + i) % N];
+        }
+        out
+    }
+}
+
+/// Snapshot of network bandwidth rate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkBandwidthSnapshot {
+    pub rx_kb_sec: f32,
+    pub tx_kb_sec: f32,
 }
 
 
@@ -263,7 +321,7 @@ impl SystemService {
         }
     }
 
-    /// Read memory metrics from `/proc/meminfo` with non-blocking 800ms cache.
+    /// Read memory metrics from `/proc/meminfo` with non-blocking 800ms cache without heap allocations.
     pub fn memory_snapshot() -> MemorySnapshot {
         let cache_lock = MEM_CACHE.get_or_init(|| {
             RwLock::new((
@@ -278,15 +336,21 @@ impl SystemService {
             }
         }
 
-        let content = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let mut mem_buf = [0u8; 1024];
         let mut total_kb: u64 = 0;
         let mut avail_kb: u64 = 0;
 
-        for line in content.lines() {
-            if line.starts_with("MemTotal:") {
-                total_kb = parse_meminfo_kb(line);
-            } else if line.starts_with("MemAvailable:") {
-                avail_kb = parse_meminfo_kb(line);
+        if let Ok(mut file) = fs::File::open("/proc/meminfo") {
+            use std::io::Read;
+            if let Ok(n) = file.read(&mut mem_buf) {
+                let content = String::from_utf8_lossy(&mem_buf[..n]);
+                for line in content.lines() {
+                    if line.starts_with("MemTotal:") {
+                        total_kb = parse_meminfo_kb(line);
+                    } else if line.starts_with("MemAvailable:") {
+                        avail_kb = parse_meminfo_kb(line);
+                    }
+                }
             }
         }
 
@@ -309,6 +373,11 @@ impl SystemService {
 
         if let Ok(mut guard) = cache_lock.write() {
             *guard = (snap.clone(), Instant::now());
+        }
+
+        let hist_lock = MEM_HISTORY.get_or_init(|| RwLock::new(RingBuffer::default()));
+        if let Ok(mut h) = hist_lock.write() {
+            h.push(percent);
         }
 
         snap
@@ -340,16 +409,76 @@ impl SystemService {
 
                     let is_charging = status.eq_ignore_ascii_case("Charging");
 
+                    let cycle_count = fs::read_to_string(entry.path().join("cycle_count"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .unwrap_or(-1);
+
+                    let model_name = fs::read_to_string(entry.path().join("model_name"))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| "Primary Battery".to_string());
+
+                    let energy_full = fs::read_to_string(entry.path().join("energy_full"))
+                        .or_else(|_| fs::read_to_string(entry.path().join("charge_full")))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<f64>().ok());
+
+                    let energy_full_design = fs::read_to_string(entry.path().join("energy_full_design"))
+                        .or_else(|_| fs::read_to_string(entry.path().join("charge_full_design")))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<f64>().ok());
+
+                    let health_pct = match (energy_full, energy_full_design) {
+                        (Some(full), Some(design)) if design > 0.0 => {
+                            ((full / design) * 100.0).clamp(0.0, 100.0).round() as u8
+                        }
+                        _ => 100,
+                    };
+
+                    let uptime_str = fs::read_to_string("/proc/uptime")
+                        .ok()
+                        .and_then(|s| {
+                            let sec = s.split_whitespace().next()?.parse::<f64>().ok()? as u64;
+                            let h = sec / 3600;
+                            let m = (sec % 3600) / 60;
+                            Some(format!("{}h {}m", h, m))
+                        })
+                        .unwrap_or_else(|| "0h 0m".to_string());
+
                     return Some(BatterySnapshot {
                         percentage: cap,
                         status,
                         is_charging,
+                        cycle_count,
+                        health_pct,
+                        model_name,
+                        uptime_str,
                     });
                 }
             }
         }
 
         None
+    }
+
+    /// Queries current volume and mute status from PipeWire / WirePlumber.
+    pub fn query_wpctl_snapshot() -> Option<AudioSnapshot> {
+        let output = std::process::Command::new("wpctl")
+            .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            let is_muted = s.contains("[MUTED]");
+            let vol_str = s.trim_start().strip_prefix("Volume:")?.trim();
+            let vol_val_str = vol_str.split_whitespace().next()?;
+            let vol_f = vol_val_str.parse::<f32>().ok()?;
+            let volume = (vol_f * 100.0).round().clamp(0.0, 150.0) as u8;
+            Some(AudioSnapshot { volume, is_muted })
+        } else {
+            None
+        }
     }
 
     /// Invalidate cached audio snapshot when external PipeWire / WirePlumber events occur.
@@ -364,10 +493,8 @@ impl SystemService {
     /// Atomically mutate cached audio state for 0ms reactive UI feedback.
     pub fn update_audio_cache<F: FnOnce(&mut AudioSnapshot)>(f: F) -> AudioSnapshot {
         let cache_lock = AUDIO_CACHE.get_or_init(|| {
-            RwLock::new((
-                AudioSnapshot { volume: 75, is_muted: false },
-                Instant::now() - Duration::from_secs(10),
-            ))
+            let initial = Self::query_wpctl_snapshot().unwrap_or(AudioSnapshot { volume: 75, is_muted: false });
+            RwLock::new((initial, Instant::now() - Duration::from_secs(10)))
         });
         let mut guard = match cache_lock.write() {
             Ok(g) => g,
@@ -380,12 +507,39 @@ impl SystemService {
 
     /// Read audio sink volume and mute state via non-blocking zero-fork cache.
     pub fn audio_snapshot() -> AudioSnapshot {
+        static FETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let cache_lock = AUDIO_CACHE.get_or_init(|| {
-            RwLock::new((
-                AudioSnapshot { volume: 75, is_muted: false },
-                Instant::now(),
-            ))
+            let initial = Self::query_wpctl_snapshot().unwrap_or(AudioSnapshot { volume: 75, is_muted: false });
+            RwLock::new((initial, Instant::now()))
         });
+
+        let needs_update = if let Ok(guard) = cache_lock.read() {
+            guard.1.elapsed() >= Duration::from_millis(1000)
+        } else {
+            false
+        };
+
+        if needs_update {
+            if let Ok(mut guard) = cache_lock.write() {
+                guard.1 = Instant::now();
+            }
+            if !FETCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::Builder::new()
+                    .name("audio-cache-update".into())
+                    .spawn(move || {
+                        if let Some(real_snap) = Self::query_wpctl_snapshot() {
+                            if let Some(lock) = AUDIO_CACHE.get() {
+                                if let Ok(mut guard) = lock.write() {
+                                    guard.0 = real_snap;
+                                    guard.1 = Instant::now();
+                                }
+                            }
+                        }
+                        FETCHING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .ok();
+            }
+        }
 
         match cache_lock.read() {
             Ok(guard) => guard.0.clone(),
@@ -477,6 +631,12 @@ impl SystemService {
                                     new_percent = (((used_delta as f64 / total_delta as f64) * 100.0).round() as u8).min(100);
                                 }
                                 *guard = (total, idle, new_percent, Instant::now());
+
+                                let hist_lock = CPU_HISTORY.get_or_init(|| RwLock::new(RingBuffer::default()));
+                                if let Ok(mut h) = hist_lock.write() {
+                                    h.push(new_percent);
+                                }
+
                                 return CpuSnapshot { percent: new_percent };
                             }
                         }
@@ -487,6 +647,108 @@ impl SystemService {
         }
 
         CpuSnapshot { percent: 12 }
+    }
+
+    /// Read network bandwidth delta throughput from `/proc/net/dev` with zero heap allocations.
+    pub fn network_bandwidth_snapshot() -> NetworkBandwidthSnapshot {
+        let stats_lock = NET_STATS.get_or_init(|| {
+            RwLock::new((
+                RingBuffer::default(),
+                RingBuffer::default(),
+                Instant::now() - Duration::from_secs(10),
+                0,
+                0,
+            ))
+        });
+
+        let mut net_buf = [0u8; 1024];
+        let mut total_rx = 0u64;
+        let mut total_tx = 0u64;
+
+        if let Ok(mut file) = fs::File::open("/proc/net/dev") {
+            use std::io::Read;
+            if let Ok(n) = file.read(&mut net_buf) {
+                let content = String::from_utf8_lossy(&net_buf[..n]);
+                for line in content.lines().skip(2) {
+                    if let Some((iface, metrics)) = line.split_once(':') {
+                        let iface_clean = iface.trim();
+                        if iface_clean == "lo" {
+                            continue;
+                        }
+                        let cols: Vec<&str> = metrics.split_whitespace().collect();
+                        if cols.len() >= 9 {
+                            let rx: u64 = cols[0].parse().unwrap_or(0);
+                            let tx: u64 = cols[8].parse().unwrap_or(0);
+                            total_rx += rx;
+                            total_tx += tx;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut guard) = stats_lock.write() {
+            let (ref mut rx_ring, ref mut tx_ring, ref mut last_time, prev_rx, prev_tx) = *guard;
+            let elapsed = last_time.elapsed().as_secs_f32();
+            let mut rx_rate = 0.0f32;
+            let mut tx_rate = 0.0f32;
+
+            if elapsed > 0.0 && prev_rx > 0 && total_rx >= prev_rx {
+                rx_rate = ((total_rx - prev_rx) as f32 / 1024.0) / elapsed;
+                tx_rate = ((total_tx.saturating_sub(prev_tx)) as f32 / 1024.0) / elapsed;
+            }
+
+            rx_ring.push(rx_rate);
+            tx_ring.push(tx_rate);
+            *last_time = Instant::now();
+            guard.3 = total_rx;
+            guard.4 = total_tx;
+
+            NetworkBandwidthSnapshot {
+                rx_kb_sec: rx_rate,
+                tx_kb_sec: tx_rate,
+            }
+        } else {
+            NetworkBandwidthSnapshot::default()
+        }
+    }
+
+    /// Returns 60-point historical CPU load percentages for canvas sparklines.
+    pub fn cpu_history() -> [u8; 60] {
+        let hist_lock = CPU_HISTORY.get_or_init(|| RwLock::new(RingBuffer::default()));
+        if let Ok(h) = hist_lock.read() {
+            h.as_ordered_slice()
+        } else {
+            [0u8; 60]
+        }
+    }
+
+    /// Returns 60-point historical Memory load percentages for canvas sparklines.
+    pub fn memory_history() -> [u8; 60] {
+        let hist_lock = MEM_HISTORY.get_or_init(|| RwLock::new(RingBuffer::default()));
+        if let Ok(h) = hist_lock.read() {
+            h.as_ordered_slice()
+        } else {
+            [0u8; 60]
+        }
+    }
+
+    /// Returns 60-point historical Network bandwidth (rx, tx in KB/s) for canvas sparklines.
+    pub fn network_history() -> ([f32; 60], [f32; 60]) {
+        let stats_lock = NET_STATS.get_or_init(|| {
+            RwLock::new((
+                RingBuffer::default(),
+                RingBuffer::default(),
+                Instant::now() - Duration::from_secs(10),
+                0,
+                0,
+            ))
+        });
+        if let Ok(g) = stats_lock.read() {
+            (g.0.as_ordered_slice(), g.1.as_ordered_slice())
+        } else {
+            ([0.0f32; 60], [0.0f32; 60])
+        }
     }
 
     /// Reads compositor identity or Hyprland active state if present.

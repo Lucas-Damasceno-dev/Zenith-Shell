@@ -25,6 +25,10 @@ pub struct MonitorItem {
     pub refresh_rate: f32,
     pub scale: f32,
     pub focused: bool,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
 }
 
 /// Individual workspace status item.
@@ -110,7 +114,42 @@ impl HyprlandService {
 
     /// Retrieve current client windows snapshot.
     pub fn clients_snapshot() -> Vec<ClientItem> {
+        static LAST_SYNC: OnceLock<std::sync::Mutex<std::time::Instant>> = OnceLock::new();
         let state = Self::get_state();
+
+        let should_sync = {
+            let mut sync_lock = LAST_SYNC
+                .get_or_init(|| std::sync::Mutex::new(std::time::Instant::now() - Duration::from_secs(1)))
+                .lock()
+                .unwrap();
+            if sync_lock.elapsed() >= Duration::from_millis(150) {
+                *sync_lock = std::time::Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_sync {
+            let (is_hypr, socket_dir) = {
+                let r = state.read().unwrap();
+                (r.is_hyprland, r.socket_dir.clone())
+            };
+            if is_hypr {
+                let cmd_sock = socket_dir
+                    .map(|d| d.join(".socket.sock"))
+                    .or_else(|| resolve_hypr_dir().map(|d| d.join(".socket.sock")));
+                if let Some(sock) = cmd_sock {
+                    if let Ok(resp) = send_socket_command(&sock, "j/clients") {
+                        let clients = parse_clients_json(&resp);
+                        if let Ok(mut w) = state.write() {
+                            w.clients = clients;
+                        }
+                    }
+                }
+            }
+        }
+
         let r = state.read().unwrap();
         r.clients.clone()
     }
@@ -135,6 +174,8 @@ impl HyprlandService {
                     refresh_rate: item["refreshRate"].as_f64().unwrap_or(60.0) as f32,
                     scale: item["scale"].as_f64().unwrap_or(1.0) as f32,
                     focused: item["focused"].as_bool().unwrap_or(false),
+                    x: item["x"].as_i64().unwrap_or(0) as i32,
+                    y: item["y"].as_i64().unwrap_or(0) as i32,
                 });
             }
             list
@@ -158,6 +199,8 @@ impl HyprlandService {
                 refresh_rate: 60.0,
                 scale: 1.0,
                 focused: true,
+                x: 0,
+                y: 0,
             }]
         }
     }
@@ -576,6 +619,8 @@ impl HyprlandService {
                         refresh_rate: 60.0,
                         scale: 1.0,
                         focused: true,
+                        x: 0,
+                        y: 0,
                     }],
                     gaps_out: 10,
                     socket_dir: None,
@@ -680,6 +725,10 @@ fn resync_hyprland_state(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
             for item in items {
                 let id = item["id"].as_i64().unwrap_or(1) as i32;
                 let name = item["name"].as_str().unwrap_or("").to_string();
+                if id < 0 || name.starts_with("special") {
+                    continue;
+                }
+                let urgent = item["urgent"].as_bool().unwrap_or(false);
                 let monitor = item["monitor"].as_str().unwrap_or("").to_string();
                 let windows = item["windows"].as_u64().unwrap_or(0) as u32;
                 workspaces.push(WorkspaceItem {
@@ -687,7 +736,7 @@ fn resync_hyprland_state(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
                     name,
                     monitor,
                     active: id == active_workspace,
-                    urgent: false,
+                    urgent,
                     windows,
                 });
             }
@@ -710,12 +759,22 @@ fn resync_hyprland_state(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
         clients = parse_clients_json(&resp);
     }
 
+    let mut monitors = Vec::new();
+    if let Ok(resp) = send_socket_command(cmd_sock, "j/monitors") {
+        monitors = HyprlandService::parse_monitors_json(&resp);
+    }
+    let gaps_out = query_gaps_out(cmd_sock);
+
     if let Ok(mut w) = state.write() {
         w.is_hyprland = true;
         w.active_workspace = active_workspace;
         w.workspaces = workspaces;
         w.active_window = active_window;
         w.clients = clients;
+        if !monitors.is_empty() {
+            w.monitors = monitors;
+        }
+        w.gaps_out = gaps_out;
     }
     notify_change();
 }
@@ -813,6 +872,7 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     }
                     ensure_minimum_workspaces(&mut w.workspaces, ws_id, 4);
                 }
+                resync_clients(cmd_sock, state);
                 notify_focus_change();
                 changed = true;
             }
@@ -846,7 +906,9 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 changed = true;
             }
             "activewindowv2" => {
+                resync_clients(cmd_sock, state);
                 let addr = data.split(',').next().unwrap_or("").trim().to_string();
+                let has_focused_client = !addr.is_empty() && addr != ",";
                 let mut w = state.write().unwrap();
                 w.active_window.address = addr.clone();
                 let client_info = w.clients.iter().find(|c| {
@@ -858,10 +920,15 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     w.active_window.class = cls;
                     w.active_window.title = ttl;
                 }
+                drop(w);
+                if has_focused_client {
+                    notify_focus_change();
+                }
                 changed = true;
             }
             "activewindow" => {
                 // Format: WINDOWCLASS,WINDOWTITLE
+                resync_clients(cmd_sock, state);
                 let (class, title) = if let Some((c, t)) = data.split_once(',') {
                     (c.trim().to_string(), t.trim().to_string())
                 } else {
@@ -883,18 +950,20 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     data.trim()
                 };
                 if let Ok(id) = ws_str.parse::<i32>() {
-                    let mut w = state.write().unwrap();
-                    if !w.workspaces.iter().any(|item| item.id == id) {
-                        let active_id = w.active_workspace;
-                        w.workspaces.push(WorkspaceItem {
-                            id,
-                            name: ws_str.to_string(),
-                            monitor: String::new(),
-                            active: id == active_id,
-                            urgent: false,
-                            windows: 0,
-                        });
-                        w.workspaces.sort_by_key(|item| item.id);
+                    if id > 0 && !data.contains("special") {
+                        let mut w = state.write().unwrap();
+                        if !w.workspaces.iter().any(|item| item.id == id) {
+                            let active_id = w.active_workspace;
+                            w.workspaces.push(WorkspaceItem {
+                                id,
+                                name: ws_str.to_string(),
+                                monitor: String::new(),
+                                active: id == active_id,
+                                urgent: false,
+                                windows: 0,
+                            });
+                            w.workspaces.sort_by_key(|item| item.id);
+                        }
                     }
                 }
                 changed = true;
@@ -1146,6 +1215,8 @@ mod tests {
                 height: 1080,
                 refresh_rate: 60.0,
                 scale: 1.0,
+                x: 0,
+                y: 0,
                 focused: false,
             }],
             socket_dir: None,

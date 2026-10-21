@@ -335,29 +335,23 @@ impl<const N: usize> DamageRing<N> {
                 return Some(full_rect);
             }
 
-            let cur = match current_damage {
-                Some(d) => d,
-                None => {
-                    self.history[self.current_idx] = None;
-                    self.current_idx = (self.current_idx + 1) % N;
-                    return None;
-                }
-            };
-
-            let mut accumulated = cur;
+            let mut accumulated: Option<DamageRect> = current_damage;
             let age_usize = age as usize;
             for step in 1..age_usize {
                 let slot = (self.current_idx + N - step) % N;
                 if let Some(prev) = self.history[slot] {
-                    accumulated = accumulated.union(&prev);
+                    accumulated = match accumulated {
+                        Some(acc) => Some(acc.union(&prev)),
+                        None => Some(prev),
+                    };
                 }
             }
 
-            self.history[self.current_idx] = Some(cur);
+            self.history[self.current_idx] = current_damage;
             self.current_idx = (self.current_idx + 1) % N;
             self.initialized_count = (self.initialized_count + 1).min(N);
 
-            Some(accumulated.clamp_to_viewport(viewport_width, viewport_height))
+            accumulated.map(|r| r.clamp_to_viewport(viewport_width, viewport_height))
         } else {
             self.rotate_damage(current_damage, viewport_width, viewport_height)
         }

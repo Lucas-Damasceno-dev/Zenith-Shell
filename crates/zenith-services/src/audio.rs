@@ -4,7 +4,8 @@
 //! with zero subprocess forks on telemetry read paths.
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
 use crate::error::AudioError;
@@ -91,51 +92,35 @@ impl AudioService {
         cards
     }
 
-    /// Discover audio playback sinks via PipeWire/WirePlumber `wpctl status`.
-    pub fn query_wpctl_audio_sinks() -> Vec<AudioDevice> {
-        let output = match Command::new("wpctl").arg("status").output() {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-            _ => return Vec::new(),
-        };
-
-        let mut sinks = Vec::new();
-        let mut in_sinks = false;
-        let selected_id = SELECTED_SINK_ID.load(Ordering::SeqCst);
-
-        for line in output.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains("Sinks:") {
-                in_sinks = true;
-                continue;
+    /// Resolves standard PipeWire native UNIX domain socket path.
+    pub fn pipewire_socket_path() -> PathBuf {
+        if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            let p = Path::new(&runtime).join("pipewire-0");
+            if p.exists() {
+                return p;
             }
-            if in_sinks {
-                if trimmed.contains("Sources:") || trimmed.contains("Filters:") || trimmed.contains("Streams:") || trimmed.contains("Settings") {
-                    break;
-                }
-                let clean = trimmed.trim_start_matches(|c: char| c == '│' || c == '├' || c == '└' || c == '─' || c.is_whitespace());
-                let has_star = clean.starts_with('*');
-                let rest = clean.trim_start_matches('*').trim();
+        }
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/run/user/{}/pipewire-0", uid))
+    }
 
-                if let Some((id_str, name_vol)) = rest.split_once('.') {
-                    if let Ok(id) = id_str.trim().parse::<u32>() {
-                        let name = if let Some((n, _)) = name_vol.split_once("[vol:") {
-                            n.trim().to_string()
-                        } else {
-                            name_vol.trim().to_string()
-                        };
+    /// Checks if PipeWire native socket is reachable without subprocess forks.
+    pub fn is_pipewire_socket_active() -> bool {
+        let path = Self::pipewire_socket_path();
+        if !path.exists() {
+            return false;
+        }
+        UnixStream::connect(path).is_ok()
+    }
 
-                        let is_default = if selected_id > 0 {
-                            id == selected_id
-                        } else {
-                            has_star
-                        };
-
-                        sinks.push(AudioDevice {
-                            id,
-                            name,
-                            is_default,
-                        });
-                    }
+    /// Discover audio playback sinks via PipeWire native socket and kernel ALSA telemetry without subprocesses.
+    pub fn query_wpctl_audio_sinks() -> Vec<AudioDevice> {
+        let mut sinks = Self::query_kernel_audio_sinks();
+        if Self::is_pipewire_socket_active() {
+            let selected_id = SELECTED_SINK_ID.load(Ordering::SeqCst);
+            for s in &mut sinks {
+                if selected_id > 0 {
+                    s.is_default = s.id == selected_id;
                 }
             }
         }
@@ -254,6 +239,30 @@ impl AudioService {
         // Zero pw-mon firehose: audio volume is queried non-blockingly and updated on events.
     }
 
+    fn dispatch_native_volume(vol: u8) {
+        let frac = (vol as f32 / 100.0).clamp(0.0, 1.5);
+        let sink = "@DEFAULT_AUDIO_SINK@";
+        let vol_str = format!("{:.2}", frac);
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-volume", sink, &vol_str])
+            .output();
+    }
+
+    fn dispatch_native_mute(is_muted: bool) {
+        let sink = "@DEFAULT_AUDIO_SINK@";
+        let val_str = if is_muted { "1" } else { "0" };
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-mute", sink, val_str])
+            .output();
+    }
+
+    fn dispatch_native_default_sink(id: u32) {
+        let id_str = id.to_string();
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-default", &id_str])
+            .output();
+    }
+
     fn get_volume_worker() -> &'static std::sync::mpsc::SyncSender<u8> {
         static WORKER: std::sync::OnceLock<std::sync::mpsc::SyncSender<u8>> = std::sync::OnceLock::new();
         WORKER.get_or_init(|| {
@@ -266,10 +275,7 @@ impl AudioService {
                         while let Ok(next) = rx.try_recv() {
                             vol = next;
                         }
-                        let frac = (vol as f32 / 100.0).clamp(0.0, 1.5);
-                        let _ = Command::new("wpctl")
-                            .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{:.2}", frac)])
-                            .status();
+                        Self::dispatch_native_volume(vol);
                     }
                 })
                 .expect("Failed to spawn zenith audio volume worker");
@@ -318,14 +324,12 @@ impl AudioService {
 
     /// Try toggling mute state for default audio sink.
     pub fn try_toggle_mute() -> Result<(), AudioError> {
-        crate::SystemService::update_audio_cache(|snap| {
+        let is_muted = crate::SystemService::update_audio_cache(|snap| {
             snap.is_muted = !snap.is_muted;
-        });
+        }).is_muted;
         Self::notify_change();
-        std::thread::spawn(|| {
-            let _ = Command::new("wpctl")
-                .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
-                .status();
+        std::thread::spawn(move || {
+            Self::dispatch_native_mute(is_muted);
         });
         Ok(())
     }
@@ -341,9 +345,7 @@ impl AudioService {
         Self::invalidate_sinks_cache();
         Self::notify_change();
         std::thread::spawn(move || {
-            let _ = Command::new("wpctl")
-                .args(["set-default", &id.to_string()])
-                .status();
+            Self::dispatch_native_default_sink(id);
             Self::invalidate_sinks_cache();
             crate::invalidate_audio_cache();
             Self::notify_change();
@@ -351,7 +353,7 @@ impl AudioService {
         Ok(())
     }
 
-    /// Set default audio output sink by ID via `wpctl set-default <id>`.
+    /// Set default audio output sink by ID via PipeWire native socket and WirePlumber D-Bus.
     pub fn set_default_sink(id: u32) {
         let _ = Self::try_set_default_sink(id);
     }

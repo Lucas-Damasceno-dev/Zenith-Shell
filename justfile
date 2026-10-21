@@ -46,6 +46,36 @@ close:
 inspect:
     cargo run -q -p zenith-cli -- inspect
 
+# Single Compiler Gatekeeper: serialized cargo check via file lock to avoid lock contention
+gate-check:
+    flock -w 120 /tmp/zenith_cargo.lock {{cargo_bin}} check --workspace
+
+# Single Compiler Gatekeeper: serialized cargo test via file lock
+gate-test:
+    flock -w 180 /tmp/zenith_cargo.lock {{cargo_bin}} test --workspace
+
+# Single Compiler Gatekeeper: run headless off-screen test suites
+gate-headless:
+    flock -w 180 /tmp/zenith_cargo.lock {{cargo_bin}} test -p zenith-tests --test headless_suites -- --nocapture
+
+# Single Compiler Gatekeeper: run hot-reload latency benchmarks (< 10ms SLA)
+gate-bench:
+    flock -w 180 /tmp/zenith_cargo.lock {{cargo_bin}} test -p zenith-tests --test bench_hot_reload -- --nocapture
+
+# Single Compiler Gatekeeper: run VmRSS stability tests (< 15MB SLA)
+gate-memory:
+    flock -w 180 /tmp/zenith_cargo.lock {{cargo_bin}} test -p zenith-tests --test memory_vmrss -- --nocapture
+
+# Fast-path for UI/Luau agents: static assertions without triggering Cargo locks
+test-fast:
+    python3 tests/validate_custom_suite.py
+    python3 tests/test_luau_syntax.py
+    python3 tests/test_dock_magnification.py
+
+# Isolated per-agent fast-check: 100% parallel with zero lock contention
+agent-check agent crate="":
+    CARGO_TARGET_DIR=target/agents/{{agent}} {{cargo_bin}} check {{ if crate != "" { "-p " + crate } else { "" } }}
+
 # Check cargo workspace without building binaries
 check:
     {{cargo_bin}} check --workspace

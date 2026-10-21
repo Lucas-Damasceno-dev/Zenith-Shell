@@ -321,7 +321,7 @@ pub async fn inspect_item_async(conn: &zbus::Connection, service_path: &str) -> 
         id: if id.is_empty() { service.to_string() } else { id },
         title: if title.is_empty() { service.to_string() } else { title },
         icon_name: if icon_name.is_empty() { "󰀻".to_string() } else { icon_name },
-        service: service.to_string(),
+        service: service_path.to_string(),
     })
 }
 

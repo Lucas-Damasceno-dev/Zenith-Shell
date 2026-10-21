@@ -2505,10 +2505,11 @@ dependencies = [
 
 [[package]]
 name = "zenith-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
+ "libc",
  "notify",
  "serde_json",
  "smithay-client-toolkit",
@@ -2521,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -2530,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-layout"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "cosmic-text",
  "taffy",
@@ -2541,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-runtime"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "mlua",
  "serde",
@@ -2555,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-services"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "png",
@@ -2570,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-tests"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -2584,13 +2585,14 @@ dependencies = [
 
 [[package]]
 name = "zenith-wayland"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
  "cosmic-text",
  "glow",
  "khronos-egl",
+ "serde",
  "serde_json",
  "smithay-client-toolkit",
  "thiserror",

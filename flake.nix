@@ -1,15 +1,11 @@
 {
-  description = "Zenith-Shell (Engine v2) — Wayland Desktop Shell Framework in Rust + Luau";
+  description = "Zenith-Shell (Engine Base v3) — Wayland Desktop Shell Framework in Rust + Luau";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    quickshell = {
-      url = "git+https://git.outfoxxed.me/outfoxxed/quickshell";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, quickshell, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
@@ -32,7 +28,7 @@
         rec {
           zenith-shell = pkgs.rustPlatform.buildRustPackage {
             pname = "zenith-shell";
-            version = "0.2.0";
+            version = "0.3.0";
             src = ./.;
 
             cargoLock = {
@@ -59,6 +55,7 @@
             postInstall = ''
               mkdir -p $out/share/zenith
               cp -r config/zenith/* $out/share/zenith/
+              ln -sf $out/bin/zenith $out/bin/zenith-cli
             '';
 
             meta = with pkgs.lib; {
@@ -105,7 +102,7 @@
         }
       );
 
-      homeManagerModules.default = import ./nix/home-manager.nix { inherit self quickshell; };
+      homeManagerModules.default = import ./nix/home-manager.nix { inherit self; };
       homeManagerModules.zenith-shell = self.homeManagerModules.default;
     };
 }

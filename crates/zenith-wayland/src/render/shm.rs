@@ -3,6 +3,11 @@
 use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache};
 use zenith_layout::ComputedBox;
 
+thread_local! {
+    static SHM_TEXT_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new_empty(Metrics::new(14.0, 18.0)));
+    static SHM_IMAGE_CACHE: std::cell::RefCell<std::collections::HashMap<(String, u32, u32), Option<tiny_skia::Pixmap>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 pub struct ShmFallbackRenderer;
 
 impl ShmFallbackRenderer {
@@ -42,13 +47,14 @@ impl ShmFallbackRenderer {
         font_system: &mut FontSystem,
         swash_cache: &mut SwashCache,
         damage_rect: Option<crate::render::damage::DamageRect>,
+        scale_factor: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let alpha_factor = spring_val.clamp(0.0, 1.0);
         let scale_y = (0.88 + 0.12 * spring_val.clamp(0.0, 1.15)).max(0.0);
         let scale_x = (0.95 + 0.05 * spring_val.clamp(0.0, 1.15)).max(0.0);
 
         let root_max_y = if !boxes.is_empty() {
-            boxes[0].y + boxes[0].height
+            (boxes[0].y + boxes[0].height) * scale_factor
         } else {
             height as f32
         };
@@ -63,21 +69,34 @@ impl ShmFallbackRenderer {
                     continue;
                 }
 
-                if i > 0 && b.y >= root_max_y - 2.0 {
+                let bx = b.x * scale_factor;
+                let by = b.y * scale_factor;
+                let bw = b.width * scale_factor;
+                let bh = b.height * scale_factor;
+                let border_radius = b.border_radius * scale_factor;
+                let border_width = b.border_width * scale_factor;
+
+                if i > 0 && by >= root_max_y - 2.0 * scale_factor {
                     continue;
                 }
 
-                let shadow_pad = b.shadow.as_ref().map(|s| s.blur * 2.5).unwrap_or(2.0);
+                let shadow_blur = b.shadow.as_ref().map(|s| s.blur * scale_factor).unwrap_or(0.0);
+                let shadow_pad = if shadow_blur > 0.0 { shadow_blur * 2.5 } else { 2.0 * scale_factor };
                 if let Some(rect) = damage_rect {
-                    if !rect.intersects_box_with_padding(b, shadow_pad) {
+                    if !rect.intersects_rect(
+                        (bx - shadow_pad) as i32,
+                        (by - shadow_pad) as i32,
+                        (bw + shadow_pad * 2.0) as i32,
+                        (bh + shadow_pad * 2.0) as i32,
+                    ) {
                         continue;
                     }
                 }
 
-                let cx = b.x + b.width * 0.5;
-                let cy = b.y;
-                let box_w = b.width * scale_x;
-                let mut box_h = b.height * scale_y;
+                let cx = bx + bw * 0.5;
+                let cy = by;
+                let box_w = bw * scale_x;
+                let mut box_h = bh * scale_y;
                 if i > 0 && cy + box_h > root_max_y {
                     box_h = (root_max_y - cy).max(0.0);
                     if box_h <= 1.0 {
@@ -94,15 +113,18 @@ impl ShmFallbackRenderer {
                 // Multi-pass drop shadow
                 if let Some(ref shadow) = b.shadow {
                     if shadow.color.a > 0 && shadow.blur > 0.0 {
-                        let steps = ((shadow.blur / 2.0).ceil() as usize).clamp(2, 5);
+                        let blur = shadow.blur * scale_factor;
+                        let offset_x = shadow.offset_x * scale_factor;
+                        let offset_y = shadow.offset_y * scale_factor;
+                        let steps = ((blur / 2.0).ceil() as usize).clamp(2, 5);
                         let base_alpha = shadow.color.a as f32 / (steps as f32 * 1.5);
                         for i in 1..=steps {
-                            let spread = (i as f32 / steps as f32) * shadow.blur;
-                            let sx = box_x + shadow.offset_x - spread * 0.5;
-                            let sy = box_y + shadow.offset_y - spread * 0.5;
+                            let spread = (i as f32 / steps as f32) * blur;
+                            let sx = box_x + offset_x - spread * 0.5;
+                            let sy = box_y + offset_y - spread * 0.5;
                             let sw = box_w + spread;
                             let sh = box_h + spread;
-                            let sr = (b.border_radius + spread * 0.5).max(0.0);
+                            let sr = (border_radius + spread * 0.5).max(0.0);
                             if let Some(spath) = Self::build_rounded_rect_path(sx, sy, sw, sh, sr) {
                                 let mut spaint = tiny_skia::Paint {
                                     anti_alias: true,
@@ -122,7 +144,7 @@ impl ShmFallbackRenderer {
                     }
                 }
 
-                let path = match Self::build_rounded_rect_path(box_x, box_y, box_w, box_h, b.border_radius) {
+                let path = match Self::build_rounded_rect_path(box_x, box_y, box_w, box_h, border_radius) {
                     Some(p) => p,
                     None => continue,
                 };
@@ -143,7 +165,7 @@ impl ShmFallbackRenderer {
                 }
 
                 // Stroke border
-                if b.border_width > 0.0 && b.border_color.a > 0 {
+                if border_width > 0.0 && b.border_color.a > 0 {
                     let mut stroke_paint = tiny_skia::Paint {
                         anti_alias: true,
                         ..Default::default()
@@ -155,7 +177,7 @@ impl ShmFallbackRenderer {
                         (b.border_color.a as f32 * alpha_factor) as u8,
                     );
                     let stroke = tiny_skia::Stroke {
-                        width: b.border_width,
+                        width: border_width,
                         ..Default::default()
                     };
                     pixmap.stroke_path(&path, &stroke_paint, &stroke, tiny_skia::Transform::identity(), None);
@@ -165,19 +187,32 @@ impl ShmFallbackRenderer {
                 if let Some(ref src) = b.image {
                     let target_w = (box_w.round() as u32).max(1);
                     let target_h = (box_h.round() as u32).max(1);
-                    if let Ok(decoded) = zenith_services::ImageService::load_image(src, Some(target_w), Some(target_h)) {
-                        if let Some(src_pixmap) = tiny_skia::PixmapRef::from_bytes(&decoded.rgba, decoded.width, decoded.height) {
-                            let scale_img_x = box_w / decoded.width as f32;
-                            let scale_img_y = box_h / decoded.height as f32;
+                    SHM_IMAGE_CACHE.with(|cache_cell| {
+                        let mut cache = cache_cell.borrow_mut();
+                        if cache.len() >= 128 {
+                            cache.clear();
+                        }
+                        let key = (src.clone(), target_w, target_h);
+                        let cached_opt = cache.entry(key).or_insert_with(|| {
+                            if let Ok(decoded) = zenith_services::ImageService::load_image(src, Some(target_w), Some(target_h)) {
+                                if let Some(size) = tiny_skia::IntSize::from_wh(decoded.width, decoded.height) {
+                                    return tiny_skia::Pixmap::from_vec(decoded.rgba, size);
+                                }
+                            }
+                            None
+                        });
+                        if let Some(ref src_pixmap) = cached_opt {
+                            let scale_img_x = box_w / src_pixmap.width() as f32;
+                            let scale_img_y = box_h / src_pixmap.height() as f32;
                             let transform = tiny_skia::Transform::from_translate(box_x, box_y).pre_scale(scale_img_x, scale_img_y);
                             let paint = tiny_skia::PixmapPaint {
                                 opacity: alpha_factor,
                                 blend_mode: tiny_skia::BlendMode::SourceOver,
                                 quality: tiny_skia::FilterQuality::Bilinear,
                             };
-                            pixmap.draw_pixmap(0, 0, src_pixmap, &paint, transform, None);
+                            pixmap.draw_pixmap(0, 0, src_pixmap.as_ref(), &paint, transform, None);
                         }
-                    }
+                    });
                 }
 
                 // TextInput focus outline
@@ -198,7 +233,7 @@ impl ShmFallbackRenderer {
 
                 // Render Zenith.Slider
                 if let Some(ref sl) = b.slider {
-                    let track_h = sl.track_height.max(2.0);
+                    let track_h = (sl.track_height * scale_factor).max(2.0 * scale_factor);
                     let track_y = box_y + (box_h - track_h) * 0.5;
                     let norm = ((sl.value - sl.min) / (sl.max - sl.min).max(0.001)).clamp(0.0, 1.0);
 
@@ -230,10 +265,10 @@ impl ShmFallbackRenderer {
                     }
 
                     // Thumb
-                    let thumb_d = sl.thumb_radius * 2.0;
+                    let thumb_d = sl.thumb_radius * 2.0 * scale_factor;
                     let thumb_x = (box_x + norm * (box_w - thumb_d)).clamp(box_x, box_x + box_w - thumb_d);
                     let thumb_y = box_y + (box_h - thumb_d) * 0.5;
-                    if let Some(thumb_path) = Self::build_rounded_rect_path(thumb_x, thumb_y, thumb_d, thumb_d, sl.thumb_radius) {
+                    if let Some(thumb_path) = Self::build_rounded_rect_path(thumb_x, thumb_y, thumb_d, thumb_d, sl.thumb_radius * scale_factor) {
                         let mut thumb_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
                         thumb_paint.set_color_rgba8(
                             sl.thumb_color.r,
@@ -261,13 +296,13 @@ impl ShmFallbackRenderer {
                     }
 
                     // Sliding thumb
-                    let thumb_d = (box_h - 4.0).max(4.0);
+                    let thumb_d = (box_h - 4.0 * scale_factor).max(4.0 * scale_factor);
                     let thumb_r = thumb_d * 0.5;
-                    let thumb_y = box_y + 2.0;
+                    let thumb_y = box_y + 2.0 * scale_factor;
                     let thumb_x = if sw.checked {
-                        box_x + box_w - thumb_d - 2.0
+                        box_x + box_w - thumb_d - 2.0 * scale_factor
                     } else {
-                        box_x + 2.0
+                        box_x + 2.0 * scale_factor
                     };
                     if let Some(thumb_path) = Self::build_rounded_rect_path(thumb_x, thumb_y, thumb_d, thumb_d, thumb_r) {
                         let mut thumb_paint = tiny_skia::Paint { anti_alias: true, ..Default::default() };
@@ -283,60 +318,72 @@ impl ShmFallbackRenderer {
             }
         }
 
-        // Pass 2: cosmic-text glyphs
-        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 18.0));
-        for b in boxes {
-            if b.y >= root_max_y - 2.0 {
-                continue;
-            }
-            if let Some(rect) = damage_rect {
-                if !rect.intersects_box_with_padding(b, 4.0) {
+        // Pass 2: cosmic-text glyphs (reusing thread-local Buffer)
+        SHM_TEXT_BUFFER.with(|buf_cell| {
+            let mut buffer = buf_cell.borrow_mut();
+            for b in boxes {
+                let bx_orig = b.x * scale_factor;
+                let by_orig = b.y * scale_factor;
+                let bw_orig = b.width * scale_factor;
+                let bh_orig = b.height * scale_factor;
+
+                if by_orig >= root_max_y - 2.0 * scale_factor {
                     continue;
                 }
-            }
+                if let Some(rect) = damage_rect {
+                    if !rect.intersects_rect(
+                        (bx_orig - 4.0 * scale_factor) as i32,
+                        (by_orig - 4.0 * scale_factor) as i32,
+                        (bw_orig + 8.0 * scale_factor) as i32,
+                        (bh_orig + 8.0 * scale_factor) as i32,
+                    ) {
+                        continue;
+                    }
+                }
 
-            let text_to_draw: Option<(std::borrow::Cow<'_, str>, zenith_layout::Color, f32)> = if let Some((ref text, color, font_size)) = b.text {
-                Some((std::borrow::Cow::Borrowed(text.as_str()), color, font_size))
-            } else if let Some(ref input) = b.text_input {
-                let (txt, col) = if input.text.is_empty() {
-                    (std::borrow::Cow::Borrowed(input.placeholder.as_str()), input.placeholder_color)
-                } else if input.active {
-                    (std::borrow::Cow::Owned(format!("{}|", input.text)), input.color)
+                let text_to_draw: Option<(std::borrow::Cow<'_, str>, zenith_layout::Color, f32)> = if let Some((ref text, color, font_size)) = b.text {
+                    Some((std::borrow::Cow::Borrowed(text.as_str()), color, font_size * scale_factor))
+                } else if let Some(ref input) = b.text_input {
+                    let (txt, col) = if input.text.is_empty() {
+                        (std::borrow::Cow::Borrowed(input.placeholder.as_str()), input.placeholder_color)
+                    } else if input.active {
+                        (std::borrow::Cow::Owned(format!("{}|", input.text)), input.color)
+                    } else {
+                        (std::borrow::Cow::Borrowed(input.text.as_str()), input.color)
+                    };
+                    Some((txt, col, input.font_size * scale_factor))
                 } else {
-                    (std::borrow::Cow::Borrowed(input.text.as_str()), input.color)
+                    None
                 };
-                Some((txt, col, input.font_size))
-            } else {
-                None
-            };
 
-            if let Some((text, color, font_size)) = text_to_draw {
-                let line_height = font_size * 1.3;
-                let metrics = Metrics::new(font_size, line_height);
-                buffer.set_metrics(metrics);
-                let is_complex = text.chars().any(|c| c as u32 > 0x0600);
-                let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
-                let font_family = std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string());
-                buffer.set_text(
-                    &text,
-                    &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
-                    shaping,
-                    None,
-                );
-                buffer.shape_until_scroll(font_system, false);
+                if let Some((text, color, font_size)) = text_to_draw {
+                    let line_height = font_size * 1.3;
+                    let metrics = Metrics::new(font_size, line_height);
+                    buffer.set_metrics(metrics);
+                    let is_complex = text.chars().any(|c| c as u32 > 0x0600);
+                    let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
+                    static FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                    let font_family = FONT.get_or_init(|| std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string()));
+                    buffer.set_text(
+                        &text,
+                        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(font_family)),
+                        shaping,
+                        None,
+                    );
+                    buffer.shape_until_scroll(font_system, false);
 
-                let cosmic_color = cosmic_text::Color::rgba(
-                    color.r,
-                    color.g,
-                    color.b,
-                    (color.a as f32 * alpha_factor) as u8,
-                );
-                let cx = b.x + b.width * 0.5;
-                let cy = b.y;
-                let box_w = b.width * scale_x;
-                let box_h = b.height * scale_y;
-                let box_x = cx - box_w * 0.5;
-                let box_y = cy;
+                    let cosmic_color = cosmic_text::Color::rgba(
+                        color.r,
+                        color.g,
+                        color.b,
+                        (color.a as f32 * alpha_factor) as u8,
+                    );
+                    let cx = bx_orig + bw_orig * 0.5;
+                    let cy = by_orig;
+                    let box_w = bw_orig * scale_x;
+                    let box_h = bh_orig * scale_y;
+                    let box_x = cx - box_w * 0.5;
+                    let box_y = cy;
 
                 let bx = box_x as i32;
                 let text_offset_y = ((box_h - line_height) / 2.0).max(0.0) as i32;
@@ -384,6 +431,7 @@ impl ShmFallbackRenderer {
                 );
             }
         }
+        });
 
         Ok(())
     }

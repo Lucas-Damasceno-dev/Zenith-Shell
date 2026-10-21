@@ -72,3 +72,28 @@ pub fn get_session_connection() -> Result<zbus::blocking::Connection, DbusError>
 pub fn get_system_connection() -> Result<zbus::blocking::Connection, DbusError> {
     zbus::blocking::Connection::system().map_err(DbusError::from)
 }
+
+static SESSION_SINGLETON: std::sync::OnceLock<std::sync::Arc<zbus::blocking::Connection>> = std::sync::OnceLock::new();
+static SYSTEM_SINGLETON: std::sync::OnceLock<std::sync::Arc<zbus::blocking::Connection>> = std::sync::OnceLock::new();
+
+/// Returns a shared, persistent session bus connection singleton.
+pub fn get_shared_session_connection() -> Result<std::sync::Arc<zbus::blocking::Connection>, DbusError> {
+    if let Some(conn) = SESSION_SINGLETON.get() {
+        return Ok(conn.clone());
+    }
+    let conn = get_session_connection()?;
+    let arc = std::sync::Arc::new(conn);
+    let _ = SESSION_SINGLETON.set(arc.clone());
+    Ok(arc)
+}
+
+/// Returns a shared, persistent system bus connection singleton.
+pub fn get_shared_system_connection() -> Result<std::sync::Arc<zbus::blocking::Connection>, DbusError> {
+    if let Some(conn) = SYSTEM_SINGLETON.get() {
+        return Ok(conn.clone());
+    }
+    let conn = get_system_connection()?;
+    let arc = std::sync::Arc::new(conn);
+    let _ = SYSTEM_SINGLETON.set(arc.clone());
+    Ok(arc)
+}

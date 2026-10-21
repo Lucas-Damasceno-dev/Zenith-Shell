@@ -53,13 +53,74 @@ struct CachedState {
 
 static CACHE: OnceLock<Arc<RwLock<CachedState>>> = OnceLock::new();
 static IS_QUERYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MONITOR_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MPRIS_LISTENER: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 /// MPRIS2 Media Controller service.
 pub struct MprisService;
 
 impl MprisService {
+    /// Register a change listener triggered on active media mutations.
+    pub fn set_change_listener<F: Fn() + Send + Sync + 'static>(listener: F) {
+        let _ = MPRIS_LISTENER.set(Arc::new(listener));
+    }
+
+    fn notify_change() {
+        if let Some(cb) = MPRIS_LISTENER.get() {
+            cb();
+        }
+    }
+
+    fn ensure_signal_monitor_spawned() {
+        if !MONITOR_INITIALIZED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::thread::Builder::new()
+                .name("zenith-mpris-monitor".into())
+                .spawn(|| {
+                    if let Ok(conn) = crate::dbus::get_session_connection() {
+                        let _ = conn.call_method(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            Some("org.freedesktop.DBus"),
+                            "AddMatch",
+                            &("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.mpris.MediaPlayer2.Player'"),
+                        );
+                        let _ = conn.call_method(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            Some("org.freedesktop.DBus"),
+                            "AddMatch",
+                            &("type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged'"),
+                        );
+
+                        for msg in zbus::blocking::MessageIterator::from(&conn) {
+                            if let Ok(msg) = msg {
+                                let header = msg.header();
+                                if let Some(member) = header.member() {
+                                    let member_str = member.as_str();
+                                    if member_str == "PropertiesChanged" || member_str == "NameOwnerChanged" {
+                                        let (fresh_snap, bus_name) = Self::query_active_player();
+                                        if let Some(cache_arc) = CACHE.get() {
+                                            if let Ok(mut writer) = cache_arc.write() {
+                                                writer.snapshot = fresh_snap;
+                                                writer.active_bus_name = bus_name;
+                                                writer.last_query = Instant::now();
+                                            }
+                                        }
+                                        Self::notify_change();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
+
     /// Retrieve current media player snapshot, returning MprisError if lock poisoned.
     pub fn try_snapshot() -> Result<MediaSnapshot, MprisError> {
+        Self::ensure_signal_monitor_spawned();
+
         let cache_arc = CACHE.get_or_init(|| {
             Arc::new(RwLock::new(CachedState {
                 last_query: Instant::now() - Duration::from_secs(10),
@@ -68,20 +129,12 @@ impl MprisService {
             }))
         });
 
-        let (snap, need_refresh) = {
+        let need_initial_query = {
             let r = cache_arc.read().map_err(|e| MprisError::LockPoisoned(e.to_string()))?;
-            let threshold = if r.snapshot.is_available {
-                Duration::from_millis(1500)
-            } else {
-                Duration::from_millis(3500)
-            };
-            (r.snapshot.clone(), r.last_query.elapsed() >= threshold)
+            !r.snapshot.is_available && r.last_query.elapsed() >= Duration::from_secs(10)
         };
 
-        if need_refresh && !IS_QUERYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            if let Ok(mut w) = cache_arc.write() {
-                w.last_query = Instant::now();
-            }
+        if need_initial_query && !IS_QUERYING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let c_arc = cache_arc.clone();
             std::thread::spawn(move || {
                 let (fresh_snap, bus_name) = Self::query_active_player();
@@ -91,10 +144,12 @@ impl MprisService {
                     writer.last_query = Instant::now();
                 }
                 IS_QUERYING.store(false, std::sync::atomic::Ordering::SeqCst);
+                Self::notify_change();
             });
         }
 
-        Ok(snap)
+        let r = cache_arc.read().map_err(|e| MprisError::LockPoisoned(e.to_string()))?;
+        Ok(r.snapshot.clone())
     }
 
     /// Retrieve current media player snapshot, cached non-blockingly.
@@ -105,7 +160,7 @@ impl MprisService {
     /// Dispatch media transport control command with rich error diagnostics.
     pub fn try_control(cmd: &str) -> Result<(), MprisError> {
         let dbus_method = match cmd.to_ascii_lowercase().as_str() {
-            "play-pause" | "playpause" | "toggle" => "PlayPause",
+            "play-pause" | "playpause" | "play_pause" | "toggle" => "PlayPause",
             "next" => "Next",
             "prev" | "previous" => "Previous",
             "stop" => "Stop",

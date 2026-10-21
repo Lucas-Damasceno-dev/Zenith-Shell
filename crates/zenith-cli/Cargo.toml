@@ -24,3 +24,5 @@ calloop = "0.13"
 calloop-wayland-source = "0.3"
 notify = "8.0"
 serde_json = "1.0"
+libc = "0.2"
+

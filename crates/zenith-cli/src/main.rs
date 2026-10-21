@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -47,6 +47,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             send_socket_command(&format!("eval {}", code))
         }
         "repl" => run_repl(),
+        "sync" => send_socket_command("settings:sync"),
+        "reset-defaults" => send_socket_command("settings:reload"),
+        "bluetooth-toggle" => {
+            let _ = zenith_services::BluetoothService::toggle_power();
+            Ok(())
+        }
+        "wallpaper" => {
+            let action = args.get(2).map(|s| s.as_str()).unwrap_or("pick");
+            if action == "pick" {
+                let script = std::env::var("HOME")
+                    .map(|h| format!("{}/.config/hypr/scripts/random-wallpaper.sh", h))
+                    .unwrap_or_else(|_| "config/hypr/scripts/random-wallpaper.sh".to_string());
+                let _ = std::process::Command::new("bash").arg(script).arg("--next").status();
+            }
+            Ok(())
+        }
+        "theme" => {
+            let action = args.get(2).map(|s| s.as_str()).unwrap_or("generate");
+            if action == "generate" {
+                let script = std::env::var("HOME")
+                    .map(|h| format!("{}/.config/hypr/scripts/random-wallpaper.sh", h))
+                    .unwrap_or_else(|_| "config/hypr/scripts/random-wallpaper.sh".to_string());
+                let _ = std::process::Command::new("bash").arg(script).arg("--reload-colors").status();
+            }
+            Ok(())
+        }
+        "launcher" => {
+            if args.get(2).map(|s| s.as_str()) == Some("filter") {
+                if let Some(cat) = args.get(3) {
+                    send_socket_command(&format!("eval Zenith.Storage.set('launcher_category', '{}')", cat))?;
+                }
+            }
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -225,8 +259,12 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     if let Err(e) = app.reload_script(&code) {
                         error!("Luau script error on hot-reload: {}", e);
                     } else {
+                        app.sync_autohide_settings();
+                        let _ = app.update_bar_visibility();
+                        let _ = app.update_dock_visibility();
                         let elapsed = start.elapsed();
                         info!("Hot-reload successfully applied in {:?}!", elapsed);
+                        needs_redraw_cb.store(true, Ordering::Release);
                     }
                 }
                 AppEvent::ReloadActiveTrees => {
@@ -234,20 +272,43 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     zenith_services::LauncherService::reload();
                     zenith_services::XdgIconResolver::invalidate_cache();
                     let start = std::time::Instant::now();
+                    app.sync_autohide_settings();
+                    let _ = app.update_bar_visibility();
+                    let _ = app.update_dock_visibility();
                     app.reload_active_trees();
                     let elapsed = start.elapsed();
                     info!("Active trees and Luau module cache reloaded in {:?}!", elapsed);
                     needs_redraw_cb.store(true, Ordering::Release);
                 }
                 AppEvent::Redraw => {
-                    needs_redraw_cb.store(true, Ordering::Release);
+                    app.sync_autohide_settings();
+                    let prev_bar_hidden = app.bar_hidden;
+                    let prev_dock_hidden = app.dock_hidden;
+                    if app.bar_last_leave.is_none() {
+                        let _ = app.update_bar_visibility();
+                    }
+                    if app.dock_last_leave.is_none() {
+                        let _ = app.update_dock_visibility();
+                    }
+                    let visibility_changed = prev_bar_hidden != app.bar_hidden || prev_dock_hidden != app.dock_hidden;
+                    let has_visible = !app.bar_hidden || !app.dock_hidden || app.popup.is_some();
+                    if (has_visible || visibility_changed) && !app.runtime.is_idle() {
+                        needs_redraw_cb.store(true, Ordering::Release);
+                    }
                 }
                 AppEvent::DismissPopup => {
                     if let Some(ref popup) = app.popup {
-                        if popup.id != "lock" && popup.id != "lockscreen" {
+                        if !popup.id.eq_ignore_ascii_case("lock") && !popup.id.eq_ignore_ascii_case("lockscreen") {
                             app.close_popup();
                         }
                     }
+                    if app.bar_last_leave.is_none() {
+                        let _ = app.update_bar_visibility();
+                    }
+                    if app.dock_last_leave.is_none() {
+                        let _ = app.update_dock_visibility();
+                    }
+                    needs_redraw_cb.store(true, Ordering::Release);
                 }
             }
         }
@@ -337,11 +398,10 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
 
                     let res = match app.runtime.storage.set(&key, json_val.clone()) {
                         Ok(_) => {
-                            if key == "barAutoHide" || key == "bar.autoHide" {
-                                app.bar_autohide = json_val.as_bool().unwrap_or(true);
-                            } else if key == "dockAutoHide" || key == "dock.autoHide" {
-                                app.dock_autohide = json_val.as_bool().unwrap_or(true);
-                            }
+                            app.sync_autohide_settings();
+                            let _ = app.update_bar_visibility();
+                            let _ = app.update_dock_visibility();
+                            app.reload_active_trees();
                             cmd_needs_redraw.store(true, Ordering::Release);
                             let _ = app.request_redraw();
                             format!("OK: setting '{}' set to {}\n", key, json_val)
@@ -368,6 +428,9 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                 ShellCommand::SettingsReload(tx) => {
                     let resp = match app.runtime.storage.reload_from_config() {
                         Ok(_) => {
+                            app.sync_autohide_settings();
+                            let _ = app.update_bar_visibility();
+                            let _ = app.update_dock_visibility();
                             app.reload_active_trees();
                             cmd_needs_redraw.store(true, Ordering::Release);
                             let _ = app.request_redraw();
@@ -379,7 +442,7 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                 }
                 ShellCommand::Lock => {
                     info!("IPC command: lock screen");
-                    let _ = app.open_popup("lock");
+                    app.lock_session();
                     cmd_needs_redraw.store(true, Ordering::Release);
                     let _ = app.request_redraw();
                 }
@@ -390,118 +453,13 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
         }
     })?;
 
-    // Bind UNIX domain control socket
+    // Bind UNIX domain control socket using hardened IPC server (0600 perms, SO_PEERCRED, 1s timeout, 64KB cap)
     let sock_path = resolve_socket_path();
-    if sock_path.exists() {
-        let _ = fs::remove_file(&sock_path);
-    }
-
-    let listener = UnixListener::bind(&sock_path)?;
-    info!("IPC control socket listening at: {}", sock_path.display());
-
     let socket_cmd_sender = cmd_sender.clone();
-    let inspect_sock_path = sock_path.clone();
-
-    std::thread::spawn(move || {
-        for stream_res in listener.incoming() {
-            let mut stream = match stream_res {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            let mut reader = BufReader::new(&stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
-                continue;
-            }
-
-            let trimmed = line.trim();
-            if trimmed == "reload" {
-                let _ = socket_cmd_sender.send(ShellCommand::Reload);
-                let _ = stream.write_all(b"OK: reload scheduled\n");
-            } else if let Some(stripped) = trimmed.strip_prefix("toggle ") {
-                let id = stripped.trim().to_string();
-                let _ = socket_cmd_sender.send(ShellCommand::Toggle(id));
-                let _ = stream.write_all(b"OK: toggle dispatched\n");
-            } else if let Some(stripped) = trimmed.strip_prefix("open ") {
-                let id = stripped.trim().to_string();
-                let _ = socket_cmd_sender.send(ShellCommand::Open(id));
-                let _ = stream.write_all(b"OK: open dispatched\n");
-            } else if trimmed == "close" {
-                let _ = socket_cmd_sender.send(ShellCommand::Close);
-                let _ = stream.write_all(b"OK: close dispatched\n");
-            } else if trimmed == "lock" {
-                let _ = socket_cmd_sender.send(ShellCommand::Open("lock".to_string()));
-                let _ = stream.write_all(b"OK: native lock screen activated\n");
-            } else if trimmed == "inspect" {
-                let (vmrss_mb, heap_mb) = read_self_memory();
-                let resp = format!(
-                    "{{\"status\":\"running\",\"vmrss_mb\":{:.2},\"heap_mb\":{:.2},\"socket\":\"{}\"}}\n",
-                    vmrss_mb, heap_mb, inspect_sock_path.display()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            } else if trimmed == "inspect:toggle" || trimmed == "inspect-toggle" {
-                let _ = socket_cmd_sender.send(ShellCommand::ToggleInspect);
-                let _ = stream.write_all(b"OK: inspect mode toggled\n");
-            } else if let Some(stripped) = trimmed.strip_prefix("eval ") {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = socket_cmd_sender.send(ShellCommand::Eval(stripped.to_string(), tx));
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(resp) => {
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                    Err(_) => {
-                        let _ = stream.write_all(b"ERR: eval timeout\n");
-                    }
-                }
-            } else if let Some(stripped) = trimmed.strip_prefix("settings:get ") {
-                let key = stripped.trim().to_string();
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = socket_cmd_sender.send(ShellCommand::SettingsGet(key, tx));
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
-                    Err(_) => { let _ = stream.write_all(b"ERR: settings get timeout\n"); }
-                }
-            } else if let Some(stripped) = trimmed.strip_prefix("settings:set ") {
-                let parts: Vec<&str> = stripped.trim().splitn(2, ' ').collect();
-                if parts.len() == 2 {
-                    let key = parts[0].to_string();
-                    let val = parts[1].to_string();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let _ = socket_cmd_sender.send(ShellCommand::SettingsSet(key, val, tx));
-                    match rx.recv_timeout(Duration::from_secs(5)) {
-                        Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
-                        Err(_) => { let _ = stream.write_all(b"ERR: settings set timeout\n"); }
-                    }
-                } else {
-                    let _ = stream.write_all(b"ERR: invalid settings:set format (expected: settings:set <key> <val>)\n");
-                }
-            } else if trimmed == "settings:list" || trimmed == "settings:all" {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = socket_cmd_sender.send(ShellCommand::SettingsList(tx));
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
-                    Err(_) => { let _ = stream.write_all(b"ERR: settings list timeout\n"); }
-                }
-            } else if trimmed == "settings:sync" {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = socket_cmd_sender.send(ShellCommand::SettingsSync(tx));
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
-                    Err(_) => { let _ = stream.write_all(b"ERR: settings sync timeout\n"); }
-                }
-            } else if trimmed == "settings:reload" {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = socket_cmd_sender.send(ShellCommand::SettingsReload(tx));
-                match rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(resp) => { let _ = stream.write_all(resp.as_bytes()); }
-                    Err(_) => { let _ = stream.write_all(b"ERR: settings reload timeout\n"); }
-                }
-            } else {
-                let _ = stream.write_all(b"ERR: unknown command\n");
-            }
-        }
-    });
+    let _ipc_handle = zenith_cli::start_ipc_server(sock_path.clone(), move |cmd| {
+        let _ = socket_cmd_sender.send(cmd);
+        None
+    }).map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     // Hook Hyprland compositor IPC change listener for sub-10ms UI updates (zero disk I/O)
     let hypr_sender = event_sender.clone();
@@ -535,6 +493,18 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                        // Prevent feedback loops with StorageEngine by ignoring config/storage files and temp rename files
+                        let is_ephemeral_or_config = event.paths.iter().any(|p| {
+                            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            name == "config.json"
+                                || name == "storage.json"
+                                || name.contains(".tmp.")
+                                || name.ends_with(".tmp")
+                        });
+                        if is_ephemeral_or_config {
+                            return;
+                        }
+
                         let is_main_script = event.paths.iter().any(|p| p == &watch_path);
                         let is_overlay_or_lib = event.paths.iter().any(|p| {
                             let s = p.to_string_lossy();
@@ -593,10 +563,17 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
     let mut last_draw = std::time::Instant::now() - Duration::from_millis(100);
 
     while app.running {
+        let autohide_delay = app.get_autohide_delay();
+        let leave_timeout = [app.dock_last_leave, app.bar_last_leave]
+            .into_iter()
+            .flatten()
+            .map(|t| autohide_delay.saturating_sub(t.elapsed()))
+            .min();
+
         let timeout = if needs_redraw.load(Ordering::Acquire) {
             Some(Duration::from_millis(8))
-        } else if app.dock_last_leave.is_some() || app.bar_last_leave.is_some() {
-            Some(Duration::from_millis(40))
+        } else if let Some(lt) = leave_timeout {
+            Some(lt.max(Duration::from_millis(1)))
         } else if app.tooltip_hover.is_some() {
             Some(Duration::from_millis(50))
         } else {
@@ -615,23 +592,30 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             }
         }
 
+        if app.runtime.check_close_requested() {
+            app.close_popup();
+            needs_redraw.store(true, Ordering::Release);
+        }
+
         // Handle dock auto-hide debounce timer when cursor leaves dock
         if let Some(leave_time) = app.dock_last_leave {
-            if leave_time.elapsed() >= Duration::from_millis(300) {
+            if leave_time.elapsed() >= autohide_delay {
                 app.dock_last_leave = None;
                 if let Err(e) = app.update_dock_visibility() {
                     error!("Failed to update dock auto-hide visibility: {}", e);
                 }
+                needs_redraw.store(true, Ordering::Release);
             }
         }
 
         // Handle bar auto-hide debounce timer when cursor leaves bar
         if let Some(leave_time) = app.bar_last_leave {
-            if leave_time.elapsed() >= Duration::from_millis(300) {
+            if leave_time.elapsed() >= autohide_delay {
                 app.bar_last_leave = None;
                 if let Err(e) = app.update_bar_visibility() {
                     error!("Failed to update bar auto-hide visibility: {}", e);
                 }
+                needs_redraw.store(true, Ordering::Release);
             }
         }
 
@@ -650,10 +634,6 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
 
     info!("Zenith Desktop Shell exited cleanly.");
     Ok(())
-}
-
-fn read_self_memory() -> (f64, f64) {
-    zenith_cli::read_self_memory()
 }
 
 fn dirs_config_path() -> Option<PathBuf> {

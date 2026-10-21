@@ -189,7 +189,7 @@ pub fn setup_async_bridge(
         },
     )?;
     zenith_table.set("spawn", spawn_fn.clone())?;
-    zenith_table.set("exec", spawn_fn)?;
+    zenith_table.set("spawn_async", spawn_fn)?;
 
     // Zenith.cancel(task_id): boolean
     let pool_cancel = Arc::clone(&pool);

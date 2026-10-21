@@ -69,7 +69,7 @@ struct BluetoothCache {
 }
 
 static CACHE: OnceLock<Arc<Mutex<BluetoothCache>>> = OnceLock::new();
-static IS_UPDATING: AtomicBool = AtomicBool::new(false);
+static MONITOR_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub struct BluetoothService;
 
@@ -78,30 +78,48 @@ impl BluetoothService {
         CACHE.get_or_init(|| {
             Arc::new(Mutex::new(BluetoothCache {
                 status: BluetoothStatus::default(),
-                last_update: Instant::now() - Duration::from_secs(10),
+                last_update: Instant::now() - Duration::from_secs(120),
             }))
         })
     }
 
+    fn ensure_signal_monitor_spawned() {
+        if !MONITOR_INITIALIZED.swap(true, Ordering::SeqCst) {
+            std::thread::Builder::new()
+                .name("zenith-bluetooth-monitor".into())
+                .spawn(|| {
+                    if let Ok(conn) = crate::dbus::get_system_connection() {
+                        let _ = conn.call_method(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            Some("org.freedesktop.DBus"),
+                            "AddMatch",
+                            &("type='signal',sender='org.bluez'"),
+                        );
+
+                        for _msg in zbus::blocking::MessageIterator::from(&conn) {
+                            let fresh = Self::query_system_status();
+                            let cache_arc = Self::cache();
+                            if let Ok(mut g) = cache_arc.lock() {
+                                g.status = fresh;
+                                g.last_update = Instant::now();
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
+
     /// Retrieve current Bluetooth controller and devices state non-blockingly.
     pub fn status() -> BluetoothStatus {
+        Self::ensure_signal_monitor_spawned();
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
 
-        if guard.last_update.elapsed() > Duration::from_millis(3000) {
+        if guard.last_update.elapsed() > Duration::from_secs(30) {
+            guard.status = Self::query_system_status();
             guard.last_update = Instant::now();
-
-            if !IS_UPDATING.swap(true, Ordering::SeqCst) {
-                let c_arc = cache_arc.clone();
-                std::thread::spawn(move || {
-                    let fresh = Self::query_system_status();
-                    if let Ok(mut g) = c_arc.lock() {
-                        g.status = fresh;
-                        g.last_update = Instant::now();
-                    }
-                    IS_UPDATING.store(false, Ordering::SeqCst);
-                });
-            }
         }
 
         guard.status.clone()

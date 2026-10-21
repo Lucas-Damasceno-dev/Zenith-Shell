@@ -13,11 +13,21 @@ use mlua::prelude::*;
 use serde_json::Value as JsonValue;
 use tracing::{error, info};
 
+use std::sync::mpsc::{channel, Sender};
+use std::time::Duration;
+
+enum StorageMsg {
+    SyncKey { key: String, val: JsonValue },
+    Flush(Sender<()>),
+    Shutdown,
+}
+
 /// Local storage engine handling key-value state persistence with bidirectional config.json sync.
 pub struct StorageEngine {
     file_path: PathBuf,
     config_path: Option<PathBuf>,
     cache: Arc<RwLock<HashMap<String, JsonValue>>>,
+    tx: Sender<StorageMsg>,
 }
 
 impl StorageEngine {
@@ -69,9 +79,12 @@ impl StorageEngine {
             ("quick", "lowPowerMode") => "lowPowerMode".to_string(),
             ("bar", "height") => "barHeight".to_string(),
             ("bar", "customRounding") => "barRadius".to_string(),
+            ("bar", "position") => "barPosition".to_string(),
+            ("bar", "autoHideDelayMs") | ("quick", "barAutoHideDelayMs") => "barAutoHideDelayMs".to_string(),
+            ("appearance", "blurOpacity") => "barGlassOpacity".to_string(),
             ("dock", "enable") => "dockEnabled".to_string(),
             ("dock", "height") => "dockHeight".to_string(),
-            ("dock", "autoHide") => "dockAutoHide".to_string(),
+            ("quick", "dockAutoHide") | ("dock", "autoHide") => "dockAutoHide".to_string(),
             ("dock", "enableBlurGlass") => "dockBlurGlass".to_string(),
             ("dock", "showMpris") => "dockShowMpris".to_string(),
             ("dock", "showTrash") => "dockShowTrash".to_string(),
@@ -124,9 +137,12 @@ impl StorageEngine {
             "lowPowerMode" => vec![("quick", "lowPowerMode")],
             "barHeight" => vec![("bar", "height")],
             "barRadius" => vec![("bar", "customRounding")],
+            "barPosition" => vec![("bar", "position")],
+            "barAutoHideDelayMs" => vec![("bar", "autoHideDelayMs")],
+            "barGlassOpacity" => vec![("appearance", "blurOpacity")],
             "dockEnabled" => vec![("dock", "enable")],
             "dockHeight" => vec![("dock", "height")],
-            "dockAutoHide" => vec![("dock", "autoHide")],
+            "dockAutoHide" => vec![("quick", "dockAutoHide"), ("dock", "autoHide")],
             "dockBlurGlass" => vec![("dock", "enableBlurGlass")],
             "dockShowMpris" => vec![("dock", "showMpris")],
             "dockShowTrash" => vec![("dock", "showTrash")],
@@ -199,9 +215,9 @@ impl StorageEngine {
                         }
                     }
                     if !found {
-                        if let Some(JsonValue::Object(ref mut quick_map)) = root_map.get_mut("quick") {
-                            quick_map.insert(key.to_string(), val.clone());
-                        }
+                        // Do not inject unknown/ephemeral session keys into config.json.
+                        // Ephemeral state remains safely persisted only in storage.json.
+                        return Ok(());
                     }
                 }
             }
@@ -245,15 +261,99 @@ impl StorageEngine {
             }
         }
 
+        let cache = Arc::new(RwLock::new(initial_data));
+        let tx = Self::start_worker(cache.clone(), file_path.clone(), config_path.clone());
+
         Self {
             file_path,
             config_path,
-            cache: Arc::new(RwLock::new(initial_data)),
+            cache,
+            tx,
         }
+    }
+
+    /// Starts a dedicated debounced persistence worker thread.
+    fn start_worker(
+        cache: Arc<RwLock<HashMap<String, JsonValue>>>,
+        file_path: PathBuf,
+        config_path: Option<PathBuf>,
+    ) -> Sender<StorageMsg> {
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("zenith-storage-debouncer".into())
+            .spawn(move || {
+                let debounce_duration = Duration::from_millis(100);
+                let mut pending_keys: HashMap<String, JsonValue> = HashMap::new();
+
+                loop {
+                    if !pending_keys.is_empty() {
+                        match rx.recv_timeout(debounce_duration) {
+                            Ok(StorageMsg::SyncKey { key, val }) => {
+                                pending_keys.insert(key, val);
+                            }
+                            Ok(StorageMsg::Flush(ack)) => {
+                                let _ = Self::flush_to_path(&cache, &file_path);
+                                if let Some(ref cp) = config_path {
+                                    for (k, v) in pending_keys.drain() {
+                                        let _ = Self::sync_key_to_config(cp, &k, &v);
+                                    }
+                                }
+                                let _ = ack.send(());
+                            }
+                            Ok(StorageMsg::Shutdown) => {
+                                let _ = Self::flush_to_path(&cache, &file_path);
+                                if let Some(ref cp) = config_path {
+                                    for (k, v) in pending_keys.drain() {
+                                        let _ = Self::sync_key_to_config(cp, &k, &v);
+                                    }
+                                }
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let _ = Self::flush_to_path(&cache, &file_path);
+                                if let Some(ref cp) = config_path {
+                                    for (k, v) in pending_keys.drain() {
+                                        let _ = Self::sync_key_to_config(cp, &k, &v);
+                                    }
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                let _ = Self::flush_to_path(&cache, &file_path);
+                                if let Some(ref cp) = config_path {
+                                    for (k, v) in pending_keys.drain() {
+                                        let _ = Self::sync_key_to_config(cp, &k, &v);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(StorageMsg::SyncKey { key, val }) => {
+                                pending_keys.insert(key, val);
+                            }
+                            Ok(StorageMsg::Flush(ack)) => {
+                                let _ = Self::flush_to_path(&cache, &file_path);
+                                let _ = ack.send(());
+                            }
+                            Ok(StorageMsg::Shutdown) => {
+                                break;
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn zenith-storage debouncer thread");
+
+        tx
     }
 
     /// Sets explicit config path (for testing and isolation).
     pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        let _ = self.tx.send(StorageMsg::Shutdown);
         self.config_path = path;
         let mut new_data = HashMap::new();
         if let Some(ref cp) = self.config_path {
@@ -269,6 +369,7 @@ impl StorageEngine {
             }
         }
         *self.cache.write().unwrap() = new_data;
+        self.tx = Self::start_worker(self.cache.clone(), self.file_path.clone(), self.config_path.clone());
         self
     }
 
@@ -289,7 +390,7 @@ impl StorageEngine {
         self.cache.read().unwrap().get(key).cloned()
     }
 
-    /// Sets a value for key and persists asynchronously to disk (both storage.json & config.json).
+    /// Sets a value for key and persists with debounced flush (100ms) to disk.
     pub fn set(&self, key: &str, val: JsonValue) -> Result<(), std::io::Error> {
         {
             let mut writer = self.cache.write().unwrap();
@@ -310,17 +411,10 @@ impl StorageEngine {
                 }
             }
         }
-        let cache_clone = self.cache.clone();
-        let path_clone = self.file_path.clone();
-        let config_path_clone = self.config_path.clone();
-        let key_str = key.to_string();
-        let val_clone = val;
 
-        std::thread::spawn(move || {
-            let _ = Self::flush_to_path(&cache_clone, &path_clone);
-            if let Some(ref cp) = config_path_clone {
-                let _ = Self::sync_key_to_config(cp, &key_str, &val_clone);
-            }
+        let _ = self.tx.send(StorageMsg::SyncKey {
+            key: key.to_string(),
+            val,
         });
         Ok(())
     }
@@ -361,11 +455,9 @@ impl StorageEngine {
             writer.remove(key).is_some()
         };
         if removed {
-            let cache_clone = self.cache.clone();
-            let path_clone = self.file_path.clone();
-            std::thread::spawn(move || {
-                let _ = Self::flush_to_path(&cache_clone, &path_clone);
-            });
+            let (ack_tx, ack_rx) = channel();
+            let _ = self.tx.send(StorageMsg::Flush(ack_tx));
+            let _ = ack_rx.recv();
         }
         Ok(removed)
     }
@@ -376,11 +468,9 @@ impl StorageEngine {
             let mut writer = self.cache.write().unwrap();
             writer.clear();
         }
-        let cache_clone = self.cache.clone();
-        let path_clone = self.file_path.clone();
-        std::thread::spawn(move || {
-            let _ = Self::flush_to_path(&cache_clone, &path_clone);
-        });
+        let (ack_tx, ack_rx) = channel();
+        let _ = self.tx.send(StorageMsg::Flush(ack_tx));
+        let _ = ack_rx.recv();
         Ok(())
     }
 
@@ -389,9 +479,15 @@ impl StorageEngine {
         self.cache.read().unwrap().clone()
     }
 
-    /// Explicitly flushes the cache to disk.
+    /// Explicitly flushes the cache to disk synchronously.
     pub fn flush(&self) -> Result<(), std::io::Error> {
-        Self::flush_to_path(&self.cache, &self.file_path)
+        let (ack_tx, ack_rx) = channel();
+        if self.tx.send(StorageMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        } else {
+            Self::flush_to_path(&self.cache, &self.file_path)?;
+        }
+        Ok(())
     }
 
     /// Atomically flushes the cache to disk via temporary file rename.
@@ -414,10 +510,18 @@ impl StorageEngine {
         {
             let mut file = File::create(&temp_path)?;
             file.write_all(json_str.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
         }
 
         fs::rename(&temp_path, file_path)?;
         Ok(())
+    }
+}
+
+impl Drop for StorageEngine {
+    fn drop(&mut self) {
+        let _ = self.tx.send(StorageMsg::Shutdown);
     }
 }
 

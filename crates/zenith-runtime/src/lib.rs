@@ -19,6 +19,120 @@ pub use spawner::{build_detached_command, parse_command_line, spawn_detached};
 pub use storage::StorageEngine;
 pub use worker::{TaskCompletion, TaskOutput, WorkerThreadPool};
 
+/// Opaque password buffer with volatile zeroization on drop and clear.
+#[derive(Default)]
+pub struct SecurePasswordBuffer {
+    bytes: Vec<u8>,
+}
+
+impl Drop for SecurePasswordBuffer {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl SecurePasswordBuffer {
+    pub fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    pub fn push_str(&mut self, s: &str) {
+        self.bytes.extend_from_slice(s.as_bytes());
+    }
+
+    pub fn pop(&mut self) {
+        if let Ok(s) = std::str::from_utf8(&self.bytes) {
+            if let Some(ch) = s.chars().last() {
+                let char_len = ch.len_utf8();
+                let new_len = self.bytes.len().saturating_sub(char_len);
+                for b in &mut self.bytes[new_len..] {
+                    unsafe { std::ptr::write_volatile(b, 0) };
+                }
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                self.bytes.truncate(new_len);
+            }
+        }
+    }
+
+    pub fn zeroize(&mut self) {
+        for b in &mut self.bytes {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn clear(&mut self) {
+        self.zeroize();
+        self.bytes.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        std::str::from_utf8(&self.bytes).map(|s| s.chars().count()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn take_password(&mut self) -> String {
+        let res = String::from_utf8_lossy(&self.bytes).to_string();
+        self.clear();
+        res
+    }
+}
+
+/// Anti-brute-force rate limiter with exponential backoff lockout after 3 failed attempts.
+#[derive(Default)]
+pub struct LockoutManager {
+    failed_attempts: usize,
+    lockout_until: Option<std::time::Instant>,
+}
+
+impl LockoutManager {
+    pub fn new() -> Self {
+        Self {
+            failed_attempts: 0,
+            lockout_until: None,
+        }
+    }
+
+    pub fn record_failure(&mut self) -> u64 {
+        self.failed_attempts += 1;
+        if self.failed_attempts >= 3 {
+            let exponent = (self.failed_attempts - 3).min(5);
+            let delay_secs = (2u64.pow(exponent as u32)).min(30);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(delay_secs);
+            self.lockout_until = Some(until);
+            delay_secs
+        } else {
+            0
+        }
+    }
+
+    pub fn record_success(&mut self) {
+        self.failed_attempts = 0;
+        self.lockout_until = None;
+    }
+
+    pub fn is_locked_out(&self) -> bool {
+        if let Some(until) = self.lockout_until {
+            std::time::Instant::now() < until
+        } else {
+            false
+        }
+    }
+
+    pub fn remaining_lockout_secs(&self) -> u64 {
+        if let Some(until) = self.lockout_until {
+            let now = std::time::Instant::now();
+            if until > now {
+                return (until - now).as_secs() + 1;
+            }
+        }
+        0
+    }
+}
+
 /// Runtime environment executing user Luau configs.
 pub struct LuauRuntime {
     lua: Lua,
@@ -26,6 +140,7 @@ pub struct LuauRuntime {
     pub worker_pool: Arc<WorkerThreadPool>,
     pub storage: Arc<StorageEngine>,
     pub is_idle: Arc<AtomicBool>,
+    pub close_requested: Arc<AtomicBool>,
     search_query: Arc<RwLock<String>>,
     selected_index: Arc<RwLock<usize>>,
     current_output: Arc<RwLock<String>>,
@@ -34,6 +149,8 @@ pub struct LuauRuntime {
     focused_input_id: Arc<RwLock<Option<String>>>,
     input_buffers: Arc<RwLock<HashMap<String, String>>>,
     editor_engines: Arc<RwLock<HashMap<String, zenith_layout::TextEditorEngine>>>,
+    pub lock_password: Arc<RwLock<SecurePasswordBuffer>>,
+    pub lockout: Arc<RwLock<LockoutManager>>,
 }
 
 impl LuauRuntime {
@@ -41,6 +158,7 @@ impl LuauRuntime {
     pub fn new() -> Result<Self, LuaError> {
         let lua = Lua::new();
         let is_idle = Arc::new(AtomicBool::new(false));
+        let close_requested = Arc::new(AtomicBool::new(false));
         let storage = Arc::new(StorageEngine::new(None));
         let search_query = Arc::new(RwLock::new(String::new()));
         let selected_index = Arc::new(RwLock::new(1usize));
@@ -50,6 +168,9 @@ impl LuauRuntime {
         let input_buffers = Arc::new(RwLock::new(HashMap::new()));
         let editor_engines = Arc::new(RwLock::new(HashMap::new()));
         let reactive = Arc::new(crate::reactive::ReactiveGraph::new());
+        let lock_password = Arc::new(RwLock::new(SecurePasswordBuffer::new()));
+        let lockout = Arc::new(RwLock::new(LockoutManager::new()));
+
 
         // Inject global `Zenith` module
         let zenith_table = lua.create_table()?;
@@ -141,10 +262,50 @@ impl LuauRuntime {
         })?;
         zenith_table.set("set_input_text", set_buf_fn)?;
 
+        // LockScreen Secure Password & Anti-Brute-Force Bindings
+        let lp_clone1 = lock_password.clone();
+        let lock_len_fn = lua.create_function(move |_, ()| {
+            let len = lp_clone1.read().unwrap().len();
+            Ok(len)
+        })?;
+        zenith_table.set("lock_pass_len", lock_len_fn.clone())?;
+        zenith_table.set("get_lock_password_len", lock_len_fn.clone())?;
+
+        let lp_clone2 = lock_password.clone();
+        let lock_disp_fn = lua.create_function(move |_, ()| {
+            let len = lp_clone2.read().unwrap().len();
+            if len > 0 {
+                Ok(format!("{}▎", "● ".repeat(len)))
+            } else {
+                Ok("Enter password to unlock...▎".to_string())
+            }
+        })?;
+        zenith_table.set("lock_pass_display", lock_disp_fn.clone())?;
+
+        let lo_clone1 = lockout.clone();
+        let is_locked_fn = lua.create_function(move |_, ()| {
+            Ok(lo_clone1.read().unwrap().is_locked_out())
+        })?;
+        zenith_table.set("is_locked_out", is_locked_fn.clone())?;
+
+        let lo_clone2 = lockout.clone();
+        let lock_rem_fn = lua.create_function(move |_, ()| {
+            Ok(lo_clone2.read().unwrap().remaining_lockout_secs())
+        })?;
+        zenith_table.set("lockout_remaining_secs", lock_rem_fn.clone())?;
+
+        let sec_table = lua.create_table()?;
+        sec_table.set("pass_length", lock_len_fn)?;
+        sec_table.set("get_display_dots", lock_disp_fn)?;
+        sec_table.set("is_locked_out", is_locked_fn)?;
+        sec_table.set("remaining_lockout_secs", lock_rem_fn)?;
+        zenith_table.set("Security", sec_table)?;
+
         let user_fn = lua.create_function(|_, ()| {
             let user = std::env::var("USER").unwrap_or_else(|_| "Zenith User".to_string());
             Ok(user)
         })?;
+
         zenith_table.set("user", user_fn.clone())?;
         zenith_table.set("User", user_fn)?;
 
@@ -248,14 +409,14 @@ impl LuauRuntime {
                 let new_val = second.unwrap_or(first);
                 *v2.borrow_mut() = new_val.clone();
                 let _ = sig_clone.set("value", new_val.clone());
-                let str_repr = match &new_val {
-                    LuaValue::String(s) => s.to_string_lossy(),
-                    LuaValue::Integer(i) => i.to_string(),
-                    LuaValue::Number(n) => n.to_string(),
-                    LuaValue::Boolean(b) => b.to_string(),
-                    _ => String::new(),
+                let sig_val = match &new_val {
+                    LuaValue::Number(n) => crate::reactive::SignalValue::Float(*n as f32),
+                    LuaValue::Integer(i) => crate::reactive::SignalValue::Float(*i as f32),
+                    LuaValue::String(s) => crate::reactive::SignalValue::Text(s.to_string_lossy()),
+                    LuaValue::Boolean(b) => crate::reactive::SignalValue::Boolean(*b),
+                    _ => crate::reactive::SignalValue::Text(String::new()),
                 };
-                r2.notify_signal_change(lua, sig_id, &str_repr);
+                r2.notify_signal_value_change(lua, sig_id, sig_val);
                 Ok(())
             })?;
             sig_tbl.set("set", set_fn.clone())?;
@@ -296,6 +457,17 @@ impl LuauRuntime {
         })?;
         zenith_table.set("Effect", effect_fn.clone())?;
         zenith_table.set("effect", effect_fn)?;
+
+        // Zenith.batch(callback) and Zenith.Batch
+        let reactive_batch = reactive.clone();
+        let batch_fn = lua.create_function(move |lua, callback: LuaFunction| {
+            reactive_batch.batch(lua, || {
+                callback.call::<()>(())
+            })?;
+            Ok(())
+        })?;
+        zenith_table.set("Batch", batch_fn.clone())?;
+        zenith_table.set("batch", batch_fn)?;
 
         // Zenith.Signals (reactive system getters)
         let signals_table = lua.create_table()?;
@@ -443,8 +615,14 @@ impl LuauRuntime {
             if let Some(bat) = zenith_services::SystemService::battery_snapshot() {
                 let tbl = lua.create_table()?;
                 tbl.set("percentage", bat.percentage)?;
+                tbl.set("percent", bat.percentage)?;
                 tbl.set("status", bat.status)?;
+                tbl.set("charging", bat.is_charging)?;
                 tbl.set("is_charging", bat.is_charging)?;
+                tbl.set("cycle_count", bat.cycle_count)?;
+                tbl.set("health_pct", bat.health_pct)?;
+                tbl.set("model_name", bat.model_name)?;
+                tbl.set("uptime_str", bat.uptime_str)?;
                 Ok(Some(tbl))
             } else {
                 Ok(None)
@@ -599,6 +777,7 @@ impl LuauRuntime {
             let tbl = lua.create_table()?;
             tbl.set("title", snap.title)?;
             tbl.set("class", snap.class)?;
+            tbl.set("address", snap.address)?;
             Ok(tbl)
         })?;
         services_table.set("ActiveWindow", active_window_fn.clone())?;
@@ -608,9 +787,14 @@ impl LuauRuntime {
         // Hyprland / Compositor Clients service
         let clients_fn = lua.create_function(|lua, ()| {
             let list = zenith_services::HyprlandService::clients_snapshot();
+            let active_addr = zenith_services::HyprlandService::active_window_snapshot().address;
+            let active_clean = active_addr.trim_start_matches("0x");
             let tbl = lua.create_table()?;
             for (idx, c) in list.into_iter().enumerate() {
                 let item = lua.create_table()?;
+                let c_clean = c.address.trim_start_matches("0x");
+                let is_focused = !active_clean.is_empty() && c_clean.eq_ignore_ascii_case(active_clean);
+                item.set("focused", is_focused)?;
                 item.set("address", c.address)?;
                 item.set("title", c.title)?;
                 item.set("class", c.class)?;
@@ -761,6 +945,31 @@ impl LuauRuntime {
         services_table.set("TrayScroll", tray_scroll_fn.clone())?;
         services_table.set("tray_scroll", tray_scroll_fn)?;
 
+        // Clipboard History service via cliphist
+        let clip_fn = lua.create_function(|lua, ()| {
+            let tbl = lua.create_table()?;
+            if let Ok(output) = std::process::Command::new("cliphist").arg("list").output() {
+                if output.status.success() {
+                    let out_str = String::from_utf8_lossy(&output.stdout);
+                    let mut idx = 1;
+                    for line in out_str.lines().take(50) {
+                        if let Some((id, text)) = line.split_once('\t') {
+                            let item = lua.create_table()?;
+                            item.set("id", id)?;
+                            item.set("text", text)?;
+                            item.set("content", text)?;
+                            item.set("is_image", text.starts_with("[[ binary data"))?;
+                            tbl.set(idx, item)?;
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+            Ok(tbl)
+        })?;
+        services_table.set("ClipboardHistory", clip_fn.clone())?;
+        services_table.set("clipboard_history", clip_fn)?;
+
         // Audio Spectrum / CAVA service
         let spectrum_fn = lua.create_function(|lua, count: Option<usize>| {
             let bars = zenith_services::CavaService::spectrum(count.unwrap_or(8));
@@ -865,6 +1074,13 @@ impl LuauRuntime {
         services_table.set("ToggleDND", notif_toggle_dnd_fn.clone())?;
         services_table.set("toggle_dnd", notif_toggle_dnd_fn)?;
 
+        let notif_set_dnd_fn = lua.create_function(|_, enabled: bool| {
+            zenith_services::NotificationService::set_dnd(enabled);
+            Ok(())
+        })?;
+        services_table.set("SetDND", notif_set_dnd_fn.clone())?;
+        services_table.set("set_dnd", notif_set_dnd_fn)?;
+
         let notif_clear_hist_fn = lua.create_function(|_, ()| {
             zenith_services::NotificationService::clear_history();
             Ok(())
@@ -908,8 +1124,16 @@ impl LuauRuntime {
             let s = zenith_services::BluetoothService::status();
             let tbl = lua.create_table()?;
             tbl.set("powered", s.powered)?;
+            let mut connected = false;
+            let mut device_name: Option<String> = None;
             let dev_tbl = lua.create_table()?;
             for (idx, d) in s.devices.into_iter().enumerate() {
+                if d.connected {
+                    connected = true;
+                    if device_name.is_none() {
+                        device_name = Some(d.name.clone());
+                    }
+                }
                 let item = lua.create_table()?;
                 item.set("mac", d.mac)?;
                 item.set("name", d.name)?;
@@ -918,6 +1142,10 @@ impl LuauRuntime {
                 dev_tbl.set(idx + 1, item)?;
             }
             tbl.set("devices", dev_tbl)?;
+            tbl.set("connected", connected)?;
+            if let Some(name) = device_name {
+                tbl.set("device_name", name)?;
+            }
             Ok(tbl)
         })?;
         services_table.set("Bluetooth", bt_status_fn.clone())?;
@@ -1028,8 +1256,12 @@ impl LuauRuntime {
         services_table.set("adjust_brightness", step_brightness_fn)?;
 
         // Disk storage service
-        let disk_fn = lua.create_function(|lua, ()| {
-            let snap = zenith_services::DiskService::get_disk_usage();
+        let disk_fn = lua.create_function(|lua, mount_path: Option<String>| {
+            let snap = if let Some(ref path) = mount_path {
+                zenith_services::DiskService::query_statvfs(path).unwrap_or_else(zenith_services::DiskService::get_disk_usage)
+            } else {
+                zenith_services::DiskService::get_disk_usage()
+            };
             let tbl = lua.create_table()?;
             tbl.set("total_gb", snap.total_gb)?;
             tbl.set("used_gb", snap.used_gb)?;
@@ -1156,15 +1388,10 @@ impl LuauRuntime {
         })?;
         zenith_table.set("exec", exec_fn)?;
 
-        // Zenith.close() - in-process IPC socket command
-        let close_fn = lua.create_function(|_, ()| {
-            if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-                let sock_path = std::path::PathBuf::from(dir).join("zenith.sock");
-                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock_path) {
-                    use std::io::Write;
-                    let _ = stream.write_all(b"close\n");
-                }
-            }
+        // Zenith.close() - in-process request flag (zero disk/socket blocking)
+        let close_req = close_requested.clone();
+        let close_fn = lua.create_function(move |_, ()| {
+            close_req.store(true, Ordering::Release);
             Ok(())
         })?;
         zenith_table.set("close", close_fn)?;
@@ -1185,23 +1412,40 @@ impl LuauRuntime {
             let mut candidates = vec![
                 format!("{}.luau", path),
                 format!("{}.lua", path),
+                format!("{}/init.luau", path),
+                format!("{}/init.lua", path),
                 format!("config/zenith/{}.luau", path),
                 format!("config/zenith/{}.lua", path),
+                format!("config/zenith/{}/init.luau", path),
+                format!("config/zenith/{}/init.lua", path),
                 format!("config/zenith/lib/{}.luau", path),
                 format!("config/zenith/lib/{}.lua", path),
                 format!("config/zenith/overlays/{}.luau", path),
                 format!("config/zenith/overlays/{}.lua", path),
                 format!("../../config/zenith/{}.luau", path),
                 format!("../../config/zenith/{}.lua", path),
+                format!("../../config/zenith/{}/init.luau", path),
+                format!("../../config/zenith/{}/init.lua", path),
                 format!("../../config/zenith/lib/{}.luau", path),
                 format!("../../config/zenith/lib/{}.lua", path),
                 format!("../../config/zenith/overlays/{}.luau", path),
                 format!("../../config/zenith/overlays/{}.lua", path),
             ];
 
+            let widget_name = path.strip_prefix("widgets/").unwrap_or(&path);
+            for domain in &["system", "desktop", "media", "tools", "shared"] {
+                candidates.push(format!("config/zenith/widgets/{}/{}/init.luau", domain, widget_name));
+                candidates.push(format!("config/zenith/widgets/{}/{}/widget.luau", domain, widget_name));
+                candidates.push(format!("config/zenith/widgets/{}/{}.luau", domain, widget_name));
+                candidates.push(format!("../../config/zenith/widgets/{}/{}/init.luau", domain, widget_name));
+                candidates.push(format!("../../config/zenith/widgets/{}/{}/widget.luau", domain, widget_name));
+                candidates.push(format!("../../config/zenith/widgets/{}/{}.luau", domain, widget_name));
+            }
+
             if let Ok(home) = std::env::var("HOME") {
                 candidates.push(format!("{}/.config/zenith/{}.luau", home, path));
                 candidates.push(format!("{}/.config/zenith/{}.lua", home, path));
+                candidates.push(format!("{}/.config/zenith/{}/init.luau", home, path));
                 candidates.push(format!("{}/.config/zenith/lib/{}.luau", home, path));
                 candidates.push(format!("{}/.config/zenith/lib/{}.lua", home, path));
                 candidates.push(format!("{}/.config/zenith/overlays/{}.luau", home, path));
@@ -1246,6 +1490,7 @@ impl LuauRuntime {
             worker_pool,
             storage,
             is_idle,
+            close_requested,
             search_query,
             selected_index,
             current_output,
@@ -1254,6 +1499,8 @@ impl LuauRuntime {
             focused_input_id,
             input_buffers,
             editor_engines,
+            lock_password,
+            lockout,
         })
     }
 
@@ -1307,7 +1554,60 @@ impl LuauRuntime {
         if let Ok(tbl) = self.lua.globals().get::<LuaTable>("__zenith_modules") {
             let _ = tbl.clear();
         }
+        if let Ok(tbl) = self.lua.globals().get::<LuaTable>("__zenith_callbacks") {
+            let _ = tbl.clear();
+        }
         self.script_cache.write().unwrap().clear();
+    }
+
+    /// Checks and resets the close requested flag.
+    pub fn check_close_requested(&self) -> bool {
+        self.close_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Requests the Wayland app to close active popups/overlays.
+    pub fn request_close(&self) {
+        self.close_requested.store(true, Ordering::Release);
+    }
+
+    /// Clears cached callbacks for a specific UI tree before re-evaluation, preventing memory leaks.
+    pub fn clear_tree_callbacks(&self, tree_id: &str) {
+        if let Ok(callbacks) = self.lua.globals().get::<LuaTable>("__zenith_callbacks") {
+            if let Ok(empty_tbl) = self.lua.create_table() {
+                let _ = callbacks.set(tree_id, empty_tbl);
+            }
+        }
+    }
+
+    pub(crate) fn find_callback(lua: &Lua, key: &str) -> Option<LuaFunction> {
+        if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
+            if let Ok(f) = callbacks.get::<LuaFunction>(key) {
+                return Some(f);
+            }
+            for pair in callbacks.pairs::<LuaValue, LuaTable>() {
+                if let Ok((_k, sub_tbl)) = pair {
+                    if let Ok(f) = sub_tbl.get::<LuaFunction>(key) {
+                        return Some(f);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn store_callback(lua: &Lua, tree_id: Option<&str>, key: &str, func: LuaFunction) {
+        if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
+            let tid = tree_id.unwrap_or("default");
+            let target_tbl = if let Ok(sub) = callbacks.get::<LuaTable>(tid) {
+                sub
+            } else if let Ok(sub) = lua.create_table() {
+                let _ = callbacks.set(tid, sub.clone());
+                sub
+            } else {
+                callbacks
+            };
+            let _ = target_tbl.set(key, func);
+        }
     }
 
     /// Retrieve active current output name from runtime.
@@ -1363,6 +1663,52 @@ impl LuauRuntime {
         *self.selected_index.write().unwrap() = idx;
     }
 
+    /// Push characters into the volatile zeroized lock password buffer.
+    pub fn push_lock_password(&self, s: &str) {
+        self.lock_password.write().unwrap().push_str(s);
+    }
+
+    /// Pop a character from the volatile zeroized lock password buffer.
+    pub fn pop_lock_password(&self) {
+        self.lock_password.write().unwrap().pop();
+    }
+
+    /// Clears and zeroizes the lock password buffer.
+    pub fn clear_lock_password(&self) {
+        self.lock_password.write().unwrap().clear();
+    }
+
+    /// Takes the password for PAM authentication and immediately scrubs the internal buffer.
+    pub fn take_lock_password(&self) -> String {
+        self.lock_password.write().unwrap().take_password()
+    }
+
+    /// Returns length in characters of the current secure lock password.
+    pub fn lock_password_len(&self) -> usize {
+        self.lock_password.read().unwrap().len()
+    }
+
+    /// Checks if authentication is temporarily locked out due to repeated failures.
+    pub fn is_locked_out(&self) -> bool {
+        self.lockout.read().unwrap().is_locked_out()
+    }
+
+    /// Records a failed authentication attempt and returns lockout duration in seconds (if any).
+    pub fn record_lock_failure(&self) -> u64 {
+        self.lockout.write().unwrap().record_failure()
+    }
+
+    /// Records a successful authentication, resetting failed attempts and lockout timers.
+    pub fn record_lock_success(&self) {
+        self.lockout.write().unwrap().record_success();
+    }
+
+    /// Returns remaining lockout time in seconds.
+    pub fn remaining_lockout_secs(&self) -> u64 {
+        self.lockout.read().unwrap().remaining_lockout_secs()
+    }
+
+
     /// Get id of currently focused text input, if any.
     pub fn get_focused_input(&self) -> Option<String> {
         self.focused_input_id.read().unwrap().clone()
@@ -1381,6 +1727,11 @@ impl LuauRuntime {
     /// Set buffered text for a text input id.
     pub fn set_input_text(&self, id: &str, text: &str) {
         self.input_buffers.write().unwrap().insert(id.to_string(), text.to_string());
+        if let Some(ed) = self.editor_engines.write().unwrap().get_mut(id) {
+            if ed.text() != text {
+                ed.set_text(text);
+            }
+        }
     }
 
     /// Access and mutate TextEditorEngine for a given text input id.
@@ -1399,7 +1750,7 @@ impl LuauRuntime {
         let res = f(editor);
         let new_text = editor.text().to_string();
         drop(map);
-        self.set_input_text(id, &new_text);
+        self.input_buffers.write().unwrap().insert(id.to_string(), new_text);
         res
     }
 
@@ -1475,11 +1826,13 @@ impl LuauRuntime {
 
     /// Trigger a registered Lua callback with a single string argument.
     pub fn trigger_callback_with_arg(&self, key: &str, arg: &str) -> Result<(), LuaError> {
-        if let Ok(callbacks) = self.lua.globals().get::<LuaTable>("__zenith_callbacks") {
-            if let Ok(cb) = callbacks.get::<LuaFunction>(key) {
-                cb.call::<()>(arg)?;
-                return Ok(());
-            }
+        if let Some(cb) = Self::find_callback(&self.lua, key) {
+            cb.call::<()>(arg)?;
+            return Ok(());
+        }
+        if key == "settings:search:change" {
+            let _ = self.storage.set("settings_search_query", serde_json::Value::String(arg.to_string()));
+            return Ok(());
         }
         if let Some(storage_key) = key.strip_prefix("storage:set:") {
             let clean_k = storage_key.trim_end_matches(':');
@@ -1489,12 +1842,17 @@ impl LuauRuntime {
             let clean_k = storage_key.trim_end_matches(':');
             let full_action = format!("storage:toggle:{}", clean_k);
             return self.trigger_click(&full_action);
+        } else if key.contains(':') {
+            let clean_k = key.trim_end_matches(':');
+            let full_action = format!("{}:{}", clean_k, arg);
+            return self.trigger_click(&full_action);
         }
         Ok(())
     }
 
-    /// Load and evaluate a Luau script string, returning the root UI node with compiled chunk caching.
-    pub fn eval_ui(&self, script: &str) -> Result<UiNode, LuaError> {
+    /// Evaluates a Luau script string for a specific UI tree, resetting its callback scope to eliminate memory leaks.
+    pub fn eval_ui_for_tree(&self, tree_id: &str, script: &str) -> Result<UiNode, LuaError> {
+        self.clear_tree_callbacks(tree_id);
         let hash = Self::hash_script(script);
         let func: LuaFunction = {
             let cache = self.script_cache.read().unwrap();
@@ -1510,10 +1868,18 @@ impl LuauRuntime {
         };
 
         let val: LuaValue = func.call(())?;
+        let focused_id = self.focused_input_id.read().unwrap().clone();
+        let engines = self.editor_engines.read().unwrap();
+        let editor_ctx = Some((&focused_id, &*engines));
         match val {
-            LuaValue::Table(tbl) => Self::parse_ui_node(&self.lua, &tbl),
+            LuaValue::Table(tbl) => Self::parse_ui_node_tracked(&self.lua, &tbl, &[], None, Some(tree_id), editor_ctx),
             _ => Err(LuaError::runtime("Script must return a Zenith UI node table")),
         }
+    }
+
+    /// Load and evaluate a Luau script string, returning the root UI node with compiled chunk caching.
+    pub fn eval_ui(&self, script: &str) -> Result<UiNode, LuaError> {
+        self.eval_ui_for_tree("default", script)
     }
 
     /// Trigger a registered click action by command or function key.
@@ -1533,14 +1899,21 @@ impl LuauRuntime {
             let _ = zenith_services::LauncherService::launch(cmd);
         } else if let Some(cmd) = action.strip_prefix("media:") {
             let _ = zenith_services::MprisService::control(cmd);
-        } else if let Some(id_str) = action.strip_prefix("notification:close:") {
+        } else if let Some(id_str) = action.strip_prefix("notification:close:").or_else(|| action.strip_prefix("notification:dismiss:")) {
             if let Ok(id) = id_str.parse::<u32>() {
                 zenith_services::NotificationService::close(id);
             }
         } else if action == "notification:clear" {
             zenith_services::NotificationService::clear_all();
         } else if action == "notification:toggle_dnd" {
-            zenith_services::NotificationService::toggle_dnd();
+            let next = zenith_services::NotificationService::toggle_dnd();
+            let _ = self.storage.set("dndEnabled", serde_json::Value::Bool(next));
+        } else if action == "notification:dnd:on" {
+            zenith_services::NotificationService::set_dnd(true);
+            let _ = self.storage.set("dndEnabled", serde_json::Value::Bool(true));
+        } else if action == "notification:dnd:off" {
+            zenith_services::NotificationService::set_dnd(false);
+            let _ = self.storage.set("dndEnabled", serde_json::Value::Bool(false));
         } else if action == "notification:clear_history" {
             zenith_services::NotificationService::clear_history();
         } else if let Some(ssid) = action.strip_prefix("wifi:connect:") {
@@ -1559,6 +1932,8 @@ impl LuauRuntime {
             zenith_services::PowerProfileService::reboot();
         } else if action == "system:poweroff" || action == "power:poweroff" {
             zenith_services::PowerProfileService::poweroff();
+        } else if action == "system:logout" {
+            let _ = zenith_services::HyprlandService::dispatch("exit", "");
         } else if action == "bluetooth:toggle" {
             zenith_services::BluetoothService::toggle_power();
         } else if let Some(mac) = action.strip_prefix("bluetooth:connect:") {
@@ -1578,8 +1953,8 @@ impl LuauRuntime {
                 }
             }
         } else if let Some(pct_str) = action.strip_prefix("brightness:set:") {
-            if let Ok(pct) = pct_str.parse::<u8>() {
-                zenith_services::BrightnessService::set_brightness(pct);
+            if let Ok(pct) = pct_str.parse::<f32>() {
+                zenith_services::BrightnessService::set_brightness(pct.round().clamp(1.0, 100.0) as u8);
             }
         } else if let Some(step_str) = action.strip_prefix("brightness:step:") {
             if let Ok(delta) = step_str.parse::<i16>() {
@@ -1598,8 +1973,8 @@ impl LuauRuntime {
                 zenith_services::AudioService::set_default_sink(id);
             }
         } else if let Some(vol_str) = action.strip_prefix("audio:set_volume:") {
-            if let Ok(val) = vol_str.parse::<u32>() {
-                zenith_services::AudioService::set_volume(val as u8);
+            if let Ok(val) = vol_str.parse::<f32>() {
+                zenith_services::AudioService::set_volume(val.round().clamp(0.0, 150.0) as u8);
             }
         } else if let Some(step_str) = action.strip_prefix("audio:volume_step:") {
             if let Ok(delta) = step_str.parse::<i32>() {
@@ -1607,6 +1982,12 @@ impl LuauRuntime {
             }
         } else if action == "audio:toggle_mute" {
             zenith_services::AudioService::toggle_mute();
+        } else if let Some(id) = action.strip_prefix("clipboard:copy:") {
+            let cmd = format!("cliphist decode {} | wl-copy", id);
+            let _ = std::process::Command::new("sh").args(["-c", &cmd]).spawn();
+        } else if let Some(id) = action.strip_prefix("clipboard:delete:") {
+            let cmd = format!("cliphist list | grep '^{}\t' | cliphist delete", id);
+            let _ = std::process::Command::new("sh").args(["-c", &cmd]).spawn();
         } else if action == "record:toggle" {
             zenith_services::RecorderService::toggle_recording();
         } else if action == "screenshot:area" {
@@ -1634,6 +2015,18 @@ impl LuauRuntime {
                     serde_json::Value::String(v.to_string())
                 };
                 let _ = self.storage.set(k, json_val);
+                match k {
+                    "gapsIn" => {
+                        let _ = zenith_services::HyprlandService::keyword("general:gaps_in", v);
+                    }
+                    "gapsOut" => {
+                        let _ = zenith_services::HyprlandService::keyword("general:gaps_out", v);
+                    }
+                    "borderSize" => {
+                        let _ = zenith_services::HyprlandService::keyword("general:border_size", v);
+                    }
+                    _ => {}
+                }
             }
         } else if let Some(k) = action.strip_prefix("storage:toggle:") {
             let cur = self.storage.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1642,6 +2035,40 @@ impl LuauRuntime {
             if let Ok(idx) = page_str.parse::<i64>() {
                 let _ = self.storage.set("settings_active_page", serde_json::Value::from(idx));
             }
+        } else if let Some(task_id) = action.strip_prefix("settings:task:") {
+            let active_page = self.storage.get("settings_active_page").and_then(|v| v.as_i64()).unwrap_or(0);
+            let page_keys = [
+                "general", "appearance", "wallpaper", "bar", "dock", "launcher", "osd", "widgets",
+                "sys_audio", "tools", "compositor", "monitors", "media", "network", "power", "security", "about"
+            ];
+            let key = if (active_page as usize) < page_keys.len() {
+                format!("settings_task_{}", page_keys[active_page as usize])
+            } else {
+                "settings_active_task".to_string()
+            };
+            let _ = self.storage.set(&key, serde_json::Value::String(task_id.to_string()));
+            let _ = self.storage.set("settings_active_task", serde_json::Value::String(task_id.to_string()));
+        } else if action == "settings:search:clear" {
+            let _ = self.storage.set("settings_search_query", serde_json::Value::String(String::new()));
+            self.set_input_text("settings_search_input", "");
+        } else if action == "settings:toggle_overlay" {
+            let cur = self.storage.get("settings_overlay_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+            let _ = self.storage.set("settings_overlay_mode", serde_json::Value::Bool(!cur));
+        } else if action == "bar:toggle_compact" {
+            let cur = self.storage.get("barCompactMode").and_then(|v| v.as_bool()).unwrap_or(false);
+            let _ = self.storage.set("barCompactMode", serde_json::Value::Bool(!cur));
+        } else if action == "quick-term" {
+            let _ = zenith_services::HyprlandService::dispatch("togglespecialworkspace", "quick-term");
+        } else if action == "trash:///" {
+            let _ = spawner::spawn_detached("xdg-open trash:///");
+        } else if action == "trash-empty" {
+            let _ = spawner::spawn_detached("gio trash --empty");
+        } else if action == "expose:filter:all" {
+            let _ = self.lua.globals().set("__expose_filter", "all");
+            let _ = self.storage.set("expose_filter", serde_json::Value::String("all".into()));
+        } else if action == "expose:filter:current" {
+            let _ = self.lua.globals().set("__expose_filter", "current");
+            let _ = self.storage.set("expose_filter", serde_json::Value::String("current".into()));
         } else if action.starts_with("click_")
             || action.starts_with("right_click_")
             || action.starts_with("scroll_up_")
@@ -1651,22 +2078,20 @@ impl LuauRuntime {
             || action.starts_with("switch_toggle_")
             || action.starts_with("slider_change_")
         {
-            if let Ok(callbacks) = self.lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                if let Ok(func) = callbacks.get::<LuaFunction>(action) {
-                    let _ = func.call::<()>(());
-                    return Ok(());
-                }
+            if let Some(func) = Self::find_callback(&self.lua, action) {
+                let _ = func.call::<()>(());
+                return Ok(());
             }
-            let _ = spawner::spawn_detached(action);
+            tracing::warn!("Callback '{}' not found in __zenith_callbacks", action);
         } else {
-            // Check if action corresponds to a shell command directly
-            let _ = spawner::spawn_detached(action);
+            tracing::warn!("Unknown action: {}", action);
         }
         Ok(())
     }
 
     /// Mounts a UI tree into the reactive graph, binding signals and persisting the tree across frames.
     pub fn mount_tree(&self, tree_id: &str, script: &str) -> Result<UiNode, LuaError> {
+        self.clear_tree_callbacks(tree_id);
         let hash = Self::hash_script(script);
         let func: LuaFunction = {
             let cache = self.script_cache.read().unwrap();
@@ -1682,9 +2107,12 @@ impl LuauRuntime {
         };
 
         let val: LuaValue = func.call(())?;
+        let focused_id = self.focused_input_id.read().unwrap().clone();
+        let engines = self.editor_engines.read().unwrap();
+        let editor_ctx = Some((&focused_id, &*engines));
         match val {
             LuaValue::Table(tbl) => {
-                let node = Self::parse_ui_node_tracked(&self.lua, &tbl, &[], Some(&self.reactive), Some(tree_id))?;
+                let node = Self::parse_ui_node_tracked(&self.lua, &tbl, &[], Some(&self.reactive), Some(tree_id), editor_ctx)?;
                 self.reactive.mount_tree(tree_id, node.clone());
                 Ok(node)
             }
@@ -1707,8 +2135,9 @@ impl LuauRuntime {
         self.reactive.mark_tree_clean(tree_id);
     }
 
+    #[allow(dead_code)]
     fn parse_ui_node(lua: &Lua, tbl: &LuaTable) -> Result<UiNode, LuaError> {
-        Self::parse_ui_node_tracked(lua, tbl, &[], None, None)
+        Self::parse_ui_node_tracked(lua, tbl, &[], None, None, None)
     }
 
     fn parse_ui_node_tracked(
@@ -1717,9 +2146,32 @@ impl LuauRuntime {
         path: &[usize],
         reactive: Option<&crate::reactive::ReactiveGraph>,
         tree_id: Option<&str>,
+        editor_ctx: Option<(&Option<String>, &std::collections::HashMap<String, zenith_layout::TextEditorEngine>)>,
     ) -> Result<UiNode, LuaError> {
         let node_type: String = tbl.get("__type").unwrap_or_else(|_| "Box".to_string());
         let style = Self::parse_style(tbl)?;
+
+        if let (Some(rg), Some(tid)) = (reactive, tree_id) {
+            for (key, prop) in [
+                ("width", crate::reactive::BoundProperty::Width),
+                ("height", crate::reactive::BoundProperty::Height),
+                ("opacity", crate::reactive::BoundProperty::Opacity),
+                ("scale", crate::reactive::BoundProperty::Scale),
+            ] {
+                if let Ok(sig_tbl) = tbl.get::<LuaTable>(key) {
+                    if let Ok(sig_id) = sig_tbl.get::<u64>("__signal_id") {
+                        rg.bind_node(
+                            sig_id,
+                            crate::reactive::NodeBinding {
+                                tree_id: tid.to_string(),
+                                node_path: path.to_vec(),
+                                property: prop,
+                            },
+                        );
+                    }
+                }
+            }
+        }
 
         if node_type == "Text" {
             let (text, maybe_sig_id): (String, Option<u64>) = if let Ok(sig_tbl) = tbl.get::<LuaTable>("text") {
@@ -1750,7 +2202,7 @@ impl LuauRuntime {
             }
 
             let font_size: f32 = tbl.get("font_size").unwrap_or(14.0);
-            let color = tbl.get("color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgb(255, 255, 255));
+            let color = tbl.get::<LuaValue>("color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgb(255, 255, 255));
 
             Ok(UiNode::Text {
                 text,
@@ -1760,7 +2212,7 @@ impl LuauRuntime {
             })
         } else if node_type == "TextInput" {
             let id = tbl.get::<String>("id").ok();
-            let (text, maybe_sig_id): (String, Option<u64>) = if let Ok(sig_tbl) = tbl.get::<LuaTable>("text") {
+            let (mut text, maybe_sig_id): (String, Option<u64>) = if let Ok(sig_tbl) = tbl.get::<LuaTable>("text") {
                 let sig_id: Option<u64> = sig_tbl.get("__signal_id").ok();
                 let s = if let Ok(get_fn) = sig_tbl.get::<LuaFunction>("get") {
                     get_fn.call::<String>(Some(sig_tbl.clone())).unwrap_or_default()
@@ -1789,18 +2241,30 @@ impl LuauRuntime {
 
             let placeholder: String = tbl.get("placeholder").unwrap_or_default();
             let font_size: f32 = tbl.get("font_size").unwrap_or(14.0);
-            let color = tbl.get("color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgb(255, 255, 255));
-            let placeholder_color = tbl.get("placeholder_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgba(255, 255, 255, 120));
-            let active: bool = tbl.get("active").unwrap_or(false);
-            let cursor_pos: usize = tbl.get("cursor_pos").unwrap_or(text.len());
+            let color = tbl.get::<LuaValue>("color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgb(255, 255, 255));
+            let placeholder_color = tbl.get::<LuaValue>("placeholder_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgba(255, 255, 255, 120));
+            let mut active: bool = tbl.get("active").unwrap_or(false);
+            let mut cursor_pos: usize = tbl.get("cursor_pos").unwrap_or(text.len());
+            let mut selection_range: Option<(usize, usize)> = None;
+
+            if let Some(ref input_id) = id {
+                if let Some((focused, engines)) = editor_ctx {
+                    if focused.as_deref() == Some(input_id.as_str()) {
+                        active = true;
+                    }
+                    if let Some(engine) = engines.get(input_id) {
+                        text = engine.text().to_string();
+                        cursor_pos = engine.cursor;
+                        selection_range = engine.selection_range();
+                    }
+                }
+            }
 
             let on_change: Option<String> = if let Ok(func) = tbl.get::<LuaFunction>("on_change") {
                 static CB_CHANGE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_CHANGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("change_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_change").ok()
@@ -1810,9 +2274,7 @@ impl LuauRuntime {
                 static CB_SUBMIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_SUBMIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("submit_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_submit").ok()
@@ -1827,7 +2289,7 @@ impl LuauRuntime {
                 placeholder_color,
                 active,
                 cursor_pos,
-                selection_range: None,
+                selection_range,
                 style,
                 on_change,
                 on_submit,
@@ -1858,17 +2320,15 @@ impl LuauRuntime {
             let value: f32 = tbl.get::<f32>("value").unwrap_or(0.0);
             let track_height: f32 = tbl.get::<f32>("track_height").unwrap_or(6.0);
             let thumb_radius: f32 = tbl.get::<f32>("thumb_radius").unwrap_or(10.0);
-            let track_color = tbl.get("track_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgba(255, 255, 255, 50));
-            let active_track_color = tbl.get("active_track_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgb(124, 77, 255));
-            let thumb_color = tbl.get("thumb_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgb(255, 255, 255));
+            let track_color = tbl.get::<LuaValue>("track_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgba(255, 255, 255, 50));
+            let active_track_color = tbl.get::<LuaValue>("active_track_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgb(124, 77, 255));
+            let thumb_color = tbl.get::<LuaValue>("thumb_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgb(255, 255, 255));
 
             let on_change: Option<String> = if let Ok(func) = tbl.get::<LuaFunction>("on_change") {
                 static CB_SLIDER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_SLIDER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("slider_change_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_change").ok()
@@ -1890,17 +2350,15 @@ impl LuauRuntime {
         } else if node_type == "Switch" {
             let id = tbl.get::<String>("id").ok();
             let checked: bool = tbl.get::<bool>("checked").unwrap_or(false);
-            let active_color = tbl.get("active_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgb(124, 77, 255));
-            let inactive_color = tbl.get("inactive_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgba(255, 255, 255, 50));
-            let thumb_color = tbl.get("thumb_color").map(|c: LuaTable| Self::parse_color(&c)).unwrap_or(Color::rgb(255, 255, 255));
+            let active_color = tbl.get::<LuaValue>("active_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgb(124, 77, 255));
+            let inactive_color = tbl.get::<LuaValue>("inactive_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgba(255, 255, 255, 50));
+            let thumb_color = tbl.get::<LuaValue>("thumb_color").ok().and_then(|v| Self::parse_color_value(&v)).unwrap_or(Color::rgb(255, 255, 255));
 
             let on_toggle: Option<String> = if let Ok(func) = tbl.get::<LuaFunction>("on_toggle") {
                 static CB_SWITCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_SWITCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("switch_toggle_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_toggle").ok()
@@ -1933,7 +2391,7 @@ impl LuauRuntime {
             if top_spacer_height > 0.0 {
                 list_children.push(UiNode::Box {
                     style: zenith_layout::NodeStyle {
-                        height: Some(top_spacer_height),
+                        height: Some(zenith_layout::length(top_spacer_height)),
                         ..Default::default()
                     },
                     children: Vec::new(),
@@ -1950,7 +2408,7 @@ impl LuauRuntime {
                     if let Ok(item_val) = items.get::<LuaValue>(i) {
                         if let Ok(item_node_tbl) = render_item_fn.call::<LuaTable>((item_val, i)) {
                             let child_path = [path, &[i]].concat();
-                            if let Ok(child_node) = Self::parse_ui_node_tracked(lua, &item_node_tbl, &child_path, reactive, tree_id) {
+                            if let Ok(child_node) = Self::parse_ui_node_tracked(lua, &item_node_tbl, &child_path, reactive, tree_id, editor_ctx) {
                                 list_children.push(child_node);
                             }
                         }
@@ -1961,7 +2419,7 @@ impl LuauRuntime {
             if bottom_spacer_height > 0.0 {
                 list_children.push(UiNode::Box {
                     style: zenith_layout::NodeStyle {
-                        height: Some(bottom_spacer_height),
+                        height: Some(zenith_layout::length(bottom_spacer_height)),
                         ..Default::default()
                     },
                     children: Vec::new(),
@@ -1975,7 +2433,7 @@ impl LuauRuntime {
 
             let mut list_style = style;
             if list_style.height.is_none() {
-                list_style.height = Some(visible_height);
+                list_style.height = Some(zenith_layout::length(visible_height));
             }
             list_style.flex_direction = zenith_layout::FlexDirection::Column;
             list_style.overflow = zenith_layout::Overflow::Scroll;
@@ -1997,7 +2455,7 @@ impl LuauRuntime {
                 for (i, child) in child_tbl.sequence_values::<LuaTable>().flatten().enumerate() {
                     let mut child_path = path.to_vec();
                     child_path.push(i);
-                    children.push(Self::parse_ui_node_tracked(lua, &child, &child_path, reactive, tree_id)?);
+                    children.push(Self::parse_ui_node_tracked(lua, &child, &child_path, reactive, tree_id, editor_ctx)?);
                 }
             }
             Ok(UiNode::Window {
@@ -2011,7 +2469,7 @@ impl LuauRuntime {
                 for (i, child) in child_tbl.sequence_values::<LuaTable>().flatten().enumerate() {
                     let mut child_path = path.to_vec();
                     child_path.push(i);
-                    children.push(Self::parse_ui_node_tracked(lua, &child, &child_path, reactive, tree_id)?);
+                    children.push(Self::parse_ui_node_tracked(lua, &child, &child_path, reactive, tree_id, editor_ctx)?);
                 }
             }
 
@@ -2019,9 +2477,7 @@ impl LuauRuntime {
                 static CB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("click_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_click").ok()
@@ -2031,9 +2487,7 @@ impl LuauRuntime {
                 static CB_RIGHT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_RIGHT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("right_click_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_right_click").ok()
@@ -2043,9 +2497,7 @@ impl LuauRuntime {
                 static CB_SCROLL_UP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_SCROLL_UP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("scroll_up_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_scroll_up").ok()
@@ -2055,9 +2507,7 @@ impl LuauRuntime {
                 static CB_SCROLL_DOWN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 let id = CB_SCROLL_DOWN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("scroll_down_{}", id);
-                if let Ok(callbacks) = lua.globals().get::<LuaTable>("__zenith_callbacks") {
-                    let _ = callbacks.set(key.clone(), func);
-                }
+                Self::store_callback(lua, tree_id, &key, func);
                 Some(key)
             } else {
                 tbl.get::<String>("on_scroll_down").ok()
@@ -2124,6 +2574,78 @@ impl LuauRuntime {
         meta
     }
 
+    pub fn parse_dimension(val: &LuaValue) -> Option<zenith_layout::Dimension> {
+        match val {
+            LuaValue::Number(n) => Some(zenith_layout::length(*n as f32)),
+            LuaValue::Integer(i) => Some(zenith_layout::length(*i as f32)),
+            LuaValue::String(s) => {
+                let str_val = s.to_str().ok()?;
+                let trimmed = str_val.trim();
+                if trimmed.eq_ignore_ascii_case("auto") {
+                    Some(zenith_layout::auto())
+                } else if trimmed.ends_with('%') {
+                    let num_str = trimmed.trim_end_matches('%').trim();
+                    let pct = num_str.parse::<f32>().ok()?;
+                    Some(zenith_layout::percent(pct / 100.0))
+                } else if let Ok(num) = trimmed.parse::<f32>() {
+                    Some(zenith_layout::length(num))
+                } else {
+                    None
+                }
+            }
+            LuaValue::Table(tbl) => {
+                if let Ok(get_fn) = tbl.get::<LuaFunction>("get") {
+                    if let Ok(res) = get_fn.call::<LuaValue>(Some(tbl.clone())) {
+                        return Self::parse_dimension(&res);
+                    }
+                }
+                if let Ok(res) = tbl.get::<LuaValue>("value") {
+                    return Self::parse_dimension(&res);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn parse_color_str(hex: &str) -> Color {
+        let hex = hex.trim();
+        if hex.eq_ignore_ascii_case("transparent") {
+            return Color::transparent();
+        }
+        let hex_clean = hex.trim_start_matches('#');
+        if hex_clean.len() == 6 {
+            let r = u8::from_str_radix(&hex_clean[0..2], 16).unwrap_or(0);
+            let g = u8::from_str_radix(&hex_clean[2..4], 16).unwrap_or(0);
+            let b = u8::from_str_radix(&hex_clean[4..6], 16).unwrap_or(0);
+            Color::rgb(r, g, b)
+        } else if hex_clean.len() == 8 {
+            let r = u8::from_str_radix(&hex_clean[0..2], 16).unwrap_or(0);
+            let g = u8::from_str_radix(&hex_clean[2..4], 16).unwrap_or(0);
+            let b = u8::from_str_radix(&hex_clean[4..6], 16).unwrap_or(0);
+            let a = u8::from_str_radix(&hex_clean[6..8], 16).unwrap_or(255);
+            Color::rgba(r, g, b, a)
+        } else if hex_clean.len() == 3 {
+            let r = u8::from_str_radix(&hex_clean[0..1].repeat(2), 16).unwrap_or(0);
+            let g = u8::from_str_radix(&hex_clean[1..2].repeat(2), 16).unwrap_or(0);
+            let b = u8::from_str_radix(&hex_clean[2..3].repeat(2), 16).unwrap_or(0);
+            Color::rgb(r, g, b)
+        } else {
+            Color::rgb(255, 255, 255)
+        }
+    }
+
+    pub fn parse_color_value(val: &LuaValue) -> Option<Color> {
+        match val {
+            LuaValue::Table(tbl) => Some(Self::parse_color(tbl)),
+            LuaValue::String(s) => {
+                let s_str = s.to_str().ok()?;
+                Some(Self::parse_color_str(&s_str))
+            }
+            _ => None,
+        }
+    }
+
     fn parse_style(tbl: &LuaTable) -> Result<NodeStyle, LuaError> {
         let mut style = NodeStyle::default();
 
@@ -2139,17 +2661,59 @@ impl LuauRuntime {
             style.scroll_offset_y = sy;
         }
 
-        if let Ok(w) = tbl.get::<f32>("width") {
-            style.width = Some(w);
-        }
-        if let Ok(h) = tbl.get::<f32>("height") {
-            style.height = Some(h);
+        if let Ok(w_val) = tbl.get::<LuaValue>("width") {
+            style.width = Self::parse_dimension(&w_val);
         }
 
-        if let Ok(dir) = tbl.get::<String>("direction") {
-            if dir == "column" {
-                style.flex_direction = FlexDirection::Column;
-                style.align_items = Some(AlignItems::STRETCH);
+        if let Ok(h_val) = tbl.get::<LuaValue>("height") {
+            style.height = Self::parse_dimension(&h_val);
+        }
+
+        if let Ok(mw_val) = tbl.get::<LuaValue>("max_width") {
+            style.max_width = Self::parse_dimension(&mw_val);
+        }
+
+        if let Ok(op) = tbl.get::<f32>("opacity") {
+            style.opacity = Some(op);
+        } else if let Ok(sig_tbl) = tbl.get::<LuaTable>("opacity") {
+            if let Ok(get_fn) = sig_tbl.get::<LuaFunction>("get") {
+                if let Ok(op) = get_fn.call::<f32>(Some(sig_tbl.clone())) {
+                    style.opacity = Some(op);
+                }
+            } else if let Ok(op) = sig_tbl.get::<f32>("value") {
+                style.opacity = Some(op);
+            }
+        }
+
+        if let Ok(sc) = tbl.get::<f32>("scale") {
+            style.scale = Some(sc);
+        } else if let Ok(sig_tbl) = tbl.get::<LuaTable>("scale") {
+            if let Ok(get_fn) = sig_tbl.get::<LuaFunction>("get") {
+                if let Ok(sc) = get_fn.call::<f32>(Some(sig_tbl.clone())) {
+                    style.scale = Some(sc);
+                }
+            } else if let Ok(sc) = sig_tbl.get::<f32>("value") {
+                style.scale = Some(sc);
+            }
+        }
+
+        if let Ok(dir) = tbl.get::<String>("flex_direction").or_else(|_| tbl.get::<String>("direction")) {
+            match dir.to_lowercase().as_str() {
+                "column" => {
+                    style.flex_direction = FlexDirection::Column;
+                    style.align_items = Some(AlignItems::STRETCH);
+                }
+                "row" => {
+                    style.flex_direction = FlexDirection::Row;
+                }
+                "column-reverse" | "column_reverse" => {
+                    style.flex_direction = FlexDirection::ColumnReverse;
+                    style.align_items = Some(AlignItems::STRETCH);
+                }
+                "row-reverse" | "row_reverse" => {
+                    style.flex_direction = FlexDirection::RowReverse;
+                }
+                _ => {}
             }
         }
 
@@ -2184,38 +2748,48 @@ impl LuauRuntime {
             style.flex_shrink = shrink;
         }
 
-        if let Ok(mw) = tbl.get::<f32>("max_width") {
-            style.max_width = Some(mw);
-        }
-
-
         if let Ok(gap) = tbl.get::<f32>("gap") {
-
             style.gap = gap;
         }
 
         if let Ok(pad) = tbl.get::<f32>("padding") {
             style.padding = [pad, pad, pad, pad];
         } else if let Ok(pad_tbl) = tbl.get::<LuaTable>("padding") {
-            let x: f32 = pad_tbl.get("x").unwrap_or(0.0);
-            let y: f32 = pad_tbl.get("y").unwrap_or(0.0);
-            let top: f32 = pad_tbl.get("top").unwrap_or(y);
-            let right: f32 = pad_tbl.get("right").unwrap_or(x);
-            let bottom: f32 = pad_tbl.get("bottom").unwrap_or(y);
-            let left: f32 = pad_tbl.get("left").unwrap_or(x);
+            let h: f32 = pad_tbl.get("horizontal").or_else(|_| pad_tbl.get("x")).unwrap_or(0.0);
+            let v: f32 = pad_tbl.get("vertical").or_else(|_| pad_tbl.get("y")).unwrap_or(0.0);
+            let top: f32 = pad_tbl.get("top").unwrap_or(v);
+            let right: f32 = pad_tbl.get("right").unwrap_or(h);
+            let bottom: f32 = pad_tbl.get("bottom").unwrap_or(v);
+            let left: f32 = pad_tbl.get("left").unwrap_or(h);
             style.padding = [top, right, bottom, left];
+        }
+
+        if let Ok(m) = tbl.get::<f32>("margin") {
+            style.margin = [m, m, m, m];
+        } else if let Ok(m_tbl) = tbl.get::<LuaTable>("margin") {
+            let h: f32 = m_tbl.get("horizontal").or_else(|_| m_tbl.get("x")).unwrap_or(0.0);
+            let v: f32 = m_tbl.get("vertical").or_else(|_| m_tbl.get("y")).unwrap_or(0.0);
+            let top: f32 = m_tbl.get("top").unwrap_or(v);
+            let right: f32 = m_tbl.get("right").unwrap_or(h);
+            let bottom: f32 = m_tbl.get("bottom").unwrap_or(v);
+            let left: f32 = m_tbl.get("left").unwrap_or(h);
+            style.margin = [top, right, bottom, left];
         }
 
         if let Ok(radius) = tbl.get::<f32>("border_radius") {
             style.border_radius = radius;
         }
 
-        if let Ok(bg_tbl) = tbl.get::<LuaTable>("background") {
-            style.background_color = Self::parse_color(&bg_tbl);
+        if let Ok(bg_val) = tbl.get::<LuaValue>("background").or_else(|_| tbl.get::<LuaValue>("bg")) {
+            if let Some(c) = Self::parse_color_value(&bg_val) {
+                style.background_color = c;
+            }
         }
 
-        if let Ok(border_tbl) = tbl.get::<LuaTable>("border_color") {
-            style.border_color = Self::parse_color(&border_tbl);
+        if let Ok(border_val) = tbl.get::<LuaValue>("border_color") {
+            if let Some(c) = Self::parse_color_value(&border_val) {
+                style.border_color = c;
+            }
         }
 
         if let Ok(bw) = tbl.get::<f32>("border_width") {
@@ -2224,8 +2798,9 @@ impl LuauRuntime {
 
         if let Ok(shadow_tbl) = tbl.get::<LuaTable>("shadow") {
             let color = shadow_tbl
-                .get("color")
-                .map(|c: LuaTable| Self::parse_color(&c))
+                .get::<LuaValue>("color")
+                .ok()
+                .and_then(|v| Self::parse_color_value(&v))
                 .unwrap_or(Color::rgba(0, 0, 0, 80));
             let blur = shadow_tbl.get::<f32>("blur").unwrap_or(8.0);
             let offset_x = shadow_tbl.get::<f32>("offset_x").unwrap_or(0.0);
@@ -2332,6 +2907,8 @@ mod tests {
             "BatteryPopup",
             "LockScreen",
             "Settings",
+            "ExposePopup",
+            "CheatSheet",
         ];
         for name in &overlays {
             let path = format!("config/zenith/overlays/{}.luau", name);
@@ -3086,8 +3663,50 @@ mod tests {
         assert!(runtime.trigger_click("brightness:set:80").is_ok());
         assert!(runtime.trigger_click("brightness:step:5").is_ok());
         assert!(runtime.trigger_click("idle:set:true").is_ok());
-        assert!(runtime.is_idle());
         assert!(runtime.trigger_click("idle:toggle").is_ok());
         assert!(!runtime.is_idle());
     }
+
+    #[test]
+    fn test_secure_password_and_lockout() {
+        let runtime = LuauRuntime::new().expect("Failed to create runtime");
+
+        // Verify initial state
+        assert_eq!(runtime.lock_password_len(), 0);
+        assert!(!runtime.is_locked_out());
+        assert_eq!(runtime.remaining_lockout_secs(), 0);
+
+        // Test pushing password characters
+        runtime.push_lock_password("s");
+        runtime.push_lock_password("e");
+        runtime.push_lock_password("c");
+        runtime.push_lock_password("ret");
+        assert_eq!(runtime.lock_password_len(), 6);
+
+        // Test pop
+        runtime.pop_lock_password();
+        assert_eq!(runtime.lock_password_len(), 5);
+
+        // Test take_password scrubs buffer immediately
+        let pwd = runtime.take_lock_password();
+        assert_eq!(pwd, "secre");
+        assert_eq!(runtime.lock_password_len(), 0);
+
+        // Test lockout exponential progression
+        assert_eq!(runtime.record_lock_failure(), 0); // 1st failure
+        assert!(!runtime.is_locked_out());
+        assert_eq!(runtime.record_lock_failure(), 0); // 2nd failure
+        assert!(!runtime.is_locked_out());
+
+        let delay1 = runtime.record_lock_failure(); // 3rd failure triggers lockout
+        assert!(delay1 > 0);
+        assert!(runtime.is_locked_out());
+        assert!(runtime.remaining_lockout_secs() > 0);
+
+        // Test success resets lockout
+        runtime.record_lock_success();
+        assert!(!runtime.is_locked_out());
+        assert_eq!(runtime.remaining_lockout_secs(), 0);
+    }
 }
+

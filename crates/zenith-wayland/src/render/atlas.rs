@@ -28,6 +28,8 @@ pub struct GlyphAtlas {
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
+    upload_scratch: Vec<u8>,
+    pub needs_flush: bool,
 }
 
 impl GlyphAtlas {
@@ -67,12 +69,23 @@ impl GlyphAtlas {
             cursor_x: 1,
             cursor_y: 1,
             row_height: 0,
+            upload_scratch: Vec::with_capacity(64 * 64 * 4),
+            needs_flush: false,
         })
     }
 
     #[inline]
     pub fn texture(&self) -> glow::NativeTexture {
         self.texture
+    }
+
+    /// Resets the texture atlas cursor and clears the CPU cache.
+    pub fn reset(&mut self) {
+        self.cache.clear();
+        self.cursor_x = 1;
+        self.cursor_y = 1;
+        self.row_height = 0;
+        self.needs_flush = false;
     }
 
     /// Lookup cached glyph or rasterize on-demand via SwashCache and upload into VRAM.
@@ -104,13 +117,11 @@ impl GlyphAtlas {
             self.row_height = 0;
         }
 
-        // If atlas is completely full, reset and purge cache
+        // If atlas is completely full, signal flush rather than silently corrupting active batched draw calls
         if self.cursor_y + height + padding >= ATLAS_SIZE {
-            tracing::warn!("Glyph Atlas VRAM full ({}x{}), resetting cache", ATLAS_SIZE, ATLAS_SIZE);
-            self.cache.clear();
-            self.cursor_x = 1;
-            self.cursor_y = 1;
-            self.row_height = 0;
+            tracing::warn!("Glyph Atlas VRAM full ({}x{}), signaling flush", ATLAS_SIZE, ATLAS_SIZE);
+            self.needs_flush = true;
+            return None;
         }
 
         let x = self.cursor_x;
@@ -126,9 +137,10 @@ impl GlyphAtlas {
 
             let is_col = match image.content {
                 SwashContent::Mask => {
-                    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+                    self.upload_scratch.clear();
+                    self.upload_scratch.reserve((width * height * 4) as usize);
                     for &a in &image.data {
-                        rgba.extend_from_slice(&[255, 255, 255, a]);
+                        self.upload_scratch.extend_from_slice(&[255, 255, 255, a]);
                     }
                     self.gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
@@ -139,15 +151,16 @@ impl GlyphAtlas {
                         height as i32,
                         glow::RGBA,
                         glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(Some(&rgba)),
+                        glow::PixelUnpackData::Slice(Some(&self.upload_scratch)),
                     );
                     false
                 }
                 SwashContent::SubpixelMask => {
-                    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+                    self.upload_scratch.clear();
+                    self.upload_scratch.reserve((width * height * 4) as usize);
                     for chunk in image.data.chunks_exact(3) {
                         let avg = ((chunk[0] as u16 + chunk[1] as u16 + chunk[2] as u16) / 3) as u8;
-                        rgba.extend_from_slice(&[255, 255, 255, avg]);
+                        self.upload_scratch.extend_from_slice(&[255, 255, 255, avg]);
                     }
                     self.gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
@@ -158,7 +171,7 @@ impl GlyphAtlas {
                         height as i32,
                         glow::RGBA,
                         glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(Some(&rgba)),
+                        glow::PixelUnpackData::Slice(Some(&self.upload_scratch)),
                     );
                     false
                 }

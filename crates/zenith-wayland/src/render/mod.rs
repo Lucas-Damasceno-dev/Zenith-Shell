@@ -1,6 +1,7 @@
 //! Zenith Rendering Subsystem — Hardware-accelerated GLES 3.0 & Contingency SHM Fallback.
 
 pub mod atlas;
+pub mod blur;
 pub mod custom_shader;
 pub mod damage;
 pub mod gles;
@@ -9,6 +10,7 @@ pub mod primitives;
 pub mod shm;
 
 pub use atlas::GlyphAtlas;
+pub use blur::DualKawaseBlur;
 pub use custom_shader::CustomShaderPipeline;
 pub use damage::{box_visual_bounds, compute_damage_rect, DamageRect, DamageRing};
 pub use gles::GlesRenderer;
@@ -43,6 +45,7 @@ mod tests {
             &mut font_system,
             &mut swash_cache,
             None,
+            1.0,
         );
         assert!(res.is_ok());
     }
@@ -136,6 +139,7 @@ mod tests {
             &mut font_system,
             &mut swash_cache,
             None,
+            1.0,
         );
         assert!(res.is_ok());
 
