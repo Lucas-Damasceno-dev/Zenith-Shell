@@ -31,7 +31,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT, BTN_RIGHT},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -47,6 +47,7 @@ use smithay_client_toolkit::{
     },
     subcompositor::SubcompositorState,
 };
+use std::sync::Arc;
 use tracing::{error, info};
 use wayland_client::{
     globals::registry_queue_init,
@@ -88,10 +89,12 @@ pub struct SessionLockSurface {
     pub height: u32,
     pub configured: bool,
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
+    pub scratch_boxes: Vec<zenith_layout::ComputedBox>,
     pub canvas_cache: Vec<u8>,
     pub egl_surface: Option<crate::egl::EglSurface>,
     pub damage_ring: crate::render::damage::DamageRing<4>,
     pub frame_callback_pending: bool,
+    pub layout_engine: LayoutEngine,
 }
 
 #[derive(Default)]
@@ -117,6 +120,36 @@ pub fn copy_rgba_to_argb8888(dst: &mut [u8], src: &[u8]) {
         dst[idx + 1] = g;
         dst[idx + 2] = r;
         dst[idx + 3] = a;
+    }
+}
+
+/// Swizzles a tiny-skia RGBA subregion into Wayland Argb8888 memory layout restricted to damage rect.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn copy_rgba_to_argb8888_rect(
+    dst: &mut [u8],
+    src: &[u8],
+    width: usize,
+    height: usize,
+    rx: usize,
+    ry: usize,
+    rw: usize,
+    rh: usize,
+) {
+    let row_bytes = width * 4;
+    let end_y = (ry + rh).min(height);
+    let end_x = (rx + rw).min(width);
+    for y in ry..end_y {
+        let row_start = y * row_bytes;
+        for x in rx..end_x {
+            let idx = row_start + x * 4;
+            if idx + 3 < dst.len() && idx + 3 < src.len() {
+                dst[idx] = src[idx + 2];
+                dst[idx + 1] = src[idx + 1];
+                dst[idx + 2] = src[idx];
+                dst[idx + 3] = src[idx + 3];
+            }
+        }
     }
 }
 
@@ -263,6 +296,7 @@ pub struct PopupWindow {
     pub configured: bool,
     pub root_ui: UiNode,
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
+    pub scratch_boxes: Vec<zenith_layout::ComputedBox>,
     pub canvas_cache: Vec<u8>,
     pub egl_surface: Option<crate::egl::EglSurface>,
     pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
@@ -270,6 +304,8 @@ pub struct PopupWindow {
     pub closing: bool,
     pub damage_ring: crate::render::damage::DamageRing<4>,
     pub frame_callback_pending: bool,
+    pub layout_engine: LayoutEngine,
+    pub last_frame_instant: Option<std::time::Instant>,
 }
 
 impl Drop for PopupWindow {
@@ -289,11 +325,13 @@ pub struct BarInstance {
     pub configured: bool,
     pub is_hidden: bool,
     pub computed_boxes: Vec<zenith_layout::ComputedBox>,
+    pub scratch_boxes: Vec<zenith_layout::ComputedBox>,
     pub canvas_cache: Vec<u8>,
     pub egl_surface: Option<crate::egl::EglSurface>,
     pub scale_tracker: Option<crate::fractional_scale::SurfaceScaleTracker>,
     pub damage_ring: crate::render::damage::DamageRing<4>,
     pub frame_callback_pending: bool,
+    pub layout_engine: LayoutEngine,
 }
 
 impl Drop for BarInstance {
@@ -304,6 +342,13 @@ impl Drop for BarInstance {
 }
 
 /// Main application state for Wayland event handling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TooltipSurface {
+    Popup,
+    Dock,
+    Bar(usize),
+}
+
 pub struct WaylandApp {
     pub registry_state: RegistryState,
     pub output_state: OutputState,
@@ -317,7 +362,6 @@ pub struct WaylandApp {
     pub gles_renderer: Option<crate::render::GlesRenderer>,
     pub layer_shell: LayerShell,
     pub bars: Vec<BarInstance>,
-    pub bar_surface: Option<LayerSurface>,
     pub popup: Option<PopupWindow>,
     pub dock: Option<PopupWindow>,
     pub dock_autohide: bool,
@@ -331,18 +375,17 @@ pub struct WaylandApp {
     pub pointer: Option<wayland_client::protocol::wl_pointer::WlPointer>,
     pub keyboard: Option<wayland_client::protocol::wl_keyboard::WlKeyboard>,
     pub pointer_pos: (f64, f64),
-    pub computed_boxes: Vec<zenith_layout::ComputedBox>,
     pub width: u32,
     pub height: u32,
     pub screen_width: u32,
     pub screen_height: u32,
     pub configured: bool,
     pub running: bool,
-    pub layout_engine: LayoutEngine,
     pub runtime: LuauRuntime,
     pub root_ui: UiNode,
     pub bar_script: String,
     pub font_system: cosmic_text::FontSystem,
+    pub cursor_measure_buffer: cosmic_text::Buffer,
     pub swash_cache: cosmic_text::SwashCache,
     pub overlay_path_cache: std::collections::HashMap<String, std::path::PathBuf>,
     pub qh: QueueHandle<Self>,
@@ -358,14 +401,16 @@ pub struct WaylandApp {
     pub idle_manager: crate::idle::IdleManager,
     pub cursor_shape_mgr: Option<WpCursorShapeManagerV1>,
     pub cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+
     pub last_pointer_enter_serial: Option<u32>,
     pub current_cursor_shape: Option<Shape>,
-    pub tooltip_hover: Option<(String, std::time::Instant)>,
+    pub tooltip_hover: Option<((TooltipSurface, usize), std::time::Instant)>,
     pub session_lock: SessionLockState,
     pub needs_redraw_bars: bool,
     pub needs_redraw_popup: bool,
     pub needs_redraw_dock: bool,
     pub dock_magnification: zenith_core::MagnificationModel,
+    pub dock_spring_tracker: zenith_core::MagnificationSpringTracker,
 }
 
 impl WaylandApp {
@@ -391,8 +436,7 @@ impl WaylandApp {
 
         let seat_state = SeatState::new(&globals, &qh);
         let runtime = LuauRuntime::new()?;
-        let root_ui = runtime.eval_ui(DEFAULT_LUAU_SCRIPT)?;
-        let layout_engine = LayoutEngine::new();
+        let root_ui = runtime.eval_ui_for_tree("bar", DEFAULT_LUAU_SCRIPT)?;
 
         let mut gestures_manager = PointerGesturesManager::new();
         if let Ok(gestures) = globals.bind::<ZwpPointerGesturesV1, _, _>(&qh, 1..=3, ()) {
@@ -468,7 +512,6 @@ impl WaylandApp {
             gles_renderer,
             layer_shell,
             bars: Vec::new(),
-            bar_surface: None,
             popup: None,
             dock: None,
             dock_autohide: false,
@@ -482,18 +525,17 @@ impl WaylandApp {
             pointer: None,
             keyboard: None,
             pointer_pos: (0.0, 0.0),
-            computed_boxes: Vec::new(),
             width: 1920,
             height: 42,
             screen_width: 1366,
             screen_height: 768,
             configured: false,
             running: true,
-            layout_engine,
             runtime,
             root_ui,
             bar_script: DEFAULT_LUAU_SCRIPT.to_string(),
             font_system: cosmic_text::FontSystem::new(),
+            cursor_measure_buffer: cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(14.0, 14.0 * 1.3)),
             swash_cache: cosmic_text::SwashCache::new(),
             overlay_path_cache: std::collections::HashMap::new(),
             qh: qh.clone(),
@@ -517,6 +559,7 @@ impl WaylandApp {
             needs_redraw_popup: false,
             needs_redraw_dock: false,
             dock_magnification: zenith_core::MagnificationModel::new(zenith_core::MagnificationConfig::default()),
+            dock_spring_tracker: zenith_core::MagnificationSpringTracker::new(16),
         };
 
         app.height = app.get_bar_height();
@@ -569,10 +612,12 @@ impl WaylandApp {
                         height: 0,
                         configured: false,
                         computed_boxes: Vec::new(),
+                        scratch_boxes: Vec::new(),
                         canvas_cache: Vec::new(),
                         egl_surface: None,
                         damage_ring: crate::render::damage::DamageRing::new(),
                         frame_callback_pending: false,
+                        layout_engine: LayoutEngine::new(),
                     });
                 }
                 self.session_lock.lock = Some(lock);
@@ -639,11 +684,13 @@ impl WaylandApp {
             configured: false,
             is_hidden: false,
             computed_boxes: Vec::new(),
+            scratch_boxes: Vec::new(),
             canvas_cache: Vec::new(),
             egl_surface: None,
             scale_tracker,
             damage_ring: crate::render::damage::DamageRing::new(),
             frame_callback_pending: false,
+            layout_engine: LayoutEngine::new(),
         });
 
         let _ = self.update_bar_visibility();
@@ -662,10 +709,6 @@ impl WaylandApp {
         for bar in &self.bars {
             bar.surface.set_margin(0, 0, 0, 0);
             bar.surface.commit();
-        }
-        if let Some(ref bar) = self.bar_surface {
-            bar.set_margin(0, 0, 0, 0);
-            bar.commit();
         }
     }
 
@@ -699,11 +742,13 @@ impl WaylandApp {
 
     /// Dispatches an asynchronous PAM authentication check in a background worker thread.
     pub fn start_pam_auth(&mut self, password: &str) {
-        let pwd = password.to_string();
+        let mut pwd = password.as_bytes().to_vec();
         let (tx, rx) = std::sync::mpsc::channel();
         self.pam_auth_rx = Some(rx);
         std::thread::spawn(move || {
-            let res = verify_pam_password_sync(&pwd);
+            let pwd_str = String::from_utf8_lossy(&pwd);
+            let res = verify_pam_password_sync(&pwd_str);
+            pwd.fill(0);
             let _ = tx.send(res);
         });
     }
@@ -797,6 +842,7 @@ impl WaylandApp {
             }
         }
         if bars_need_draw {
+            self.runtime.mark_tree_dirty("bar");
             self.needs_redraw_bars = false;
             let redrawn = self.update_bar_visibility().unwrap_or(false);
             if !redrawn {
@@ -827,11 +873,7 @@ impl WaylandApp {
                     dock.frame_callback_pending = true;
                     self.needs_redraw_dock = false;
                     let _ = self.update_dock_visibility();
-                    if !self.dock_hidden {
-                        let _ = self.reload_dock();
-                    } else {
-                        let _ = self.draw_dock();
-                    }
+                    let _ = self.draw_dock();
                 } else {
                     self.needs_redraw_dock = true;
                 }
@@ -879,29 +921,37 @@ impl WaylandApp {
     /// Checks if a pending tooltip hover has exceeded 400ms and activates the tooltip box.
     pub fn check_tooltip_timer(&mut self) -> bool {
         let mut activated = false;
-        if let Some((ref key, start)) = self.tooltip_hover {
+        if let Some(((surface, box_idx), start)) = self.tooltip_hover {
             if start.elapsed() >= std::time::Duration::from_millis(400) {
-                if let Some(ref mut popup) = self.popup {
-                    for b in &mut popup.computed_boxes {
-                        if b.tooltip.is_some() && key.starts_with("popup:") && key.contains(&format!("@{:.0},{:.0}", b.x, b.y)) && !b.tooltip_active {
-                            b.tooltip_active = true;
-                            activated = true;
+                match surface {
+                    TooltipSurface::Popup => {
+                        if let Some(ref mut popup) = self.popup {
+                            if let Some(b) = popup.computed_boxes.get_mut(box_idx) {
+                                if b.tooltip.is_some() && !b.tooltip_active {
+                                    b.tooltip_active = true;
+                                    activated = true;
+                                }
+                            }
                         }
                     }
-                }
-                if let Some(ref mut dock) = self.dock {
-                    for b in &mut dock.computed_boxes {
-                        if b.tooltip.is_some() && key.starts_with("dock:") && key.contains(&format!("@{:.0},{:.0}", b.x, b.y)) && !b.tooltip_active {
-                            b.tooltip_active = true;
-                            activated = true;
+                    TooltipSurface::Dock => {
+                        if let Some(ref mut dock) = self.dock {
+                            if let Some(b) = dock.computed_boxes.get_mut(box_idx) {
+                                if b.tooltip.is_some() && !b.tooltip_active {
+                                    b.tooltip_active = true;
+                                    activated = true;
+                                }
+                            }
                         }
                     }
-                }
-                for bar in &mut self.bars {
-                    for b in &mut bar.computed_boxes {
-                        if b.tooltip.is_some() && key.starts_with(&format!("bar:{}", bar.output_name)) && key.contains(&format!("@{:.0},{:.0}", b.x, b.y)) && !b.tooltip_active {
-                            b.tooltip_active = true;
-                            activated = true;
+                    TooltipSurface::Bar(bar_idx) => {
+                        if let Some(bar) = self.bars.get_mut(bar_idx) {
+                            if let Some(b) = bar.computed_boxes.get_mut(box_idx) {
+                                if b.tooltip.is_some() && !b.tooltip_active {
+                                    b.tooltip_active = true;
+                                    activated = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -916,6 +966,7 @@ impl WaylandApp {
     /// Reloads Luau active component trees after file modifications.
     pub fn reload_active_trees(&mut self) {
         self.runtime.clear_module_cache();
+        self.runtime.mark_tree_dirty("bar");
 
         // Reload bars
         for bar in &mut self.bars {
@@ -953,10 +1004,14 @@ impl WaylandApp {
     /// Re-evaluates Luau script and updates the UI tree on hot-reload.
     /// Preserves the last rendered frame if syntax or evaluation error occurs (Error Boundary).
     pub fn reload_script(&mut self, script: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(e) = self.runtime.eval_ui(script) {
-            eprintln!("[zenith] Hot-reload compilation error, preserving last frame: {e}");
-            return Ok(());
-        }
+        let new_ui = match self.runtime.eval_ui_for_tree("bar", script) {
+            Ok(ui) => ui,
+            Err(e) => {
+                eprintln!("[zenith] Hot-reload compilation error, preserving last frame: {e}");
+                return Ok(());
+            }
+        };
+        self.root_ui = new_ui;
         self.bar_script = script.to_string();
         self.reload_active_trees();
         Ok(())
@@ -1192,6 +1247,7 @@ impl WaylandApp {
             configured: false,
             root_ui,
             computed_boxes: Vec::new(),
+            scratch_boxes: Vec::new(),
             canvas_cache: Vec::new(),
             egl_surface: None,
             scale_tracker,
@@ -1199,6 +1255,8 @@ impl WaylandApp {
             closing: false,
             damage_ring: crate::render::damage::DamageRing::new(),
             frame_callback_pending: false,
+            layout_engine: LayoutEngine::new(),
+            last_frame_instant: None,
         });
 
         Ok(())
@@ -1719,6 +1777,7 @@ impl WaylandApp {
             configured: false,
             root_ui,
             computed_boxes: Vec::new(),
+            scratch_boxes: Vec::new(),
             canvas_cache: Vec::new(),
             egl_surface: None,
             scale_tracker,
@@ -1726,6 +1785,8 @@ impl WaylandApp {
             closing: false,
             damage_ring: crate::render::damage::DamageRing::new(),
             frame_callback_pending: false,
+            layout_engine: LayoutEngine::new(),
+            last_frame_instant: None,
         });
 
         let _ = self.update_dock_visibility();
@@ -1733,40 +1794,7 @@ impl WaylandApp {
         Ok(())
     }
 
-    /// Scales computed layout boxes by fractional/integer surface scale factor.
-    pub fn scale_computed_boxes<'a>(
-        boxes: &'a [zenith_layout::ComputedBox],
-        scale_factor: f32,
-    ) -> std::borrow::Cow<'a, [zenith_layout::ComputedBox]> {
-        if (scale_factor - 1.0).abs() > 0.001 {
-            std::borrow::Cow::Owned(boxes.iter().map(|b| {
-                let mut scaled = b.clone();
-                scaled.x *= scale_factor;
-                scaled.y *= scale_factor;
-                scaled.width *= scale_factor;
-                scaled.height *= scale_factor;
-                scaled.border_width *= scale_factor;
-                scaled.border_radius *= scale_factor;
-                if let Some((ref txt, color, size)) = scaled.text {
-                    scaled.text = Some((txt.clone(), color, size * scale_factor));
-                }
-                if let Some(ref mut input) = scaled.text_input {
-                    input.font_size *= scale_factor;
-                }
-                if let Some(ref mut shadow) = scaled.shadow {
-                    shadow.blur *= scale_factor;
-                    shadow.offset_x *= scale_factor;
-                    shadow.offset_y *= scale_factor;
-                }
-                if let Some([cx, cy, cw, ch]) = scaled.clip_rect {
-                    scaled.clip_rect = Some([cx * scale_factor, cy * scale_factor, cw * scale_factor, ch * scale_factor]);
-                }
-                scaled
-            }).collect())
-        } else {
-            std::borrow::Cow::Borrowed(boxes)
-        }
-    }
+
 
     /// Unified rendering pipeline for all Wayland surfaces (Bars, Dock, Popups, Lockscreen).
     /// Enforces correct EGL make_current ordering before buffer age query, and swizzles
@@ -1909,7 +1937,16 @@ impl WaylandApp {
                 wl_shm::Format::Argb8888,
             )?;
 
-            copy_rgba_to_argb8888(canvas, canvas_cache);
+            copy_rgba_to_argb8888_rect(
+                canvas,
+                canvas_cache,
+                phys_w as usize,
+                phys_h as usize,
+                p_dx.max(0) as usize,
+                p_dy.max(0) as usize,
+                p_dw.max(0) as usize,
+                p_dh.max(0) as usize,
+            );
 
             buffer.attach_to(wl_surface)?;
             if attach_frame_callback {
@@ -1998,10 +2035,16 @@ impl WaylandApp {
                 }
             };
 
-            let new_boxes = self.layout_engine.compute(&root_ui, width as f32, height as f32);
             let surf = &mut self.session_lock.surfaces[i];
-            let damage = Self::compute_damage_rect(&surf.computed_boxes, &new_boxes, width, height);
-            surf.computed_boxes = new_boxes;
+            surf.layout_engine.compute_into(
+                &root_ui,
+                width as f32,
+                height as f32,
+                &mut surf.scratch_boxes,
+                Some(&mut self.font_system),
+            );
+            let damage = Self::compute_damage_rect(&surf.computed_boxes, &surf.scratch_boxes, width, height);
+            std::mem::swap(&mut surf.computed_boxes, &mut surf.scratch_boxes);
 
             let render_boxes = std::borrow::Cow::Borrowed(&surf.computed_boxes);
             let wl_surf = surf.wl_surface.clone();
@@ -2056,7 +2099,8 @@ impl WaylandApp {
             let pill_h = 2.0f32;
             let pill_x = (width as f32 - pill_w) * 0.5;
             let pill_y = (height as f32 - pill_h).max(0.0);
-            let new_boxes = vec![zenith_layout::ComputedBox {
+            dock.scratch_boxes.clear();
+            dock.scratch_boxes.push(zenith_layout::ComputedBox {
                 x: pill_x,
                 y: pill_y,
                 width: pill_w,
@@ -2064,12 +2108,12 @@ impl WaylandApp {
                 background_color: zenith_layout::Color::rgba(130, 170, 255, 120),
                 border_radius: 1.0,
                 ..Default::default()
-            }];
-            if dock.computed_boxes == new_boxes {
+            });
+            if dock.computed_boxes == dock.scratch_boxes {
                 dock.frame_callback_pending = false;
                 return Ok(());
             }
-            dock.computed_boxes = new_boxes;
+            std::mem::swap(&mut dock.computed_boxes, &mut dock.scratch_boxes);
 
             let scale_factor = dock.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
             if let Some(ref tracker) = dock.scale_tracker {
@@ -2105,22 +2149,43 @@ impl WaylandApp {
             return Ok(());
         }
 
-        let mut new_boxes = self.layout_engine.compute(&dock.root_ui, width as f32, height as f32);
+        dock.layout_engine.compute_into(
+            &dock.root_ui,
+            width as f32,
+            height as f32,
+            &mut dock.scratch_boxes,
+            Some(&mut self.font_system),
+        );
         let mag_enabled = self.runtime.storage.get("dockMagnification").and_then(|v| v.as_bool()).unwrap_or(true);
         let pointer_x = if self.dock_hovered && mag_enabled {
             Some(self.pointer_pos.0 as f32)
         } else {
             None
         };
-        zenith_layout::apply_dock_magnification(&mut new_boxes, &self.dock_magnification, pointer_x, true);
-        let damage = Self::compute_damage_rect(&dock.computed_boxes, &new_boxes, width, height);
+        let now = std::time::Instant::now();
+        let dt = dock.last_frame_instant.map(|prev| (now - prev).as_secs_f32()).unwrap_or(0.016).clamp(0.001, 0.05);
+        dock.last_frame_instant = Some(now);
 
-        if damage.is_none() && !dock.computed_boxes.is_empty() {
+        let is_mag_animating = zenith_layout::apply_dock_magnification_with_tracker(
+            &mut dock.scratch_boxes,
+            &self.dock_magnification,
+            Some(&mut self.dock_spring_tracker),
+            pointer_x,
+            dt,
+            true,
+        );
+        let damage = if is_mag_animating {
+            Some((0, 0, width as i32, height as i32))
+        } else {
+            Self::compute_damage_rect(&dock.computed_boxes, &dock.scratch_boxes, width, height)
+        };
+
+        if !is_mag_animating && damage.is_none() && !dock.computed_boxes.is_empty() {
             dock.frame_callback_pending = false;
             return Ok(());
         }
 
-        dock.computed_boxes = new_boxes;
+        std::mem::swap(&mut dock.computed_boxes, &mut dock.scratch_boxes);
 
         let scale_factor = dock.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
         if let Some(ref tracker) = dock.scale_tracker {
@@ -2131,7 +2196,7 @@ impl WaylandApp {
         let egl_surf = &mut dock.egl_surface;
         let damage_ring = &mut dock.damage_ring;
         let canvas_cache = &mut dock.canvas_cache;
-        let attach_frame = dock.frame_callback_pending;
+        let attach_frame = is_mag_animating || dock.frame_callback_pending;
 
         Self::render_surface_pipeline_helper(
             &self.egl_context,
@@ -2152,6 +2217,13 @@ impl WaylandApp {
             1.0,
             attach_frame,
         )?;
+
+        if attach_frame {
+            dock.frame_callback_pending = true;
+        }
+        if is_mag_animating {
+            self.needs_redraw_dock = true;
+        }
 
         Ok(())
     }
@@ -2252,6 +2324,16 @@ impl WaylandApp {
                 let _ = self.reload_popup(&id);
                 let _ = self.draw_popup();
             }
+        } else if action == "settings:sync" {
+            let _ = self.runtime.storage.sync_to_config();
+            self.reload_active_trees();
+        } else if action == "reload" {
+            self.reload_active_trees();
+        } else if action == "settings:reset_defaults" {
+            let _ = self.runtime.storage.clear();
+            let _ = self.runtime.storage.sync_to_config();
+            let _ = self.runtime.storage.reload_from_config();
+            self.reload_active_trees();
         } else if let Some(reason) = action.strip_prefix("idle:inhibit:") {
             let _ = self.inhibit_idle(reason);
         } else if action == "idle:inhibit" {
@@ -2303,6 +2385,7 @@ impl WaylandApp {
             if self.dock.is_some() {
                 let _ = self.reload_dock();
             }
+            self.runtime.mark_tree_dirty("bar");
             let _ = self.draw();
         }
     }
@@ -2326,7 +2409,8 @@ impl WaylandApp {
                 let line_w = (width as f32 * 0.25).clamp(80.0, 300.0);
                 let line_h = 2.0f32;
                 let line_x = (width as f32 - line_w) * 0.5;
-                let new_boxes = vec![zenith_layout::ComputedBox {
+                bar.scratch_boxes.clear();
+                bar.scratch_boxes.push(zenith_layout::ComputedBox {
                     x: line_x,
                     y: 0.0,
                     width: line_w,
@@ -2334,12 +2418,12 @@ impl WaylandApp {
                     background_color: zenith_layout::Color::rgba(130, 170, 255, 100),
                     border_radius: 1.0,
                     ..Default::default()
-                }];
-                if bar.computed_boxes == new_boxes {
+                });
+                if bar.computed_boxes == bar.scratch_boxes {
                     bar.frame_callback_pending = false;
                     continue;
                 }
-                bar.computed_boxes = new_boxes;
+                std::mem::swap(&mut bar.computed_boxes, &mut bar.scratch_boxes);
 
                 let scale_factor = bar.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
                 if let Some(ref tracker) = bar.scale_tracker {
@@ -2388,17 +2472,26 @@ impl WaylandApp {
             };
             self.runtime.set_current_output_geometry(&bar.output_name, screen_w, screen_h);
 
-            let bar_ui = match self.runtime.eval_ui_for_tree("bar", &self.bar_script) {
-                Ok(ui) => ui,
-                Err(e) => {
-                    tracing::error!("BAR EVAL ERROR: {}", e);
-                    self.root_ui.clone()
-                }
-            };
-
-            // Compute Taffy layout on the Luau tree
-            let new_boxes = self.layout_engine.compute(&bar_ui, width as f32, height as f32);
-            let damage = Self::compute_damage_rect(&bar.computed_boxes, &new_boxes, width, height);
+            // Compute Taffy layout on the Luau tree by reference without cloning
+            let computed = self.runtime.reactive.with_tree("bar", |root_ui| {
+                bar.layout_engine.compute_into(
+                    root_ui,
+                    width as f32,
+                    height as f32,
+                    &mut bar.scratch_boxes,
+                    Some(&mut self.font_system),
+                );
+            });
+            if computed.is_none() {
+                bar.layout_engine.compute_into(
+                    &self.root_ui,
+                    width as f32,
+                    height as f32,
+                    &mut bar.scratch_boxes,
+                    Some(&mut self.font_system),
+                );
+            }
+            let damage = Self::compute_damage_rect(&bar.computed_boxes, &bar.scratch_boxes, width, height);
 
             // Frame-skip optimization: if nothing changed in the computed boxes, avoid redrawing and committing!
             if damage.is_none() && !bar.computed_boxes.is_empty() {
@@ -2406,7 +2499,7 @@ impl WaylandApp {
                 continue;
             }
 
-            bar.computed_boxes = new_boxes;
+            std::mem::swap(&mut bar.computed_boxes, &mut bar.scratch_boxes);
 
             let scale_factor = bar.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
             if let Some(ref tracker) = bar.scale_tracker {
@@ -2440,6 +2533,7 @@ impl WaylandApp {
             )?;
         }
 
+        self.runtime.mark_tree_clean("bar");
         Ok(())
     }
 
@@ -2473,24 +2567,28 @@ impl WaylandApp {
             return Ok(());
         }
 
-        let new_boxes = if is_spring_animating && !is_scroll_animating && !popup.computed_boxes.is_empty() {
-            popup.computed_boxes.clone()
-        } else {
-            self.layout_engine.compute(&popup.root_ui, width as f32, height as f32)
-        };
-        let damage = if is_animating {
+        let damage = if is_spring_animating && !is_scroll_animating && !popup.computed_boxes.is_empty() {
             Some((0, 0, width as i32, height as i32))
         } else {
-            Self::compute_damage_rect(&popup.computed_boxes, &new_boxes, width, height)
+            popup.layout_engine.compute_into(
+                &popup.root_ui,
+                width as f32,
+                height as f32,
+                &mut popup.scratch_boxes,
+                Some(&mut self.font_system),
+            );
+            let d = if is_animating {
+                Some((0, 0, width as i32, height as i32))
+            } else {
+                Self::compute_damage_rect(&popup.computed_boxes, &popup.scratch_boxes, width, height)
+            };
+            if !is_animating && d.is_none() && !popup.computed_boxes.is_empty() {
+                popup.frame_callback_pending = false;
+                return Ok(());
+            }
+            std::mem::swap(&mut popup.computed_boxes, &mut popup.scratch_boxes);
+            d
         };
-
-        // Frame-skip optimization: skip popup redraw if unchanged and not animating
-        if !is_animating && damage.is_none() && !popup.computed_boxes.is_empty() {
-            popup.frame_callback_pending = false;
-            return Ok(());
-        }
-
-        popup.computed_boxes = new_boxes;
 
         let scale_factor = popup.scale_tracker.as_ref().map(|t| t.scale_factor).unwrap_or(1.0);
         if let Some(ref tracker) = popup.scale_tracker {
@@ -2540,29 +2638,7 @@ impl WaylandApp {
             .map(|d| (d.x, d.y, d.width, d.height))
     }
 
-    #[allow(dead_code)]
-    fn build_rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
-        if w <= 0.0 || h <= 0.0 {
-            return None;
-        }
-        let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
-        if r > 0.0 {
-            let mut pb = tiny_skia::PathBuilder::new();
-            pb.move_to(x + r, y);
-            pb.line_to(x + w - r, y);
-            pb.quad_to(x + w, y, x + w, y + r);
-            pb.line_to(x + w, y + h - r);
-            pb.quad_to(x + w, y + h, x + w - r, y + h);
-            pb.line_to(x + r, y + h);
-            pb.quad_to(x, y + h, x, y + h - r);
-            pb.line_to(x, y + r);
-            pb.quad_to(x, y, x + r, y);
-            pb.close();
-            pb.finish()
-        } else {
-            tiny_skia::Rect::from_xywh(x, y, w, h).map(tiny_skia::PathBuilder::from_rect)
-        }
-    }
+
 
     #[allow(clippy::too_many_arguments)]
     fn render_boxes_to_canvas(
@@ -2632,29 +2708,8 @@ impl DataDeviceHandler for WaylandApp {
     fn motion(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice, _x: f64, _y: f64) {}
     fn selection(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &wayland_client::protocol::wl_data_device::WlDataDevice) {
         if self.clipboard_manager.copy_source.is_none() {
-            if let Some(ref device) = self.clipboard_manager.data_device {
-                if let Some(offer) = device.data().selection_offer() {
-                    let mime_match = offer.with_mime_types(|types| {
-                        crate::clipboard::TEXT_MIME_TYPES
-                            .iter()
-                            .find(|m| types.iter().any(|t| t == *m))
-                            .copied()
-                    });
-                    if let Some(mime) = mime_match {
-                        if let Ok(mut read_pipe) = offer.receive(mime.to_string()) {
-                            let ram_buf = self.clipboard_manager.ram_buffer.clone();
-                            std::thread::spawn(move || {
-                                use std::io::Read;
-                                let mut text = String::new();
-                                if read_pipe.read_to_string(&mut text).is_ok() && !text.is_empty() {
-                                    if let Ok(mut lock) = ram_buf.lock() {
-                                        *lock = text;
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
+            if let Ok(mut lock) = self.clipboard_manager.ram_buffer.lock() {
+                lock.clear();
             }
         }
     }
@@ -3070,6 +3125,7 @@ impl SeatHandler for WaylandApp {
 }
 
 fn measure_text_cursor_idx(
+    buffer: &mut cosmic_text::Buffer,
     font_system: &mut cosmic_text::FontSystem,
     text: &str,
     font_size: f32,
@@ -3078,11 +3134,14 @@ fn measure_text_cursor_idx(
     if text.is_empty() || rel_x <= 0.0 {
         return 0;
     }
-    let font_family = std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string());
-    let mut buffer = cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(font_size, font_size * 1.3));
+    static ZENITH_FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let font_family = ZENITH_FONT.get_or_init(|| {
+        std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string())
+    });
+    buffer.set_metrics(cosmic_text::Metrics::new(font_size, font_size * 1.3));
     buffer.set_text(
         text,
-        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
+        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(font_family)),
         cosmic_text::Shaping::Basic,
         None,
     );
@@ -3129,7 +3188,13 @@ impl PointerHandler for WaylandApp {
                         if self.dock_hidden {
                             let _ = self.update_dock_visibility();
                         } else {
-                            let _ = self.draw_dock();
+                            self.needs_redraw_dock = true;
+                            if let Some(ref mut dock) = self.dock {
+                                if !dock.frame_callback_pending {
+                                    dock.frame_callback_pending = true;
+                                    let _ = self.draw_dock();
+                                }
+                            }
                         }
                     }
                     if is_bar {
@@ -3143,11 +3208,11 @@ impl PointerHandler for WaylandApp {
                     // 1. Dynamic Cursor Shape (wp_cursor_shape_v1) & Tooltip Hover Detection
                     let (px, py) = self.pointer_pos;
                     let mut desired_shape = Shape::Default;
-                    let mut hovered_box_key: Option<String> = None;
+                    let mut hovered_box_target: Option<(TooltipSurface, usize)> = None;
 
                     if is_popup {
                         if let Some(ref popup) = self.popup {
-                            for b in popup.computed_boxes.iter().rev() {
+                            for (idx, b) in popup.computed_boxes.iter().enumerate().rev() {
                                 if px >= b.x as f64 && px <= (b.x + b.width) as f64 && py >= b.y as f64 && py <= (b.y + b.height) as f64 {
                                     if desired_shape == Shape::Default {
                                         if let Some(ref inp) = b.text_input {
@@ -3158,12 +3223,10 @@ impl PointerHandler for WaylandApp {
                                             desired_shape = Shape::Pointer;
                                         }
                                     }
-                                    if hovered_box_key.is_none() {
-                                        if let Some(ref tt) = b.tooltip {
-                                            hovered_box_key = Some(format!("popup:{}@{:.0},{:.0}", tt, b.x, b.y));
-                                        }
+                                    if hovered_box_target.is_none() && b.tooltip.is_some() {
+                                        hovered_box_target = Some((TooltipSurface::Popup, idx));
                                     }
-                                    if desired_shape != Shape::Default && hovered_box_key.is_some() {
+                                    if desired_shape != Shape::Default && hovered_box_target.is_some() {
                                         break;
                                     }
                                 }
@@ -3171,7 +3234,7 @@ impl PointerHandler for WaylandApp {
                         }
                     } else if is_dock {
                         if let Some(ref dock) = self.dock {
-                            for b in dock.computed_boxes.iter().rev() {
+                            for (idx, b) in dock.computed_boxes.iter().enumerate().rev() {
                                 if px >= b.x as f64 && px <= (b.x + b.width) as f64 && py >= b.y as f64 && py <= (b.y + b.height) as f64 {
                                     if desired_shape == Shape::Default {
                                         if let Some(ref inp) = b.text_input {
@@ -3182,21 +3245,19 @@ impl PointerHandler for WaylandApp {
                                             desired_shape = Shape::Pointer;
                                         }
                                     }
-                                    if hovered_box_key.is_none() {
-                                        if let Some(ref tt) = b.tooltip {
-                                            hovered_box_key = Some(format!("dock:{}@{:.0},{:.0}", tt, b.x, b.y));
-                                        }
+                                    if hovered_box_target.is_none() && b.tooltip.is_some() {
+                                        hovered_box_target = Some((TooltipSurface::Dock, idx));
                                     }
-                                    if desired_shape != Shape::Default && hovered_box_key.is_some() {
+                                    if desired_shape != Shape::Default && hovered_box_target.is_some() {
                                         break;
                                     }
                                 }
                             }
                         }
                     } else if is_bar {
-                        for bar in &self.bars {
+                        for (bar_idx, bar) in self.bars.iter().enumerate() {
                             if event.surface == *bar.surface.wl_surface() {
-                                for b in bar.computed_boxes.iter().rev() {
+                                for (idx, b) in bar.computed_boxes.iter().enumerate().rev() {
                                     if px >= b.x as f64 && px <= (b.x + b.width) as f64 && py >= b.y as f64 && py <= (b.y + b.height) as f64 {
                                         if desired_shape == Shape::Default {
                                             if let Some(ref inp) = b.text_input {
@@ -3207,12 +3268,10 @@ impl PointerHandler for WaylandApp {
                                                 desired_shape = Shape::Pointer;
                                             }
                                         }
-                                        if hovered_box_key.is_none() {
-                                            if let Some(ref tt) = b.tooltip {
-                                                hovered_box_key = Some(format!("bar:{}:{}@{:.0},{:.0}", bar.output_name, tt, b.x, b.y));
-                                            }
+                                        if hovered_box_target.is_none() && b.tooltip.is_some() {
+                                            hovered_box_target = Some((TooltipSurface::Bar(bar_idx), idx));
                                         }
-                                        if desired_shape != Shape::Default && hovered_box_key.is_some() {
+                                        if desired_shape != Shape::Default && hovered_box_target.is_some() {
                                             break;
                                         }
                                     }
@@ -3226,12 +3285,12 @@ impl PointerHandler for WaylandApp {
 
                     // 2. Tooltip Hover Timer (>400ms)
                     let now = std::time::Instant::now();
-                    let is_tooltip_active = match (&self.tooltip_hover, &hovered_box_key) {
-                        (Some((prev_key, start)), Some(curr_key)) if prev_key == curr_key => {
+                    let is_tooltip_active = match (&self.tooltip_hover, &hovered_box_target) {
+                        (Some((prev_target, start)), Some(curr_target)) if prev_target == curr_target => {
                             start.elapsed() >= std::time::Duration::from_millis(400)
                         }
-                        (_, Some(curr_key)) => {
-                            self.tooltip_hover = Some((curr_key.clone(), now));
+                        (_, Some(curr_target)) => {
+                            self.tooltip_hover = Some((*curr_target, now));
                             false
                         }
                         _ => {
@@ -3242,8 +3301,8 @@ impl PointerHandler for WaylandApp {
 
                     let mut redraw_for_tooltip = false;
                     if let Some(ref mut popup) = self.popup {
-                        for b in &mut popup.computed_boxes {
-                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_key.as_ref().is_some_and(|k| k.starts_with("popup:") && k.contains(&format!("@{:.0},{:.0}", b.x, b.y)));
+                        for (idx, b) in popup.computed_boxes.iter_mut().enumerate() {
+                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_target == Some((TooltipSurface::Popup, idx));
                             if b.tooltip_active != should_be {
                                 b.tooltip_active = should_be;
                                 redraw_for_tooltip = true;
@@ -3251,17 +3310,17 @@ impl PointerHandler for WaylandApp {
                         }
                     }
                     if let Some(ref mut dock) = self.dock {
-                        for b in &mut dock.computed_boxes {
-                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_key.as_ref().is_some_and(|k| k.starts_with("dock:") && k.contains(&format!("@{:.0},{:.0}", b.x, b.y)));
+                        for (idx, b) in dock.computed_boxes.iter_mut().enumerate() {
+                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_target == Some((TooltipSurface::Dock, idx));
                             if b.tooltip_active != should_be {
                                 b.tooltip_active = should_be;
                                 redraw_for_tooltip = true;
                             }
                         }
                     }
-                    for bar in &mut self.bars {
-                        for b in &mut bar.computed_boxes {
-                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_key.as_ref().is_some_and(|k| k.starts_with(&format!("bar:{}", bar.output_name)) && k.contains(&format!("@{:.0},{:.0}", b.x, b.y)));
+                    for (bar_idx, bar) in self.bars.iter_mut().enumerate() {
+                        for (idx, b) in bar.computed_boxes.iter_mut().enumerate() {
+                            let should_be = is_tooltip_active && b.tooltip.is_some() && hovered_box_target == Some((TooltipSurface::Bar(bar_idx), idx));
                             if b.tooltip_active != should_be {
                                 b.tooltip_active = should_be;
                                 redraw_for_tooltip = true;
@@ -3283,7 +3342,7 @@ impl PointerHandler for WaylandApp {
                                         if inp.id.as_deref() == Some(input_id) && inp.active {
                                             let (px, _) = self.pointer_pos;
                                             let rel_x = (px - b.x as f64).max(0.0) as f32;
-                                            let char_idx = measure_text_cursor_idx(&mut self.font_system, &inp.text, inp.font_size, rel_x);
+                                            let char_idx = measure_text_cursor_idx(&mut self.cursor_measure_buffer, &mut self.font_system, &inp.text, inp.font_size, rel_x);
                                             self.runtime.editor_drag(input_id, char_idx);
                                             let (cur, sel) = self.runtime.get_editor_state(input_id);
                                             inp.cursor_pos = cur;
@@ -3408,7 +3467,13 @@ impl PointerHandler for WaylandApp {
                         self.dock_hovered = false;
                         self.dock_last_leave = Some(std::time::Instant::now());
                         if !self.dock_hidden {
-                            let _ = self.draw_dock();
+                            self.needs_redraw_dock = true;
+                            if let Some(ref mut dock) = self.dock {
+                                if !dock.frame_callback_pending {
+                                    dock.frame_callback_pending = true;
+                                    let _ = self.draw_dock();
+                                }
+                            }
                         }
                     }
                     let is_bar = self.bars.iter().any(|b| event.surface == *b.surface.wl_surface());
@@ -3417,11 +3482,12 @@ impl PointerHandler for WaylandApp {
                         self.bar_last_leave = Some(std::time::Instant::now());
                     }
                 }
-                PointerEventKind::Press { button, .. } if button == BTN_LEFT || button == BTN_RIGHT => {
+                PointerEventKind::Press { button, .. } if button == BTN_LEFT || button == BTN_RIGHT || button == BTN_MIDDLE => {
                     self.pointer_pressed = true;
                     let is_right = button == BTN_RIGHT;
+                    let is_middle = button == BTN_MIDDLE;
                     let (px, py) = self.pointer_pos;
-                    let mut target_action: Option<String> = None;
+                    let mut target_action: Option<Arc<str>> = None;
 
                     // Check if click was on ext-session-lock surface
                     if self.session_lock.locked {
@@ -3433,7 +3499,7 @@ impl PointerHandler for WaylandApp {
                                         && py >= b.y as f64
                                         && py <= (b.y + b.height) as f64
                                     {
-                                        let action_opt = if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
+                                        let action_opt = if is_middle { b.on_middle_click.as_ref() } else if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
                                         if let Some(action) = action_opt {
                                             target_action = Some(action.clone());
                                             break;
@@ -3464,7 +3530,7 @@ impl PointerHandler for WaylandApp {
                                     && py >= b.y as f64
                                     && py <= (b.y + b.height) as f64
                                 {
-                                    let action_opt = if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
+                                    let action_opt = if is_middle { b.on_middle_click.as_ref() } else if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
                                     if let Some(action) = action_opt {
                                         target_action = Some(action.clone());
                                         break;
@@ -3484,8 +3550,8 @@ impl PointerHandler for WaylandApp {
                     if is_popup_surface {
                         let mut _clicked_box = false;
                         let mut focused_new_input: Option<FocusedInputState> = None;
-                        let mut toggled_switch: Option<(bool, Option<String>)> = None;
-                        let mut clicked_slider: Option<(f32, Option<String>, Option<String>)> = None;
+                        let mut toggled_switch: Option<(bool, Option<Arc<str>>)> = None;
+                        let mut clicked_slider: Option<(f32, Option<String>, Option<Arc<str>>)> = None;
 
                         if let Some(ref mut popup) = self.popup {
                             for b in popup.computed_boxes.iter_mut().rev() {
@@ -3498,7 +3564,7 @@ impl PointerHandler for WaylandApp {
                                     if let Some(ref input) = b.text_input {
                                         let id = input.id.clone().unwrap_or_else(|| "text_input".to_string());
                                         let rel_x = (px - b.x as f64).max(0.0) as f32;
-                                        let char_idx = measure_text_cursor_idx(&mut self.font_system, &input.text, input.font_size, rel_x);
+                                        let char_idx = measure_text_cursor_idx(&mut self.cursor_measure_buffer, &mut self.font_system, &input.text, input.font_size, rel_x);
                                         self.runtime.editor_click(&id, char_idx, self.modifiers.shift, std::time::Instant::now());
                                         let (cur, sel) = self.runtime.get_editor_state(&id);
                                         focused_new_input = Some((id, cur, sel));
@@ -3520,7 +3586,7 @@ impl PointerHandler for WaylandApp {
                                         break;
                                     }
 
-                                    let action_opt = if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
+                                    let action_opt = if is_middle { b.on_middle_click.as_ref() } else if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
                                     if let Some(action) = action_opt {
                                         target_action = Some(action.clone());
                                         break;
@@ -3544,7 +3610,7 @@ impl PointerHandler for WaylandApp {
                         }
 
                         if let Some((new_val, id_opt, cb_opt)) = clicked_slider {
-                            let slider_id = id_opt.or(cb_opt.clone()).unwrap_or_else(|| "slider".to_string());
+                            let slider_id = id_opt.or_else(|| cb_opt.as_ref().map(|s| s.to_string())).unwrap_or_else(|| "slider".to_string());
                             self.active_dragging_slider = Some(slider_id);
                             if let Some(cb) = cb_opt {
                                 let _ = self.runtime.trigger_callback_with_arg(&cb, &new_val.to_string());
@@ -3596,8 +3662,8 @@ impl PointerHandler for WaylandApp {
                                 let _ = self.update_bar_visibility();
                                 return;
                             }
-                            let mut bar_toggled_switch: Option<(bool, Option<String>)> = None;
-                            let mut bar_clicked_slider: Option<(f32, Option<String>, Option<String>)> = None;
+                            let mut bar_toggled_switch: Option<(bool, Option<Arc<str>>)> = None;
+                            let mut bar_clicked_slider: Option<(f32, Option<String>, Option<Arc<str>>)> = None;
 
                             for b in bar.computed_boxes.iter_mut().rev() {
                                 if px >= b.x as f64
@@ -3620,7 +3686,7 @@ impl PointerHandler for WaylandApp {
                                         break;
                                     }
 
-                                    let action_opt = if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
+                                    let action_opt = if is_middle { b.on_middle_click.as_ref() } else if is_right { b.on_right_click.as_ref() } else { b.on_click.as_ref() };
                                     if let Some(action) = action_opt {
                                         target_action = Some(action.clone());
                                         break;
@@ -3637,7 +3703,7 @@ impl PointerHandler for WaylandApp {
                             }
 
                             if let Some((new_val, id_opt, cb_opt)) = bar_clicked_slider {
-                                let slider_id = id_opt.or(cb_opt.clone()).unwrap_or_else(|| "slider".to_string());
+                                let slider_id = id_opt.or_else(|| cb_opt.as_ref().map(|s| s.to_string())).unwrap_or_else(|| "slider".to_string());
                                 self.active_dragging_slider = Some(slider_id);
                                 if let Some(cb) = cb_opt {
                                     let _ = self.runtime.trigger_callback_with_arg(&cb, &new_val.to_string());
@@ -3679,7 +3745,7 @@ impl PointerHandler for WaylandApp {
                     }
 
                     let (px, py) = self.pointer_pos;
-                    let mut target_action: Option<String> = None;
+                    let mut target_action: Option<Arc<str>> = None;
                     let mut handled_scroll = false;
 
                     // Check popup window first
@@ -4084,7 +4150,7 @@ impl KeyboardHandler for WaylandApp {
                 }
                 let selected_idx = self.runtime.get_selected_index();
                 if let Some(ref popup) = self.popup {
-                    let mut actionables: Vec<String> = Vec::new();
+                    let mut actionables: Vec<Arc<str>> = Vec::new();
                     for b in &popup.computed_boxes {
                         if let Some(ref act) = b.on_click {
                             if act.starts_with("launch:") {
@@ -4213,8 +4279,12 @@ impl CompositorHandler for WaylandApp {
             if popup.surface.wl_surface() == surface {
                 popup.frame_callback_pending = false;
                 let mut should_draw = self.needs_redraw_popup;
+                let now = std::time::Instant::now();
+                let dt = popup.last_frame_instant.map(|prev| (now - prev).as_secs_f32()).unwrap_or(0.016).clamp(0.001, 0.05);
+                popup.last_frame_instant = Some(now);
+
                 if let Some(ref mut anim) = popup.spring {
-                    anim.step(0.016);
+                    anim.step(dt);
                     should_draw = true;
                     if popup.closing && (anim.is_settled() || anim.current <= 0.04) {
                         self.popup = None;
@@ -4222,7 +4292,7 @@ impl CompositorHandler for WaylandApp {
                     }
                 }
                 if !self.gestures_manager.is_scroll_settled() {
-                    let new_scroll = self.gestures_manager.step_scroll(0.016);
+                    let new_scroll = self.gestures_manager.step_scroll(dt);
                     zenith_layout::set_scroll_offset_in_tree(&mut popup.root_ui, new_scroll);
                     for b in &mut popup.computed_boxes {
                         if b.overflow == zenith_layout::Overflow::Scroll {
@@ -4252,11 +4322,7 @@ impl CompositorHandler for WaylandApp {
                 if self.needs_redraw_dock {
                     self.needs_redraw_dock = false;
                     let _ = self.update_dock_visibility();
-                    if !self.dock_hidden {
-                        let _ = self.reload_dock();
-                    } else {
-                        let _ = self.draw_dock();
-                    }
+                    let _ = self.draw_dock();
                 }
                 return;
             }
@@ -4632,7 +4698,7 @@ mod tests {
             active_color: Color::rgb(124, 77, 255),
             inactive_color: Color::rgba(255, 255, 255, 50),
             thumb_color: Color::rgb(255, 255, 255),
-            on_toggle: Some("wifi_changed".to_string()),
+            on_toggle: Some("wifi_changed".into()),
         };
 
         let mut b = ComputedBox {
@@ -4641,25 +4707,10 @@ mod tests {
             width: 50.0,
             height: 26.0,
             background_color: Color::transparent(),
-            border_color: Color::transparent(),
-            border_width: 0.0,
             border_radius: 13.0,
-            shadow: None,
-            custom_shader: None,
-            text: None,
-            image: None,
-            text_input: None,
-            slider: None,
             switch: Some(sw),
-            overflow: zenith_layout::Overflow::Visible,
-            scroll_offset_y: 0.0,
-            clip_rect: None,
-            on_click: Some("wifi_changed".to_string()),
-            on_right_click: None,
-            on_scroll_up: None,
-            on_scroll_down: None,
-            tooltip: None,
-            tooltip_active: false,
+            on_click: Some("wifi_changed".into()),
+            ..Default::default()
         };
 
         // Click inside switch bounds (25.0, 30.0)
@@ -4692,7 +4743,7 @@ mod tests {
             track_color: Color::rgba(255, 255, 255, 50),
             active_track_color: Color::rgb(124, 77, 255),
             thumb_color: Color::rgb(255, 255, 255),
-            on_change: Some("on_volume".to_string()),
+            on_change: Some("on_volume".into()),
         };
 
         let b = ComputedBox {
@@ -4701,25 +4752,8 @@ mod tests {
             width: 200.0,
             height: 30.0,
             background_color: Color::transparent(),
-            border_color: Color::transparent(),
-            border_width: 0.0,
-            border_radius: 0.0,
-            shadow: None,
-            custom_shader: None,
-            text: None,
-            image: None,
-            text_input: None,
             slider: Some(sl),
-            switch: None,
-            overflow: zenith_layout::Overflow::Visible,
-            scroll_offset_y: 0.0,
-            clip_rect: None,
-            on_click: None,
-            on_right_click: None,
-            on_scroll_up: None,
-            on_scroll_down: None,
-            tooltip: None,
-            tooltip_active: false,
+            ..Default::default()
         };
 
         let sl_ref = b.slider.as_ref().unwrap();
@@ -4763,7 +4797,7 @@ mod tests {
                 height: Some(zenith_layout::length(30.0)),
                 ..Default::default()
             },
-            on_toggle: Some("my_toggle_action".to_string()),
+            on_toggle: Some("my_toggle_action".into()),
         };
 
         let boxes = engine.compute(&node, 800.0, 600.0);
@@ -4834,5 +4868,78 @@ mod tests {
         assert!(!runtime.is_idle());
         let is_idle_luau2 = runtime.eval_code("return Zenith.Signals.is_idle()").expect("eval is_idle");
         assert_eq!(is_idle_luau2.trim(), "false");
+    }
+
+    #[test]
+    fn test_independent_surface_layout_engines() {
+        let mut bar_engine = zenith_layout::LayoutEngine::new();
+        let mut dock_engine = zenith_layout::LayoutEngine::new();
+
+        let bar_node = UiNode::Box {
+            style: zenith_layout::NodeStyle {
+                width: Some(zenith_layout::length(1920.0)),
+                height: Some(zenith_layout::length(36.0)),
+                ..Default::default()
+            },
+            children: vec![],
+            on_click: None,
+            on_right_click: None,
+            on_middle_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+
+        let dock_node = UiNode::Box {
+            style: zenith_layout::NodeStyle {
+                width: Some(zenith_layout::length(600.0)),
+                height: Some(zenith_layout::length(64.0)),
+                ..Default::default()
+            },
+            children: vec![],
+            on_click: None,
+            on_right_click: None,
+            on_middle_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+
+        let mut bar_boxes = Vec::new();
+        bar_engine.compute_into(&bar_node, 1920.0, 36.0, &mut bar_boxes, None);
+        let bar_root = bar_engine.root_node_id();
+
+        let mut dock_boxes = Vec::new();
+        dock_engine.compute_into(&dock_node, 600.0, 64.0, &mut dock_boxes, None);
+        let dock_root = dock_engine.root_node_id();
+
+        // Independent engines must preserve their own root NodeIds across subsequent computations
+        let mut bar_boxes2 = Vec::new();
+        bar_engine.compute_into(&bar_node, 1920.0, 36.0, &mut bar_boxes2, None);
+        assert_eq!(bar_engine.root_node_id(), bar_root);
+
+        let mut dock_boxes2 = Vec::new();
+        dock_engine.compute_into(&dock_node, 600.0, 64.0, &mut dock_boxes2, None);
+        assert_eq!(dock_engine.root_node_id(), dock_root);
+    }
+
+    #[test]
+    fn test_middle_click_box_routing() {
+        let node = UiNode::Box {
+            style: zenith_layout::NodeStyle::default(),
+            children: vec![],
+            on_click: Some("click_act".into()),
+            on_right_click: Some("right_act".into()),
+            on_middle_click: Some("middle_act".into()),
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+
+        let mut engine = zenith_layout::LayoutEngine::new();
+        let mut boxes = Vec::new();
+        engine.compute_into(&node, 100.0, 100.0, &mut boxes, None);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].on_middle_click.as_deref(), Some("middle_act"));
     }
 }

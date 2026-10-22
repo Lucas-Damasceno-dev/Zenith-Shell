@@ -472,4 +472,13 @@ mod tests {
         editor.move_cursor(CursorDirection::End, true);
         assert_eq!(editor.selected_text(), Some("testing keyboard"));
     }
+
+    #[test]
+    fn test_undo_redo_ring_buffer_cap() {
+        let mut editor = TextEditorEngine::new("0");
+        for i in 1..=120 {
+            editor.insert_text(&format!(",{}", i));
+        }
+        assert!(editor.undo_stack.len() <= 100);
+    }
 }

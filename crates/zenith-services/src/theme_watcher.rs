@@ -38,6 +38,14 @@ impl ThemeWatcher {
             watched.push(PathBuf::from(&home).join(".config/matugen/colors.json"));
         }
 
+        if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
+            watched.push(PathBuf::from(&cache_home).join("quickshell/matugen/colors.json"));
+            watched.push(PathBuf::from(&cache_home).join("matugen/colors.json"));
+        } else if let Ok(home) = std::env::var("HOME") {
+            watched.push(PathBuf::from(&home).join(".cache/quickshell/matugen/colors.json"));
+            watched.push(PathBuf::from(&home).join(".cache/matugen/colors.json"));
+        }
+
         watched.push(PathBuf::from("/etc/stylix/palette.json"));
 
         let initial_mtime = Self::probe_latest_mtime(&watched);

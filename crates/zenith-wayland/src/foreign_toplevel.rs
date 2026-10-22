@@ -12,19 +12,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
 };
-use serde::{Deserialize, Serialize};
-
-/// Lightweight toplevel window metadata snapshot for Luau scripts and services.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ForeignToplevelInfo {
-    pub id: u32,
-    pub title: String,
-    pub app_id: String,
-    pub maximized: bool,
-    pub minimized: bool,
-    pub activated: bool,
-    pub fullscreen: bool,
-}
+pub use zenith_services::{ToplevelAction, ToplevelInfo as ForeignToplevelInfo, ToplevelService};
 
 /// Internal tracked state for an individual toplevel window handle.
 #[derive(Debug)]
@@ -203,7 +191,8 @@ impl ForeignToplevelManager {
     /// Synchronizes internal toplevel list to the global thread-safe snapshot.
     pub fn sync_cache(&self) {
         let snapshot = self.snapshot();
-        update_global_cache(snapshot);
+        update_global_cache(snapshot.clone());
+        ToplevelService::update_toplevels(snapshot);
     }
 
     /// Returns a snapshot of all active toplevel windows.

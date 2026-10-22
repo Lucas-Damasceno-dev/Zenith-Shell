@@ -219,9 +219,11 @@ fn bench_reactive_graph_latency() {
         let tree_id = format!("tree_{}", i);
 
         let test_node = UiNode::Text {
-            text: format!("Value {}", i),
+            text: format!("Value {}", i).into(),
             font_size: 14.0,
             color: Color::rgb(255, 255, 255),
+            font_family: None,
+            font_weight: None,
             style: NodeStyle::default(),
         };
 

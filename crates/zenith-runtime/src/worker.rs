@@ -7,9 +7,12 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 /// Result returned from an asynchronous background task.
 #[derive(Debug, Clone)]
@@ -40,24 +43,23 @@ enum Job {
         args: Vec<String>,
         timeout: Option<Duration>,
     },
-    Delay {
-        task_id: u64,
-        duration: Duration,
-    },
     Custom {
         task_id: u64,
         job_fn: Box<dyn FnOnce() -> Result<TaskOutput, String> + Send + 'static>,
     },
+    Shutdown,
 }
 
 /// Threadpool executing background operations.
 pub struct WorkerThreadPool {
     sender: Sender<Job>,
+    result_sender: Sender<TaskCompletion>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     running: Arc<AtomicBool>,
-    cancelled_tasks: Arc<RwLock<HashSet<u64>>>,
+    cancelled_tasks: Arc<(Mutex<HashSet<u64>>, Condvar)>,
     next_task_id: AtomicU64,
     result_receiver: Mutex<Receiver<TaskCompletion>>,
+    completion_notifier: Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl WorkerThreadPool {
@@ -67,7 +69,9 @@ impl WorkerThreadPool {
         let (result_tx, result_rx) = channel::<TaskCompletion>();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let running = Arc::new(AtomicBool::new(true));
-        let cancelled_tasks = Arc::new(RwLock::new(HashSet::new()));
+        let cancelled_tasks = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
+        let completion_notifier: Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>> =
+            Arc::new(RwLock::new(None));
 
         let mut threads = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
@@ -75,12 +79,22 @@ impl WorkerThreadPool {
             let tx = result_tx.clone();
             let is_running = Arc::clone(&running);
             let cancelled = Arc::clone(&cancelled_tasks);
+            let notifier = Arc::clone(&completion_notifier);
+
+            let send_comp = move |comp: TaskCompletion| {
+                let _ = tx.send(comp);
+                if let Ok(guard) = notifier.read() {
+                    if let Some(ref cb) = *guard {
+                        cb();
+                    }
+                }
+            };
 
             let handle = thread::Builder::new()
                 .name(format!("zenith-worker-{}", worker_idx))
                 .spawn(move || {
                     let is_task_cancelled = |id: u64| -> bool {
-                        cancelled.read().map(|set| set.contains(&id)).unwrap_or(false)
+                        cancelled.0.lock().map(|set| set.contains(&id)).unwrap_or(false)
                     };
 
                     while is_running.load(Ordering::Acquire) {
@@ -89,12 +103,15 @@ impl WorkerThreadPool {
                                 Ok(guard) => guard,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
-                            match lock.recv_timeout(Duration::from_millis(100)) {
+                            match lock.recv() {
                                 Ok(j) => j,
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(_) => break,
                             }
                         };
+
+                        if matches!(job, Job::Shutdown) || !is_running.load(Ordering::Acquire) {
+                            break;
+                        }
 
                         match job {
                             Job::SpawnProcess {
@@ -104,7 +121,7 @@ impl WorkerThreadPool {
                                 timeout,
                             } => {
                                 if is_task_cancelled(task_id) || !is_running.load(Ordering::Acquire) {
-                                    let _ = tx.send(TaskCompletion {
+                                    send_comp(TaskCompletion {
                                         task_id,
                                         result: Err("Task cancelled".to_string()),
                                     });
@@ -120,7 +137,7 @@ impl WorkerThreadPool {
                                 {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        let _ = tx.send(TaskCompletion {
+                                        send_comp(TaskCompletion {
                                             task_id,
                                             result: Err(format!("Failed to execute '{}': {}", command, e)),
                                         });
@@ -128,32 +145,37 @@ impl WorkerThreadPool {
                                     }
                                 };
 
-                                let stdout = child.stdout.take();
-                                let stderr = child.stderr.take();
+                                let mut stdout_stream = child.stdout.take();
+                                let mut stderr_stream = child.stderr.take();
 
-                                let stdout_reader = thread::spawn(move || {
-                                    use std::io::Read;
-                                    let mut buf = Vec::new();
-                                    if let Some(mut stream) = stdout {
-                                        let _ = stream.read_to_end(&mut buf);
-                                    }
-                                    buf
-                                });
+                                #[cfg(unix)]
+                                let stdout_fd = stdout_stream.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+                                #[cfg(unix)]
+                                let stderr_fd = stderr_stream.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
 
-                                let stderr_reader = thread::spawn(move || {
-                                    use std::io::Read;
-                                    let mut buf = Vec::new();
-                                    if let Some(mut stream) = stderr {
-                                        let _ = stream.read_to_end(&mut buf);
+                                #[cfg(unix)]
+                                unsafe {
+                                    if stdout_fd >= 0 {
+                                        let fl = libc::fcntl(stdout_fd, libc::F_GETFL);
+                                        libc::fcntl(stdout_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
                                     }
-                                    buf
-                                });
+                                    if stderr_fd >= 0 {
+                                        let fl = libc::fcntl(stderr_fd, libc::F_GETFL);
+                                        libc::fcntl(stderr_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                                    }
+                                }
 
                                 let start = std::time::Instant::now();
                                 let mut exit_status = None;
                                 let mut timed_out = false;
                                 let mut was_cancelled = false;
-                                let poll_step = Duration::from_millis(15);
+                                let mut stdout_bytes = Vec::new();
+                                let mut stderr_bytes = Vec::new();
+                                let mut buf = [0u8; 8192];
+                                #[allow(unused_mut)]
+                                let mut stdout_closed = false;
+                                #[allow(unused_mut)]
+                                let mut stderr_closed = false;
 
                                 loop {
                                     if !is_running.load(Ordering::Acquire) || is_task_cancelled(task_id) {
@@ -163,26 +185,99 @@ impl WorkerThreadPool {
                                         break;
                                     }
 
+                                    if let Some(to) = timeout {
+                                        if start.elapsed() >= to {
+                                            timed_out = true;
+                                            let _ = child.kill();
+                                            let _ = child.wait();
+                                            break;
+                                        }
+                                    }
+
+                                    // Drain available stdout in non-blocking chunks
+                                    if !stdout_closed {
+                                        if let Some(ref mut stream) = stdout_stream {
+                                            loop {
+                                                match stream.read(&mut buf) {
+                                                    Ok(0) => {
+                                                        stdout_closed = true;
+                                                        break;
+                                                    }
+                                                    Ok(n) => stdout_bytes.extend_from_slice(&buf[..n]),
+                                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                                    Err(_) => {
+                                                        stdout_closed = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Drain available stderr in non-blocking chunks
+                                    if !stderr_closed {
+                                        if let Some(ref mut stream) = stderr_stream {
+                                            loop {
+                                                match stream.read(&mut buf) {
+                                                    Ok(0) => {
+                                                        stderr_closed = true;
+                                                        break;
+                                                    }
+                                                    Ok(n) => stderr_bytes.extend_from_slice(&buf[..n]),
+                                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                                    Err(_) => {
+                                                        stderr_closed = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     match child.try_wait() {
                                         Ok(Some(status)) => {
                                             exit_status = Some(status);
+                                            // Final drain
+                                            if let Some(ref mut stream) = stdout_stream {
+                                                let mut rest = Vec::new();
+                                                let _ = stream.read_to_end(&mut rest);
+                                                stdout_bytes.extend(rest);
+                                            }
+                                            if let Some(ref mut stream) = stderr_stream {
+                                                let mut rest = Vec::new();
+                                                let _ = stream.read_to_end(&mut rest);
+                                                stderr_bytes.extend(rest);
+                                            }
                                             break;
                                         }
                                         Ok(None) => {
-                                            if let Some(to) = timeout {
-                                                if start.elapsed() >= to {
-                                                    timed_out = true;
-                                                    let _ = child.kill();
-                                                    let _ = child.wait();
-                                                    break;
+                                            #[cfg(unix)]
+                                            {
+                                                let mut pollfds = [
+                                                    libc::pollfd {
+                                                        fd: if stdout_closed { -1 } else { stdout_fd },
+                                                        events: libc::POLLIN | libc::POLLHUP,
+                                                        revents: 0,
+                                                    },
+                                                    libc::pollfd {
+                                                        fd: if stderr_closed { -1 } else { stderr_fd },
+                                                        events: libc::POLLIN | libc::POLLHUP,
+                                                        revents: 0,
+                                                    },
+                                                ];
+                                                unsafe {
+                                                    libc::poll(pollfds.as_mut_ptr(), 2, 15);
                                                 }
                                             }
-                                            thread::sleep(poll_step);
+                                            #[cfg(not(unix))]
+                                            {
+                                                thread::sleep(Duration::from_millis(15));
+                                            }
                                         }
                                         Err(e) => {
                                             let _ = child.kill();
                                             let _ = child.wait();
-                                            let _ = tx.send(TaskCompletion {
+                                            send_comp(TaskCompletion {
                                                 task_id,
                                                 result: Err(format!(
                                                     "Error waiting for command '{}': {}",
@@ -194,16 +289,13 @@ impl WorkerThreadPool {
                                     }
                                 }
 
-                                let stdout_bytes = stdout_reader.join().unwrap_or_default();
-                                let stderr_bytes = stderr_reader.join().unwrap_or_default();
-
                                 if was_cancelled {
-                                    let _ = tx.send(TaskCompletion {
+                                    send_comp(TaskCompletion {
                                         task_id,
                                         result: Err("Task cancelled".to_string()),
                                     });
                                 } else if timed_out {
-                                    let _ = tx.send(TaskCompletion {
+                                    send_comp(TaskCompletion {
                                         task_id,
                                         result: Err(format!(
                                             "Command '{}' timed out after {:?}",
@@ -217,48 +309,24 @@ impl WorkerThreadPool {
                                         stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
                                         exit_code: status.code().unwrap_or(-1),
                                     };
-                                    let _ = tx.send(TaskCompletion {
+                                    send_comp(TaskCompletion {
                                         task_id,
                                         result: Ok(res),
                                     });
                                 }
                             }
-                            Job::Delay { task_id, duration } => {
-                                let start = std::time::Instant::now();
-                                let mut cancelled_flag = false;
-                                while start.elapsed() < duration {
-                                    if !is_running.load(Ordering::Acquire) || is_task_cancelled(task_id) {
-                                        cancelled_flag = true;
-                                        break;
-                                    }
-                                    let rem = duration.saturating_sub(start.elapsed());
-                                    let step = rem.min(Duration::from_millis(15));
-                                    thread::sleep(step);
-                                }
-
-                                if cancelled_flag {
-                                    let _ = tx.send(TaskCompletion {
-                                        task_id,
-                                        result: Err("Task cancelled".to_string()),
-                                    });
-                                } else {
-                                    let _ = tx.send(TaskCompletion {
-                                        task_id,
-                                        result: Ok(TaskOutput::Empty),
-                                    });
-                                }
-                            }
                             Job::Custom { task_id, job_fn } => {
                                 if !is_running.load(Ordering::Acquire) || is_task_cancelled(task_id) {
-                                    let _ = tx.send(TaskCompletion {
+                                    send_comp(TaskCompletion {
                                         task_id,
                                         result: Err("Task cancelled".to_string()),
                                     });
                                 } else {
                                     let res = job_fn();
-                                    let _ = tx.send(TaskCompletion { task_id, result: res });
+                                    send_comp(TaskCompletion { task_id, result: res });
                                 }
                             }
+                            Job::Shutdown => break,
                         }
                     }
                 })
@@ -269,11 +337,20 @@ impl WorkerThreadPool {
 
         Self {
             sender: job_tx,
+            result_sender: result_tx,
             threads: Mutex::new(threads),
             running,
             cancelled_tasks,
             next_task_id: AtomicU64::new(1),
             result_receiver: Mutex::new(result_rx),
+            completion_notifier,
+        }
+    }
+
+    /// Sets an external completion callback (e.g. Calloop Ping) to wake up the event loop when a task finishes.
+    pub fn set_completion_notifier(&self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut lock) = self.completion_notifier.write() {
+            *lock = Some(notifier);
         }
     }
 
@@ -299,10 +376,54 @@ impl WorkerThreadPool {
         task_id
     }
 
-    /// Schedules a timer delay in background.
+    /// Schedules a timer delay in background on a non-blocking timer thread.
     pub fn delay(&self, duration: Duration) -> u64 {
         let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.sender.send(Job::Delay { task_id, duration });
+        let sender = self.result_sender.clone();
+        let notifier = self.completion_notifier.clone();
+        let running = self.running.clone();
+        let cancelled = self.cancelled_tasks.clone();
+
+        std::thread::Builder::new()
+            .name(format!("zenith-timer-{}", task_id))
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let mut was_cancelled = false;
+                let (lock, cvar) = &*cancelled;
+                if let Ok(mut guard) = lock.lock() {
+                    while start.elapsed() < duration {
+                        if !running.load(Ordering::Acquire) || guard.contains(&task_id) {
+                            was_cancelled = true;
+                            break;
+                        }
+                        let rem = duration.saturating_sub(start.elapsed());
+                        let (new_guard, timeout_res) = match cvar.wait_timeout(guard, rem) {
+                            Ok(res) => res,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard = new_guard;
+                        if timeout_res.timed_out() {
+                            break;
+                        }
+                    }
+                    if !was_cancelled && (!running.load(Ordering::Acquire) || guard.contains(&task_id)) {
+                        was_cancelled = true;
+                    }
+                }
+                let res = if was_cancelled {
+                    Err("Task cancelled".to_string())
+                } else {
+                    Ok(TaskOutput::Empty)
+                };
+                let _ = sender.send(TaskCompletion { task_id, result: res });
+                if let Ok(guard) = notifier.read() {
+                    if let Some(ref cb) = *guard {
+                        cb();
+                    }
+                }
+            })
+            .ok();
+
         task_id
     }
 
@@ -321,8 +442,10 @@ impl WorkerThreadPool {
 
     /// Cancels a running or queued background task by ID.
     pub fn cancel_task(&self, task_id: u64) -> bool {
-        if let Ok(mut set) = self.cancelled_tasks.write() {
+        let (lock, cvar) = &*self.cancelled_tasks;
+        if let Ok(mut set) = lock.lock() {
             set.insert(task_id);
+            cvar.notify_all();
             true
         } else {
             false
@@ -331,8 +454,8 @@ impl WorkerThreadPool {
 
     /// Checks if a task ID is marked as cancelled.
     pub fn is_cancelled(&self, task_id: u64) -> bool {
-        self.cancelled_tasks
-            .read()
+        let (lock, _) = &*self.cancelled_tasks;
+        lock.lock()
             .map(|set| set.contains(&task_id))
             .unwrap_or(false)
     }
@@ -340,6 +463,12 @@ impl WorkerThreadPool {
     /// Cancels all ongoing tasks and signals worker threads to stop.
     pub fn cancel_all(&self) {
         self.running.store(false, Ordering::Release);
+        self.cancelled_tasks.1.notify_all();
+        if let Ok(threads) = self.threads.lock() {
+            for _ in 0..threads.len() {
+                let _ = self.sender.send(Job::Shutdown);
+            }
+        }
     }
 
     /// Non-blocking drain of all completed background tasks.
@@ -347,7 +476,7 @@ impl WorkerThreadPool {
         let mut completions = Vec::new();
         if let Ok(rx) = self.result_receiver.lock() {
             while let Ok(comp) = rx.try_recv() {
-                if let Ok(mut set) = self.cancelled_tasks.write() {
+                if let Ok(mut set) = self.cancelled_tasks.0.lock() {
                     set.remove(&comp.task_id);
                 }
                 completions.push(comp);
@@ -360,6 +489,11 @@ impl WorkerThreadPool {
 impl Drop for WorkerThreadPool {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        if let Ok(threads) = self.threads.lock() {
+            for _ in 0..threads.len() {
+                let _ = self.sender.send(Job::Shutdown);
+            }
+        }
         if let Ok(mut lock) = self.threads.lock() {
             for handle in lock.drain(..) {
                 let _ = handle.join();
@@ -503,5 +637,34 @@ mod tests {
     fn test_worker_thread_pool_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<WorkerThreadPool>();
+    }
+
+    #[test]
+    fn test_worker_thread_pool_large_output_no_pipe_deadlock() {
+        let pool = WorkerThreadPool::new(2);
+        let id = pool.spawn_process_with_timeout(
+            "python3".to_string(),
+            vec!["-c".to_string(), "import sys; sys.stdout.write('X' * 131072); sys.stderr.write('Y' * 131072)".to_string()],
+            Some(Duration::from_secs(5)),
+        );
+        let start = std::time::Instant::now();
+        let mut results = Vec::new();
+        while start.elapsed() < Duration::from_secs(4) {
+            results = pool.try_recv_completions();
+            if !results.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, id);
+        if let Ok(TaskOutput::Process { stdout, stderr, exit_code }) = &results[0].result {
+            assert_eq!(*exit_code, 0);
+            assert_eq!(stdout.len(), 131072);
+            assert_eq!(stderr.len(), 131072);
+        } else {
+            panic!("Expected successful process completion, got: {:?}", results[0].result);
+        }
     }
 }

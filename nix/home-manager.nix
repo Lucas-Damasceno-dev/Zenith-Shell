@@ -12,12 +12,17 @@ let
   runtimeDeps = with pkgs; [
     # Minimal runtime dependencies: native engine handles D-Bus (zbus) and sockets directly
     pipewire
+    wireplumber
     hyprland
+    wl-clipboard
+    cliphist
+    grim
+    slurp
   ];
 in
 {
   options.programs.zenith-shell = {
-    enable = mkEnableOption "Zenith-Shell (Engine v2) — Wayland Desktop Shell in Rust + Luau";
+    enable = mkEnableOption "Zenith-Shell (Engine Base v3) — Wayland Desktop Shell in Rust + Luau";
 
     package = mkOption {
       type = types.package;
@@ -67,7 +72,7 @@ in
 
     systemd.user.services.zenith-shell = mkIf cfg.enableSystemd {
       Unit = {
-        Description = "Zenith Desktop Shell (Engine v2)";
+        Description = "Zenith Desktop Shell (Engine Base v3)";
         After = [ "graphical-session.target" "hyprland-session.target" ];
         PartOf = [ "graphical-session.target" ];
         ConditionEnvironment = "WAYLAND_DISPLAY";
@@ -79,11 +84,13 @@ in
         Restart = "on-failure";
         RestartSec = 2;
         Slice = "session.slice";
-        MemoryMax = "35M";
-        MemoryHigh = "25M";
+        MemoryMax = "180M";
+        MemoryHigh = "120M";
         CPUWeight = 200;
         Environment = [
           "PATH=${cfg.package}/bin:${lib.makeBinPath runtimeDeps}"
+          "ZENITH_CONFIG_DIR=${config.home.homeDirectory}/.config/zenith"
+          "MALLOC_ARENA_MAX=2"
         ];
       };
       Install = {

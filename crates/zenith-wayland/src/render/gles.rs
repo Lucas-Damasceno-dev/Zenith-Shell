@@ -7,7 +7,6 @@ use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache};
 use zenith_layout::ComputedBox;
 
 use super::atlas::GlyphAtlas;
-use super::blur::DualKawaseBlur;
 use super::custom_shader::CustomShaderPipeline;
 use super::image_cache::ImageCache;
 use super::primitives::{SdfInstance, SdfRectShader};
@@ -29,20 +28,25 @@ layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
 layout(location = 2) in float a_is_color;
 layout(location = 3) in vec4 a_color;
+layout(location = 4) in vec4 a_clip_rect;
 
 uniform vec2 u_resolution;
 
 out vec2 v_uv;
+out vec2 v_pos;
 out float v_is_color;
 out vec4 v_color;
+out vec4 v_clip_rect;
 
 void main() {
     vec2 clip = (a_pos / u_resolution) * 2.0 - 1.0;
     clip.y = -clip.y;
     gl_Position = vec4(clip, 0.0, 1.0);
     v_uv = a_uv;
+    v_pos = a_pos;
     v_is_color = a_is_color;
     v_color = a_color;
+    v_clip_rect = a_clip_rect;
 }
 "#;
 
@@ -50,13 +54,21 @@ const TEXT_FS: &str = r#"#version 300 es
 precision highp float;
 
 in vec2 v_uv;
+in vec2 v_pos;
 in float v_is_color;
 in vec4 v_color;
+in vec4 v_clip_rect;
 uniform sampler2D u_atlas;
 
 out vec4 frag_color;
 
 void main() {
+    if (v_clip_rect.z > 0.0 && v_clip_rect.w > 0.0) {
+        if (v_pos.x < v_clip_rect.x || v_pos.x > v_clip_rect.x + v_clip_rect.z ||
+            v_pos.y < v_clip_rect.y || v_pos.y > v_clip_rect.y + v_clip_rect.w) {
+            discard;
+        }
+    }
     vec4 tex = texture(u_atlas, v_uv);
     if (tex.a <= 0.001) {
         discard;
@@ -105,7 +117,6 @@ pub struct GlesRenderer {
     pub text_vbo_capacity: usize,
     text_shaping_access_counter: u64,
     text_shaping_cache: HashMap<(u64, u32), (String, CachedTextLayout, u64)>,
-    pub blur: Option<DualKawaseBlur>,
     pub inspect_mode: bool,
     pub frame_counter: u32,
     pub last_fps_instant: std::time::Instant,
@@ -135,15 +146,17 @@ impl GlesRenderer {
         gl.bind_vertex_array(Some(text_vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(text_vbo));
 
-        // Vertex layout: [pos_x, pos_y, uv_u, uv_v, is_color, r, g, b, a] (stride: 9 floats = 36 bytes)
+        // Vertex layout: [pos_x, pos_y, uv_u, uv_v, is_color, r, g, b, a, clip_x, clip_y, clip_w, clip_h] (stride: 13 floats = 52 bytes)
         gl.enable_vertex_attrib_array(0);
-        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 9 * 4, 0);
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 13 * 4, 0);
         gl.enable_vertex_attrib_array(1);
-        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 9 * 4, 2 * 4);
+        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 13 * 4, 2 * 4);
         gl.enable_vertex_attrib_array(2);
-        gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, 9 * 4, 4 * 4);
+        gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, 13 * 4, 4 * 4);
         gl.enable_vertex_attrib_array(3);
-        gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, 9 * 4, 5 * 4);
+        gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, 13 * 4, 5 * 4);
+        gl.enable_vertex_attrib_array(4);
+        gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, 13 * 4, 9 * 4);
 
         gl.bind_vertex_array(None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
@@ -151,7 +164,7 @@ impl GlesRenderer {
         let text_buffer = Buffer::new_empty(Metrics::new(14.0, 18.0));
 
         Ok(Self {
-            gl,
+            gl: gl.clone(),
             sdf_shader,
             sdf_instances: Vec::with_capacity(128),
             atlas,
@@ -167,7 +180,6 @@ impl GlesRenderer {
             text_vbo_capacity: 0,
             text_shaping_access_counter: 0,
             text_shaping_cache: HashMap::new(),
-            blur: None,
             inspect_mode: false,
             frame_counter: 0,
             last_fps_instant: std::time::Instant::now(),
@@ -203,7 +215,7 @@ impl GlesRenderer {
             self.text_vbo_capacity = new_cap;
         }
 
-        let vertex_count = (self.glyph_scratch.len() / 9) as i32;
+        let vertex_count = (self.glyph_scratch.len() / 13) as i32;
         self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
 
         self.gl.bind_texture(glow::TEXTURE_2D, None);
@@ -216,16 +228,22 @@ impl GlesRenderer {
         &mut self,
         text: &str,
         font_size: f32,
+        font_family_opt: Option<&str>,
+        font_weight_opt: Option<u16>,
         font_system: &mut FontSystem,
     ) -> CachedTextLayout {
         use std::hash::{Hash, Hasher};
         self.text_shaping_access_counter = self.text_shaping_access_counter.wrapping_add(1);
         let current_access = self.text_shaping_access_counter;
 
-        let font_family = current_font_family();
+        let default_family = current_font_family();
+        let font_family = font_family_opt.unwrap_or(&default_family);
+        let font_weight = font_weight_opt.unwrap_or(400);
+
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut hasher);
         font_family.hash(&mut hasher);
+        font_weight.hash(&mut hasher);
         let key = (hasher.finish(), font_size.to_bits());
 
         if let Some((cached_text, layout, last_used)) = self.text_shaping_cache.get_mut(&key) {
@@ -252,7 +270,9 @@ impl GlesRenderer {
         let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
         self.text_buffer.set_text(
             text,
-            &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(&font_family)),
+            &cosmic_text::Attrs::new()
+                .family(cosmic_text::Family::Name(font_family))
+                .weight(cosmic_text::Weight(font_weight)),
             shaping,
             None,
         );
@@ -308,16 +328,13 @@ impl GlesRenderer {
         };
 
         let res = (width as f32, height as f32);
+        let damage_scissor = damage_rect.and_then(|rect| rect.to_gl_scissor_valid(width as i32, height as i32));
 
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
-            if let Some(rect) = damage_rect {
-                if let Some((sx, sy, sw, sh)) = rect.to_gl_scissor_valid(width as i32, height as i32) {
-                    self.gl.enable(glow::SCISSOR_TEST);
-                    self.gl.scissor(sx, sy, sw, sh);
-                } else {
-                    self.gl.disable(glow::SCISSOR_TEST);
-                }
+            if let Some((sx, sy, sw, sh)) = damage_scissor {
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl.scissor(sx, sy, sw, sh);
             } else {
                 self.gl.disable(glow::SCISSOR_TEST);
             }
@@ -443,6 +460,7 @@ impl GlesRenderer {
                         border_width,
                         shadow_spec,
                         alpha_factor,
+                        clip_rect,
                     ));
                 }
 
@@ -460,6 +478,7 @@ impl GlesRenderer {
                             pad2,
                             None,
                             alpha_factor,
+                            clip_rect,
                         ));
 
                         // Quad de seleção com cor de destaque (theme.primary_container)
@@ -480,6 +499,7 @@ impl GlesRenderer {
                                 0.0,
                                 None,
                                 alpha_factor,
+                                clip_rect,
                             ));
                         }
                     }
@@ -504,6 +524,7 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
+                        clip_rect,
                     ));
 
                     // Active filled track
@@ -518,6 +539,7 @@ impl GlesRenderer {
                             0.0,
                             None,
                             alpha_factor,
+                            clip_rect,
                         ));
                     }
 
@@ -534,6 +556,7 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
+                        clip_rect,
                     ));
                 }
 
@@ -557,6 +580,7 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
+                        clip_rect,
                     ));
 
                     // Sliding thumb
@@ -577,6 +601,7 @@ impl GlesRenderer {
                         0.0,
                         None,
                         alpha_factor,
+                        clip_rect,
                     ));
                 }
             }
@@ -629,8 +654,37 @@ impl GlesRenderer {
                     let target_w = (box_w.round() as u32).max(1);
                     let target_h = (box_h.round() as u32).max(1);
 
+                    let has_scissor = clip_rect.is_some();
+                    if let Some([cx, cy, cw, ch]) = clip_rect {
+                        let clip_x = cx.max(0.0) as i32;
+                        let clip_y = (res.1 - (cy + ch)).max(0.0) as i32;
+                        let clip_w = cw.max(1.0) as i32;
+                        let clip_h = ch.max(1.0) as i32;
+
+                        if let Some((sx, sy, sw, sh)) = damage_scissor {
+                            let ix1 = clip_x.max(sx);
+                            let iy1 = clip_y.max(sy);
+                            let ix2 = (clip_x + clip_w).min(sx + sw);
+                            let iy2 = (clip_y + clip_h).min(sy + sh);
+                            let iw = (ix2 - ix1).max(0);
+                            let ih = (iy2 - iy1).max(0);
+                            self.gl.scissor(ix1, iy1, iw, ih);
+                        } else {
+                            self.gl.enable(glow::SCISSOR_TEST);
+                            self.gl.scissor(clip_x, clip_y, clip_w, clip_h);
+                        }
+                    }
+
                     if let Some((tex, _, _)) = self.image_cache.get_or_load(src, target_w, target_h) {
-                        self.image_cache.draw(tex, res, (box_x, box_y, box_w, box_h), alpha_factor);
+                        self.image_cache.draw(tex, res, (box_x, box_y, box_w, box_h), alpha_factor, b.border_radius * scale_factor);
+                    }
+
+                    if has_scissor {
+                        if let Some((sx, sy, sw, sh)) = damage_scissor {
+                            self.gl.scissor(sx, sy, sw, sh);
+                        } else {
+                            self.gl.disable(glow::SCISSOR_TEST);
+                        }
                     }
                 }
             }
@@ -725,6 +779,36 @@ impl GlesRenderer {
                     let box_x = cx - box_w * 0.5;
                     let box_y = cy;
 
+                    let clip_rect = b.clip_rect.map(|[cx, cy, cw, ch]| {
+                        [cx * scale_factor, cy * scale_factor, cw * scale_factor, ch * scale_factor]
+                    });
+                    if let Some([cx, cy, cw, ch]) = clip_rect {
+                        if by + bh <= cy || by >= cy + ch || bx + bw <= cx || bx >= cx + cw {
+                            continue;
+                        }
+                    }
+
+                    let has_scissor = clip_rect.is_some();
+                    if let Some([cx, cy, cw, ch]) = clip_rect {
+                        let clip_x = cx.max(0.0) as i32;
+                        let clip_y = (height as f32 - (cy + ch)).max(0.0) as i32;
+                        let clip_w = cw.max(1.0) as i32;
+                        let clip_h = ch.max(1.0) as i32;
+
+                        if let Some((sx, sy, sw, sh)) = damage_scissor {
+                            let ix1 = clip_x.max(sx);
+                            let iy1 = clip_y.max(sy);
+                            let ix2 = (clip_x + clip_w).min(sx + sw);
+                            let iy2 = (clip_y + clip_h).min(sy + sh);
+                            let iw = (ix2 - ix1).max(0);
+                            let ih = (iy2 - iy1).max(0);
+                            self.gl.scissor(ix1, iy1, iw, ih);
+                        } else {
+                            self.gl.enable(glow::SCISSOR_TEST);
+                            self.gl.scissor(clip_x, clip_y, clip_w, clip_h);
+                        }
+                    }
+
                     let _ = self.custom_shaders.render(
                         shader,
                         box_x,
@@ -734,6 +818,14 @@ impl GlesRenderer {
                         width,
                         height,
                     );
+
+                    if has_scissor {
+                        if let Some((sx, sy, sw, sh)) = damage_scissor {
+                            self.gl.scissor(sx, sy, sw, sh);
+                        } else {
+                            self.gl.disable(glow::SCISSOR_TEST);
+                        }
+                    }
                 }
             }
 
@@ -770,7 +862,7 @@ impl GlesRenderer {
                 }
 
                 let text_to_draw: Option<(std::borrow::Cow<'_, str>, zenith_layout::Color, f32)> = if let Some((ref text, color, font_size)) = b.text {
-                    Some((std::borrow::Cow::Borrowed(text.as_str()), color, font_size * scale_factor))
+                    Some((std::borrow::Cow::Borrowed(text.as_ref()), color, font_size * scale_factor))
                 } else if let Some(ref input) = b.text_input {
                     let (txt, col) = if input.text.is_empty() {
                         (std::borrow::Cow::Borrowed(input.placeholder.as_str()), input.placeholder_color)
@@ -783,7 +875,7 @@ impl GlesRenderer {
                 };
 
                 if let Some((text, color, font_size)) = text_to_draw {
-                    let layout = self.get_or_shape_text(&text, font_size, font_system);
+                    let layout = self.get_or_shape_text(&text, font_size, b.font_family.as_deref(), b.font_weight, font_system);
                     let line_height = layout.line_height;
 
                     let cx = bx + bw * 0.5;
@@ -800,6 +892,8 @@ impl GlesRenderer {
                     let cg = color.g as f32 / 255.0;
                     let cb = color.b as f32 / 255.0;
                     let ca = (color.a as f32 / 255.0) * alpha_factor;
+
+                    let [cl_x, cl_y, cl_w, cl_h] = clip_rect.unwrap_or([0.0, 0.0, 0.0, 0.0]);
 
                     for pos_glyph in layout.glyphs.iter() {
                         let physical = pos_glyph.glyph.physical((box_x + pos_glyph.x, base_y + pos_glyph.y), 1.0);
@@ -822,13 +916,13 @@ impl GlesRenderer {
                             let is_col = if cached.is_color { 1.0f32 } else { 0.0f32 };
 
                             self.glyph_scratch.extend_from_slice(&[
-                                gx,  gy,  cached.u0, cached.v0, is_col, cr, cg, cb, ca,
-                                gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca,
-                                gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca,
+                                gx,  gy,  cached.u0, cached.v0, is_col, cr, cg, cb, ca, cl_x, cl_y, cl_w, cl_h,
+                                gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca, cl_x, cl_y, cl_w, cl_h,
+                                gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca, cl_x, cl_y, cl_w, cl_h,
 
-                                gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca,
-                                gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca,
-                                gx1, gy1, cached.u1, cached.v1, is_col, cr, cg, cb, ca,
+                                gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca, cl_x, cl_y, cl_w, cl_h,
+                                gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca, cl_x, cl_y, cl_w, cl_h,
+                                gx1, gy1, cached.u1, cached.v1, is_col, cr, cg, cb, ca, cl_x, cl_y, cl_w, cl_h,
                             ]);
                         }
                     }
@@ -840,7 +934,8 @@ impl GlesRenderer {
                             let cur_y = base_y;
                             let cur_w = 2.0f32 * scale_factor;
                             let cur_h = line_height;
-                            let pulse = ((self.frame_counter as f32 * 0.15).sin() * 0.35 + 0.65).clamp(0.0, 1.0);
+                            let elapsed = self.custom_shaders.start_time.elapsed().as_secs_f32();
+                            let pulse = ((elapsed * 4.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0);
                             let cur_col = (
                                 input.color.r as f32 / 255.0,
                                 input.color.g as f32 / 255.0,
@@ -885,7 +980,7 @@ impl GlesRenderer {
                             }
                         }
 
-                        let layout = self.get_or_shape_text(tip_text, font_sz, font_system);
+                        let layout = self.get_or_shape_text(tip_text, font_sz, None, None, font_system);
                         let line_height = layout.line_height;
 
                         let text_offset_y = ((tip_h - line_height) / 2.0).max(0.0);
@@ -918,13 +1013,13 @@ impl GlesRenderer {
                                 let is_col = if cached.is_color { 1.0f32 } else { 0.0f32 };
 
                                 self.glyph_scratch.extend_from_slice(&[
-                                    gx,  gy,  cached.u0, cached.v0, is_col, cr, cg, cb, ca,
-                                    gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca,
-                                    gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca,
+                                    gx,  gy,  cached.u0, cached.v0, is_col, cr, cg, cb, ca, 0.0, 0.0, 0.0, 0.0,
+                                    gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca, 0.0, 0.0, 0.0, 0.0,
+                                    gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca, 0.0, 0.0, 0.0, 0.0,
 
-                                    gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca,
-                                    gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca,
-                                    gx1, gy1, cached.u1, cached.v1, is_col, cr, cg, cb, ca,
+                                    gx,  gy1, cached.u0, cached.v1, is_col, cr, cg, cb, ca, 0.0, 0.0, 0.0, 0.0,
+                                    gx1, gy,  cached.u1, cached.v0, is_col, cr, cg, cb, ca, 0.0, 0.0, 0.0, 0.0,
+                                    gx1, gy1, cached.u1, cached.v1, is_col, cr, cg, cb, ca, 0.0, 0.0, 0.0, 0.0,
                                 ]);
                             }
                         }

@@ -107,6 +107,14 @@ struct TrayCache {
 static TRAY_CACHE: OnceLock<Arc<Mutex<TrayCache>>> = OnceLock::new();
 static IS_UPDATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+enum TrayCommand {
+    Refresh(Arc<Mutex<TrayCache>>),
+    Activate(String, i32, i32),
+    ContextMenu(String, i32, i32),
+    SecondaryActivate(String, i32, i32),
+    Scroll(String, i32, String),
+}
+
 pub struct TrayService;
 
 impl TrayService {
@@ -128,15 +136,7 @@ impl TrayService {
         if guard.last_query.elapsed() >= Duration::from_millis(3000) {
             guard.last_query = Instant::now();
             if !IS_UPDATING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let c_arc = cache_arc.clone();
-                std::thread::spawn(move || {
-                    let fresh = zbus::block_on(Self::list_async());
-                    if let Ok(mut g) = c_arc.lock() {
-                        g.items = fresh;
-                        g.last_query = Instant::now();
-                    }
-                    IS_UPDATING.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
+                let _ = Self::get_tray_worker().try_send(TrayCommand::Refresh(cache_arc.clone()));
             }
         }
 
@@ -209,35 +209,71 @@ impl TrayService {
 
     /// Dispatch primary activation click (Activate(x, y)).
     pub fn activate(service: &str) {
-        let service = service.to_string();
-        std::thread::spawn(move || {
-            let _ = zbus::block_on(Self::activate_async(&service, 0, 0));
-        });
+        let _ = Self::get_tray_worker().try_send(TrayCommand::Activate(service.to_string(), 0, 0));
     }
 
     /// Dispatch context menu click (ContextMenu(x, y)).
     pub fn context_menu(service: &str) {
-        let service = service.to_string();
-        std::thread::spawn(move || {
-            let _ = zbus::block_on(Self::context_menu_async(&service, 0, 0));
-        });
+        let _ = Self::get_tray_worker().try_send(TrayCommand::ContextMenu(service.to_string(), 0, 0));
     }
 
     /// Dispatch secondary activation click (SecondaryActivate(x, y)).
     pub fn secondary_activate(service: &str) {
-        let service = service.to_string();
-        std::thread::spawn(move || {
-            let _ = zbus::block_on(Self::secondary_activate_async(&service, 0, 0));
-        });
+        let _ = Self::get_tray_worker().try_send(TrayCommand::SecondaryActivate(service.to_string(), 0, 0));
     }
 
-    /// Dispatch scroll event.
+    fn get_tray_worker() -> &'static std::sync::mpsc::SyncSender<TrayCommand> {
+        static WORKER: std::sync::OnceLock<std::sync::mpsc::SyncSender<TrayCommand>> = std::sync::OnceLock::new();
+        WORKER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<TrayCommand>(64);
+            std::thread::Builder::new()
+                .name("zenith-tray-worker".into())
+                .spawn(move || {
+                    while let Ok(cmd) = rx.recv() {
+                        match cmd {
+                            TrayCommand::Refresh(c_arc) => {
+                                let fresh = zbus::block_on(Self::list_async());
+                                if let Ok(mut g) = c_arc.lock() {
+                                    g.items = fresh;
+                                    g.last_query = Instant::now();
+                                }
+                                IS_UPDATING.store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            TrayCommand::Activate(service, x, y) => {
+                                let _ = zbus::block_on(Self::activate_async(&service, x, y));
+                            }
+                            TrayCommand::ContextMenu(service, x, y) => {
+                                let _ = zbus::block_on(Self::context_menu_async(&service, x, y));
+                            }
+                            TrayCommand::SecondaryActivate(service, x, y) => {
+                                let _ = zbus::block_on(Self::secondary_activate_async(&service, x, y));
+                            }
+                            TrayCommand::Scroll(service, mut delta, orientation) => {
+                                while let Ok(TrayCommand::Scroll(s, d, o)) = rx.try_recv() {
+                                    if s == service && o == orientation {
+                                        delta += d;
+                                    } else {
+                                        let _ = zbus::block_on(Self::scroll_async(&service, delta, &orientation));
+                                        let _ = zbus::block_on(Self::scroll_async(&s, d, &o));
+                                        delta = 0;
+                                        break;
+                                    }
+                                }
+                                if delta != 0 {
+                                    let _ = zbus::block_on(Self::scroll_async(&service, delta, &orientation));
+                                }
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn zenith tray worker");
+            tx
+        })
+    }
+
+    /// Dispatch scroll event with channel coalescing.
     pub fn scroll(service: &str, delta: i32, orientation: &str) {
-        let service = service.to_string();
-        let orientation = orientation.to_string();
-        std::thread::spawn(move || {
-            let _ = zbus::block_on(Self::scroll_async(&service, delta, &orientation));
-        });
+        let _ = Self::get_tray_worker().try_send(TrayCommand::Scroll(service.to_string(), delta, orientation.to_string()));
     }
 
     /// Dispatch primary activation click (Activate(x, y)) synchronously.
@@ -278,18 +314,34 @@ pub fn resolve_bus_address() -> Option<String> {
     None
 }
 
+static SHARED_CONN: Mutex<Option<zbus::Connection>> = Mutex::new(None);
+
 /// Helper to obtain an async session connection with graceful fallback to standard runtime bus socket.
 pub async fn session_connection() -> zbus::Result<zbus::Connection> {
-    if let Ok(conn) = zbus::Connection::session().await {
-        return Ok(conn);
-    }
-    if let Some(addr) = resolve_bus_address() {
-        let path = addr.strip_prefix("unix:path=").unwrap_or(&addr);
-        if let Ok(conn) = zbus::connection::Builder::address(path)?.build().await {
-            return Ok(conn);
+    if let Ok(guard) = SHARED_CONN.lock() {
+        if let Some(ref conn) = *guard {
+            return Ok(conn.clone());
         }
     }
-    zbus::Connection::session().await
+
+    let conn = if let Ok(conn) = zbus::Connection::session().await {
+        conn
+    } else if let Some(addr) = resolve_bus_address() {
+        let path = addr.strip_prefix("unix:path=").unwrap_or(&addr);
+        if let Ok(conn) = zbus::connection::Builder::address(path)?.build().await {
+            conn
+        } else {
+            zbus::Connection::session().await?
+        }
+    } else {
+        zbus::Connection::session().await?
+    };
+
+    if let Ok(mut guard) = SHARED_CONN.lock() {
+        *guard = Some(conn.clone());
+    }
+
+    Ok(conn)
 }
 
 pub async fn query_registered_items_async() -> zbus::Result<Vec<String>> {

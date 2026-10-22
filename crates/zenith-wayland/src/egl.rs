@@ -77,7 +77,7 @@ impl EglContext {
             egl::DEPTH_SIZE,
             0,
             egl::STENCIL_SIZE,
-            8,
+            0,
             egl::NONE,
         ];
 

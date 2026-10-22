@@ -23,7 +23,7 @@ local function LauncherCategories(props: { active: string? }?)
                 then Zenith.hex(theme.primary)
                 else Zenith.hex(theme.outline_variant or theme.outline, 35),
             border_width = 1,
-            on_click = "cmd:zenith launcher filter " .. string.lower(cat),
+            on_click = "storage:set:launcher_category:" .. cat,
             children = {
                 Zenith.Text({
                     text = cat,

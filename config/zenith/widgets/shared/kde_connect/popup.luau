@@ -74,7 +74,7 @@ local function KdeConnectPopup()
                         border_radius = 6,
                         background = Zenith.hex(theme.surface_container, 160),
                         cursor = "pointer",
-                        on_click = "cmd:kdeconnect-app &",
+                        on_click = "cmd:kdeconnect-app",
                         children = {
                             Zenith.Text({
                                 text = "Abrir Configurações",

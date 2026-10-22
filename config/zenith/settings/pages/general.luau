@@ -91,7 +91,7 @@ local function GeneralPage()
                         button_label = "Sincronizar",
                         button_icon = "󰦗",
                         variant = "tonal",
-                        on_click = "cmd:zenith settings sync",
+                        on_click = "settings:sync",
                     }),
                     Components.Divider(),
                     Components.ActionRow({
@@ -101,7 +101,7 @@ local function GeneralPage()
                         button_label = "Recarregar",
                         button_icon = "󰑖",
                         variant = "tonal",
-                        on_click = "cmd:zenith reload",
+                        on_click = "reload",
                     }),
                     Components.Divider(),
                     Components.ActionRow({
@@ -111,7 +111,7 @@ local function GeneralPage()
                         button_label = "Restaurar",
                         button_icon = "󰁯",
                         variant = "outlined",
-                        on_click = "cmd:zenith reset-defaults",
+                        on_click = "settings:reset_defaults",
                     }),
                 },
             }),

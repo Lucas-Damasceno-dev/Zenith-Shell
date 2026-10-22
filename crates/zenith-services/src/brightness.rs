@@ -74,13 +74,30 @@ impl BrightnessService {
         snapshot
     }
 
+    fn get_brightness_worker() -> &'static std::sync::mpsc::SyncSender<u8> {
+        static WORKER: OnceLock<std::sync::mpsc::SyncSender<u8>> = OnceLock::new();
+        WORKER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(16);
+            std::thread::Builder::new()
+                .name("zenith-brightness".into())
+                .spawn(move || {
+                    while let Ok(mut pct) = rx.recv() {
+                        while let Ok(next) = rx.try_recv() {
+                            pct = next;
+                        }
+                        Self::apply_brightness(pct);
+                        Self::invalidate_cache();
+                    }
+                })
+                .expect("Failed to spawn zenith brightness worker");
+            tx
+        })
+    }
+
     /// Set brightness percentage (0-100) directly via sysfs or logind D-Bus in background.
     pub fn set_brightness(percent: u8) {
         let pct = percent.clamp(1, 100);
-        std::thread::spawn(move || {
-            Self::apply_brightness(pct);
-            Self::invalidate_cache();
-        });
+        let _ = Self::get_brightness_worker().try_send(pct);
     }
 
     fn default_snapshot() -> BrightnessSnapshot {
@@ -201,7 +218,7 @@ impl BrightnessService {
     }
 
     fn set_brightness_logind(device: &str, target: u64) {
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             let target_u32 = target.min(u32::MAX as u64) as u32;
 
             let sent = if let Ok(proxy) = zbus::blocking::Proxy::new(

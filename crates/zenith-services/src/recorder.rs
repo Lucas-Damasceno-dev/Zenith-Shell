@@ -53,23 +53,7 @@ impl RecorderService {
 
     /// Whether screen recording is currently active.
     pub fn is_recording() -> bool {
-        let cache_lock = RECORDER_CACHE.get_or_init(|| {
-            std::sync::RwLock::new((false, std::time::Instant::now() - std::time::Duration::from_secs(10)))
-        });
-
-        if let Ok(guard) = cache_lock.read() {
-            if guard.1.elapsed() < std::time::Duration::from_millis(1000) {
-                return guard.0;
-            }
-        }
-
-        let active = Self::find_recorder_pid().is_some();
-        if let Ok(mut guard) = cache_lock.write() {
-            guard.0 = active;
-            guard.1 = std::time::Instant::now();
-        }
-        IS_RECORDING.store(active, Ordering::SeqCst);
-        active
+        IS_RECORDING.load(Ordering::Relaxed)
     }
 
     /// Toggle screen recording via `wf-recorder`.
@@ -143,10 +127,18 @@ impl RecorderService {
             if let Some(status) = grim_status {
                 if status.success() && file_path.exists() {
                     if let Ok(file) = std::fs::File::open(&file_path) {
-                        let _ = Command::new("wl-copy")
+                        if let Ok(mut child) = Command::new("wl-copy")
                             .args(["--type", "image/png"])
                             .stdin(file)
-                            .spawn();
+                            .spawn()
+                        {
+                            std::thread::Builder::new()
+                                .name("wl-copy-reaper".into())
+                                .spawn(move || {
+                                    let _ = child.wait();
+                                })
+                                .ok();
+                        }
                     }
                 }
             }

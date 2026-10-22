@@ -114,12 +114,26 @@ impl BluetoothService {
     /// Retrieve current Bluetooth controller and devices state non-blockingly.
     pub fn status() -> BluetoothStatus {
         Self::ensure_signal_monitor_spawned();
+        static IS_UPDATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
 
         if guard.last_update.elapsed() > Duration::from_secs(30) {
-            guard.status = Self::query_system_status();
             guard.last_update = Instant::now();
+            if !IS_UPDATING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let cache_clone = cache_arc.clone();
+                std::thread::Builder::new()
+                    .name("zenith-bluetooth-status-bg".into())
+                    .spawn(move || {
+                        let fresh = Self::query_system_status();
+                        if let Ok(mut g) = cache_clone.lock() {
+                            g.status = fresh;
+                            g.last_update = Instant::now();
+                        }
+                        IS_UPDATING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .ok();
+            }
         }
 
         guard.status.clone()
@@ -137,7 +151,7 @@ impl BluetoothService {
             return Err("No Bluetooth adapter present".to_string());
         }
 
-        let conn = zbus::blocking::Connection::system()
+        let conn = crate::dbus::get_shared_system_connection()
             .map_err(|e| format!("Failed to connect to system D-Bus: {}", e))?;
 
         let dev_path = Self::find_device_path(&conn, mac)
@@ -163,7 +177,7 @@ impl BluetoothService {
             return Err("No Bluetooth adapter present".to_string());
         }
 
-        let conn = zbus::blocking::Connection::system()
+        let conn = crate::dbus::get_shared_system_connection()
             .map_err(|e| format!("Failed to connect to system D-Bus: {}", e))?;
 
         let dev_path = Self::find_device_path(&conn, mac)
@@ -193,7 +207,7 @@ impl BluetoothService {
         let target = !current;
 
         // 1. D-Bus BlueZ Adapter1 toggle
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             if let Some(adapter_path) = Self::find_first_adapter_path(&conn) {
                 if let Ok(adapter_proxy) = zbus::blocking::Proxy::new(
                     &conn,
@@ -283,7 +297,7 @@ impl BluetoothService {
             return BluetoothStatus::default();
         }
 
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             if let Ok(proxy) = zbus::blocking::Proxy::new(
                 &conn,
                 "org.bluez",

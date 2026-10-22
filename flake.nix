@@ -59,8 +59,8 @@
             '';
 
             meta = with pkgs.lib; {
-              description = "Zenith Desktop Shell (Engine v2) — Wayland Desktop Shell Framework in Rust + Luau";
-              homepage = "https://github.com/lucas/Zenith-Shell";
+              description = "Zenith Desktop Shell (Engine Base v3) — Wayland Desktop Shell Framework in Rust + Luau";
+              homepage = "https://github.com/Lucas-Damasceno-dev/Zenith-Shell";
               license = licenses.mit;
               platforms = platforms.linux;
               mainProgram = "zenith";

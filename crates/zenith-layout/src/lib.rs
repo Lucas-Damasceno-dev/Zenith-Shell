@@ -1,8 +1,9 @@
 //! Zenith Layout - Taffy Flexbox tree and cosmic-text layout calculations.
 
+use std::sync::Arc;
 use taffy::prelude::*;
 pub use taffy::style::ExpandedDimension;
-pub use taffy::prelude::{AlignItems, Dimension, FlexDirection, JustifyContent, auto, length, percent};
+pub use taffy::prelude::{AlignItems, Dimension, FlexDirection, FlexWrap, JustifyContent, auto, length, percent};
 
 /// Color representation in RGBA (0-255).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +79,8 @@ pub struct ComputedTextInput {
     pub selection_range: Option<(usize, usize)>,
     pub cursor_offset_x: f32,
     pub selection_rect: Option<(f32, f32, f32, f32)>,
-    pub on_change: Option<String>,
-    pub on_submit: Option<String>,
+    pub on_change: Option<Arc<str>>,
+    pub on_submit: Option<Arc<str>>,
 }
 
 /// Computed slider parameters for interactive range controls.
@@ -94,7 +95,7 @@ pub struct ComputedSlider {
     pub track_color: Color,
     pub active_track_color: Color,
     pub thumb_color: Color,
-    pub on_change: Option<String>,
+    pub on_change: Option<Arc<str>>,
 }
 
 /// Computed switch parameters for animated toggle controls.
@@ -105,7 +106,7 @@ pub struct ComputedSwitch {
     pub active_color: Color,
     pub inactive_color: Color,
     pub thumb_color: Color,
-    pub on_toggle: Option<String>,
+    pub on_toggle: Option<Arc<str>>,
 }
 
 /// Shadow parameters for vector drop shadows.
@@ -132,6 +133,7 @@ pub struct NodeStyle {
     pub padding: [f32; 4], // top, right, bottom, left
     pub margin: [f32; 4],
     pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
     pub justify_content: Option<JustifyContent>,
     pub align_items: Option<AlignItems>,
     pub gap: f32,
@@ -159,6 +161,7 @@ impl Default for NodeStyle {
             padding: [0.0; 4],
             margin: [0.0; 4],
             flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::NoWrap,
             justify_content: None,
             align_items: Some(AlignItems::CENTER),
             gap: 0.0,
@@ -185,16 +188,19 @@ pub enum UiNode {
     Box {
         style: NodeStyle,
         children: Vec<UiNode>,
-        on_click: Option<String>,
-        on_right_click: Option<String>,
-        on_scroll_up: Option<String>,
-        on_scroll_down: Option<String>,
-        tooltip: Option<String>,
+        on_click: Option<Arc<str>>,
+        on_right_click: Option<Arc<str>>,
+        on_middle_click: Option<Arc<str>>,
+        on_scroll_up: Option<Arc<str>>,
+        on_scroll_down: Option<Arc<str>>,
+        tooltip: Option<Arc<str>>,
     },
     Text {
-        text: String,
+        text: Arc<str>,
         font_size: f32,
         color: Color,
+        font_family: Option<Arc<str>>,
+        font_weight: Option<u16>,
         style: NodeStyle,
     },
     TextInput {
@@ -208,11 +214,11 @@ pub enum UiNode {
         cursor_pos: usize,
         selection_range: Option<(usize, usize)>,
         style: NodeStyle,
-        on_change: Option<String>,
-        on_submit: Option<String>,
+        on_change: Option<Arc<str>>,
+        on_submit: Option<Arc<str>>,
     },
     Image {
-        src: String,
+        src: Arc<str>,
         style: NodeStyle,
     },
     Shader {
@@ -231,7 +237,7 @@ pub enum UiNode {
         active_track_color: Color,
         thumb_color: Color,
         style: NodeStyle,
-        on_change: Option<String>,
+        on_change: Option<Arc<str>>,
     },
     Switch {
         id: Option<String>,
@@ -240,7 +246,7 @@ pub enum UiNode {
         inactive_color: Color,
         thumb_color: Color,
         style: NodeStyle,
-        on_toggle: Option<String>,
+        on_toggle: Option<Arc<str>>,
     },
     Window {
         meta: WindowMeta,
@@ -271,20 +277,23 @@ pub struct ComputedBox {
     pub border_radius: f32,
     pub shadow: Option<ShadowStyle>,
     pub custom_shader: Option<CustomShaderStyle>,
-    pub text: Option<(String, Color, f32)>,
-    pub image: Option<String>,
+    pub text: Option<(Arc<str>, Color, f32)>,
+    pub image: Option<Arc<str>>,
     pub text_input: Option<ComputedTextInput>,
     pub slider: Option<ComputedSlider>,
     pub switch: Option<ComputedSwitch>,
     pub overflow: Overflow,
     pub scroll_offset_y: f32,
     pub clip_rect: Option<[f32; 4]>,
-    pub on_click: Option<String>,
-    pub on_right_click: Option<String>,
-    pub on_scroll_up: Option<String>,
-    pub on_scroll_down: Option<String>,
-    pub tooltip: Option<String>,
+    pub on_click: Option<Arc<str>>,
+    pub on_right_click: Option<Arc<str>>,
+    pub on_middle_click: Option<Arc<str>>,
+    pub on_scroll_up: Option<Arc<str>>,
+    pub on_scroll_down: Option<Arc<str>>,
+    pub tooltip: Option<Arc<str>>,
     pub tooltip_active: bool,
+    pub font_family: Option<Arc<str>>,
+    pub font_weight: Option<u16>,
 }
 
 impl Default for ComputedBox {
@@ -310,10 +319,13 @@ impl Default for ComputedBox {
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         }
     }
 }
@@ -365,8 +377,20 @@ pub fn apply_dock_magnification(
     pointer_x: Option<f32>,
     anchor_bottom: bool,
 ) {
+    apply_dock_magnification_with_tracker(boxes, model, None, pointer_x, 0.016, anchor_bottom);
+}
+
+/// Applies smooth in-place dock magnification using RK4 springs for smooth scale transition.
+pub fn apply_dock_magnification_with_tracker(
+    boxes: &mut [ComputedBox],
+    model: &zenith_core::MagnificationModel,
+    tracker: Option<&mut zenith_core::MagnificationSpringTracker>,
+    pointer_x: Option<f32>,
+    dt: f32,
+    anchor_bottom: bool,
+) -> bool {
     if boxes.is_empty() {
-        return;
+        return false;
     }
 
     let n = boxes.len();
@@ -375,7 +399,7 @@ pub fn apply_dock_magnification(
             let scale = model.compute_scale(px, boxes[0].center_x());
             boxes[0].apply_magnification_scale(scale, anchor_bottom);
         }
-        return;
+        return false;
     }
 
     // Detect if `boxes` is a hierarchical pre-order tree from LayoutEngine::compute
@@ -409,7 +433,7 @@ pub fn apply_dock_magnification(
         }
 
         if count == 0 {
-            return;
+            return false;
         }
 
         let first_idx = subtrees[0].0;
@@ -418,7 +442,7 @@ pub fn apply_dock_magnification(
         let orig_last_end = boxes[last_idx].x + boxes[last_idx].width;
         let orig_center_x = (orig_first_x + orig_last_end) * 0.5;
 
-        let mut scales = [1.0f32; 64];
+        let mut target_scales = [1.0f32; 64];
         let mut gaps = [0.0f32; 63];
         let mut new_widths = [0.0f32; 64];
         let mut total_new_width = 0.0f32;
@@ -428,9 +452,23 @@ pub fn apply_dock_magnification(
             if let Some(px) = pointer_x {
                 // Only magnify interactive dock app icons (skip 1px separators and wide widgets/pills)
                 if boxes[root_i].width > 4.0 && boxes[root_i].width <= 72.0 {
-                    scales[i] = model.compute_scale(px, boxes[root_i].center_x());
+                    target_scales[i] = model.compute_scale(px, boxes[root_i].center_x());
                 }
             }
+        }
+
+        let mut scales = target_scales;
+        let mut is_animating = false;
+        if let Some(t) = tracker {
+            t.resize(count);
+            let mut out = [1.0f32; 64];
+            let active = t.update(&target_scales[..count], dt, &mut out[..count]);
+            scales[..count].copy_from_slice(&out[..count]);
+            is_animating = active;
+        }
+
+        for i in 0..count {
+            let root_i = subtrees[i].0;
             if i + 1 < count {
                 let next_i = subtrees[i + 1].0;
                 gaps[i] = (boxes[next_i].x - (boxes[root_i].x + boxes[root_i].width)).max(0.0);
@@ -486,12 +524,12 @@ pub fn apply_dock_magnification(
                 cur_x += new_widths[i] + gaps[i];
             }
         }
-        return;
+        return is_animating;
     }
 
     // Flat slice path (used by unit tests with standalone sibling boxes)
     let Some(px) = pointer_x else {
-        return;
+        return false;
     };
     let orig_first_x = boxes[0].x;
     let orig_last_end = boxes[n - 1].x + boxes[n - 1].width;
@@ -541,6 +579,7 @@ pub fn apply_dock_magnification(
             cur_x += new_widths[i] + gaps[i];
         }
     }
+    false
 }
 
 /// Updates scroll_offset_y recursively in any UiNode with Overflow::Scroll
@@ -593,6 +632,7 @@ struct LayoutNodeCache {
 pub struct LayoutEngine {
     taffy: TaffyTree<()>,
     cached_root: Option<LayoutNodeCache>,
+    measure_buffer: cosmic_text::Buffer,
 }
 
 impl Default for LayoutEngine {
@@ -615,6 +655,7 @@ impl LayoutEngine {
         Self {
             taffy: TaffyTree::new(),
             cached_root: None,
+            measure_buffer: cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(14.0, 14.0 * 1.3)),
         }
     }
 
@@ -638,7 +679,7 @@ impl LayoutEngine {
     /// Recycles existing Taffy nodes across incremental mutations instead of clearing the tree.
     pub fn compute(&mut self, root: &UiNode, viewport_width: f32, viewport_height: f32) -> Vec<ComputedBox> {
         let mut computed = Vec::with_capacity(32);
-        self.compute_into(root, viewport_width, viewport_height, &mut computed);
+        self.compute_into(root, viewport_width, viewport_height, &mut computed, None);
         computed
     }
 
@@ -649,10 +690,11 @@ impl LayoutEngine {
         viewport_width: f32,
         viewport_height: f32,
         computed: &mut Vec<ComputedBox>,
+        mut font_system: Option<&mut cosmic_text::FontSystem>,
     ) {
         computed.clear();
         let old_cache = self.cached_root.take();
-        let mut root_cache = self.sync_node(root, old_cache);
+        let mut root_cache = self.sync_node_with_font(root, old_cache, font_system.as_deref_mut());
 
         // Ensure root container expands to viewport bounds if not explicitly sized
         let mut root_style = root_cache.style.clone();
@@ -681,7 +723,17 @@ impl LayoutEngine {
             return;
         }
 
-        self.collect_computed(root, root_cache.node_id, 0.0, 0.0, None, computed);
+        Self::collect_computed(
+            &self.taffy,
+            &mut self.measure_buffer,
+            font_system.as_deref_mut(),
+            root,
+            &root_cache,
+            0.0,
+            0.0,
+            None,
+            computed,
+        );
         self.cached_root = Some(root_cache);
     }
 
@@ -692,15 +744,23 @@ impl LayoutEngine {
         let _ = self.taffy.remove(cache.node_id);
     }
 
-    fn compute_taffy_style(node: &UiNode) -> Style {
+    fn compute_taffy_style(
+        node: &UiNode,
+        buffer: &mut cosmic_text::Buffer,
+        mut font_system: Option<&mut cosmic_text::FontSystem>,
+    ) -> Style {
         match node {
             UiNode::Box { style, .. } | UiNode::Window { style, .. } => Self::convert_style(style),
             UiNode::Text { style, text, font_size, .. } => {
                 let mut taffy_style = Self::convert_style(style);
                 if style.width.is_none() {
-                    let char_count = text.chars().count();
-                    let approx_width = (char_count as f32 * (*font_size * 0.62)).max(*font_size * 0.7);
-                    taffy_style.size.width = length(approx_width);
+                    let actual_width = Self::measure_text_substring_width(
+                        buffer,
+                        font_system.as_deref_mut(),
+                        text,
+                        *font_size,
+                    );
+                    taffy_style.size.width = length(actual_width.max(*font_size * 0.7));
                 }
                 if style.height.is_none() {
                     taffy_style.size.height = length(*font_size * 1.2);
@@ -755,8 +815,22 @@ impl LayoutEngine {
         }
     }
 
+    #[allow(dead_code)]
     fn sync_node(&mut self, node: &UiNode, cached: Option<LayoutNodeCache>) -> LayoutNodeCache {
-        let desired_style = Self::compute_taffy_style(node);
+        self.sync_node_with_font(node, cached, None)
+    }
+
+    fn sync_node_with_font(
+        &mut self,
+        node: &UiNode,
+        cached: Option<LayoutNodeCache>,
+        mut font_system: Option<&mut cosmic_text::FontSystem>,
+    ) -> LayoutNodeCache {
+        let desired_style = Self::compute_taffy_style(
+            node,
+            &mut self.measure_buffer,
+            font_system.as_deref_mut(),
+        );
         let ui_children = match node {
             UiNode::Box { children, .. } | UiNode::Window { children, .. } => children.as_slice(),
             _ => &[],
@@ -770,29 +844,49 @@ impl LayoutEngine {
                     cache.style = desired_style;
                 }
 
-                let mut new_children_caches = Vec::with_capacity(ui_children.len());
-                let mut cached_children = cache.children;
-                let mut drain = cached_children.drain(..);
+                let old_len = cache.children.len();
+                let new_len = ui_children.len();
 
-                for ui_child in ui_children {
-                    let cached_child = drain.next();
-                    let child_cache = self.sync_node(ui_child, cached_child);
-                    new_children_caches.push(child_cache);
-                }
+                if old_len == new_len {
+                    let mut children_changed = false;
+                    for (ui_child, child_cache) in ui_children.iter().zip(cache.children.iter_mut()) {
+                        let old_id = child_cache.node_id;
+                        let old_entry = std::mem::replace(child_cache, LayoutNodeCache {
+                            node_id: old_id,
+                            style: Style::default(),
+                            children: Vec::new(),
+                        });
+                        let updated = self.sync_node_with_font(ui_child, Some(old_entry), font_system.as_deref_mut());
+                        if old_id != updated.node_id {
+                            children_changed = true;
+                        }
+                        *child_cache = updated;
+                    }
+                    if children_changed {
+                        let new_child_ids: Vec<NodeId> = cache.children.iter().map(|c| c.node_id).collect();
+                        let _ = self.taffy.set_children(cache.node_id, &new_child_ids);
+                    }
+                } else {
+                    let mut new_children_caches = Vec::with_capacity(new_len);
+                    let mut cached_children = cache.children;
+                    let mut drain = cached_children.drain(..);
 
-                // Remove leftover cached child nodes from Taffy
-                for leftover in drain {
-                    self.remove_cache_tree(leftover);
-                }
+                    for ui_child in ui_children {
+                        let old_child = drain.next();
+                        let child_cache = self.sync_node_with_font(ui_child, old_child, font_system.as_deref_mut());
+                        new_children_caches.push(child_cache);
+                    }
 
-                // Update child references only if children composition actually changed
-                let current_child_ids = self.taffy.children(cache.node_id).unwrap_or_default();
-                if !current_child_ids.iter().copied().eq(new_children_caches.iter().map(|c| c.node_id)) {
+                    // Remove leftover cached child nodes from Taffy
+                    for leftover in drain {
+                        self.remove_cache_tree(leftover);
+                    }
+
                     let new_child_ids: Vec<NodeId> = new_children_caches.iter().map(|c| c.node_id).collect();
                     let _ = self.taffy.set_children(cache.node_id, &new_child_ids);
+                    cache.children = new_children_caches;
                 }
 
-                cache.children = new_children_caches;
                 cache
             }
             None => {
@@ -806,7 +900,7 @@ impl LayoutEngine {
                 } else {
                     let mut child_caches = Vec::with_capacity(ui_children.len());
                     for ui_child in ui_children {
-                        child_caches.push(self.sync_node(ui_child, None));
+                        child_caches.push(self.sync_node_with_font(ui_child, None, font_system.as_deref_mut()));
                     }
                     let child_ids: Vec<NodeId> = child_caches.iter().map(|c| c.node_id).collect();
                     let node_id = self.taffy.new_with_children(desired_style.clone(), &child_ids).unwrap();
@@ -843,6 +937,7 @@ impl LayoutEngine {
                 left: length(style.margin[3]),
             },
             flex_direction: style.flex_direction,
+            flex_wrap: style.flex_wrap,
             justify_content: style.justify_content,
             align_items: style.align_items,
             flex_grow: style.flex_grow,
@@ -855,31 +950,70 @@ impl LayoutEngine {
         }
     }
 
+    fn measure_text_substring_width(
+        buffer: &mut cosmic_text::Buffer,
+        mut font_system: Option<&mut cosmic_text::FontSystem>,
+        text: &str,
+        font_size: f32,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        static ZENITH_FONT_ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let font_family = ZENITH_FONT_ONCE.get_or_init(|| {
+            std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string())
+        });
+
+        if let Some(ref mut fs) = font_system {
+            buffer.set_metrics(cosmic_text::Metrics::new(font_size, font_size * 1.3));
+            buffer.set_text(
+                text,
+                &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(font_family)),
+                cosmic_text::Shaping::Basic,
+                None,
+            );
+            buffer.shape_until_scroll(fs, false);
+            for run in buffer.layout_runs() {
+                let mut w = 0.0f32;
+                for glyph in run.glyphs.iter() {
+                    w += glyph.w;
+                }
+                return w;
+            }
+        }
+        let char_w = font_size * 0.62;
+        text.chars().count() as f32 * char_w
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn collect_computed(
-        &self,
+        taffy: &TaffyTree<()>,
+        buffer: &mut cosmic_text::Buffer,
+        mut font_system: Option<&mut cosmic_text::FontSystem>,
         node: &UiNode,
-        node_id: NodeId,
+        cache: &LayoutNodeCache,
         parent_x: f32,
         parent_y: f32,
         active_clip: Option<[f32; 4]>,
         out: &mut Vec<ComputedBox>,
     ) {
-        let layout = self.taffy.layout(node_id).unwrap();
+        let layout = taffy.layout(cache.node_id).unwrap();
         let abs_x = parent_x + layout.location.x;
         let abs_y = parent_y + layout.location.y;
 
         match node {
             UiNode::Box { style, children, .. }
             | UiNode::Window { style, children, .. } => {
-                let (on_c, on_rc, on_su, on_sd, tip) = match node {
-                    UiNode::Box { on_click, on_right_click, on_scroll_up, on_scroll_down, tooltip, .. } => (
+                let (on_c, on_rc, on_mc, on_su, on_sd, tip) = match node {
+                    UiNode::Box { on_click, on_right_click, on_middle_click, on_scroll_up, on_scroll_down, tooltip, .. } => (
                         on_click.clone(),
                         on_right_click.clone(),
+                        on_middle_click.clone(),
                         on_scroll_up.clone(),
                         on_scroll_down.clone(),
                         tooltip.clone(),
                     ),
-                    _ => (None, None, None, None, None),
+                    _ => (None, None, None, None, None, None),
                 };
 
                 out.push(ComputedBox {
@@ -903,10 +1037,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: on_c,
                     on_right_click: on_rc,
+                    on_middle_click: on_mc,
                     on_scroll_up: on_su,
                     on_scroll_down: on_sd,
                     tooltip: tip,
                     tooltip_active: false,
+                    font_family: None,
+                    font_weight: None,
                 });
 
                 let my_clip = if style.overflow == Overflow::Scroll || style.overflow == Overflow::Hidden {
@@ -925,18 +1062,27 @@ impl LayoutEngine {
                     active_clip
                 };
 
-                let child_ids = self.taffy.children(node_id).unwrap();
                 let scroll_y = if style.overflow == Overflow::Scroll {
                     style.scroll_offset_y
                 } else {
                     0.0
                 };
 
-                for (child_node, child_id) in children.iter().zip(child_ids.iter()) {
-                    self.collect_computed(child_node, *child_id, abs_x, abs_y - scroll_y, my_clip, out);
+                for (child_node, child_cache) in children.iter().zip(cache.children.iter()) {
+                    Self::collect_computed(
+                        taffy,
+                        buffer,
+                        font_system.as_deref_mut(),
+                        child_node,
+                        child_cache,
+                        abs_x,
+                        abs_y - scroll_y,
+                        my_clip,
+                        out,
+                    );
                 }
             }
-            UiNode::Text { style, text, color, font_size } => {
+            UiNode::Text { style, text, color, font_size, font_family, font_weight } => {
                 out.push(ComputedBox {
                     x: abs_x,
                     y: abs_y,
@@ -958,10 +1104,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
                     tooltip_active: false,
+                    font_family: font_family.clone(),
+                    font_weight: *font_weight,
                 });
             }
             UiNode::TextInput {
@@ -978,16 +1127,31 @@ impl LayoutEngine {
                 on_change,
                 on_submit,
             } => {
-                let char_w = font_size * 0.62;
                 let line_h = font_size * 1.3;
-                let cursor_chars = text.get(..*cursor_pos).map(|s| s.chars().count()).unwrap_or_else(|| text.chars().count());
-                let cursor_offset_x = cursor_chars as f32 * char_w;
+                let cursor_sub = text.get(..*cursor_pos).unwrap_or(text.as_str());
+                let cursor_offset_x = Self::measure_text_substring_width(
+                    buffer,
+                    font_system.as_deref_mut(),
+                    cursor_sub,
+                    *font_size,
+                );
 
                 let selection_rect = selection_range.as_ref().map(|&(s, e)| {
-                    let s_chars = text.get(..s).map(|st| st.chars().count()).unwrap_or(0);
-                    let e_chars = text.get(..e).map(|st| st.chars().count()).unwrap_or_else(|| text.chars().count());
-                    let sel_x = s_chars as f32 * char_w;
-                    let sel_w = ((e_chars.saturating_sub(s_chars)) as f32 * char_w).max(2.0);
+                    let s_sub = text.get(..s).unwrap_or("");
+                    let e_sub = text.get(..e).unwrap_or(text.as_str());
+                    let sel_x = Self::measure_text_substring_width(
+                        buffer,
+                        font_system.as_deref_mut(),
+                        s_sub,
+                        *font_size,
+                    );
+                    let end_x = Self::measure_text_substring_width(
+                        buffer,
+                        font_system.as_deref_mut(),
+                        e_sub,
+                        *font_size,
+                    );
+                    let sel_w = (end_x - sel_x).max(2.0);
                     let sel_y = ((layout.size.height - line_h) * 0.5).max(0.0);
                     (sel_x, sel_y, sel_w, line_h)
                 });
@@ -1027,10 +1191,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
                     tooltip_active: false,
+                    font_family: None,
+                    font_weight: None,
                 });
             }
             UiNode::Image { style, src } => {
@@ -1055,10 +1222,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
                     tooltip_active: false,
+                    font_family: None,
+                    font_weight: None,
                 });
             }
             UiNode::Shader { style, fragment, uniforms } => {
@@ -1086,10 +1256,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
                     tooltip_active: false,
+                    font_family: None,
+                    font_weight: None,
                 });
             }
             UiNode::Slider {
@@ -1137,10 +1310,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
                     tooltip_active: false,
+                    font_family: None,
+                    font_weight: None,
                 });
             }
             UiNode::Switch {
@@ -1180,10 +1356,13 @@ impl LayoutEngine {
                     clip_rect: active_clip,
                     on_click: on_toggle.clone(),
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
                     tooltip_active: false,
+                    font_family: None,
+                    font_weight: None,
                 });
             }
         }
@@ -1212,6 +1391,7 @@ mod tests {
                     children: vec![],
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
@@ -1219,6 +1399,7 @@ mod tests {
             ],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -1252,6 +1433,7 @@ mod tests {
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
+                            on_middle_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
                             tooltip: None,
@@ -1261,6 +1443,7 @@ mod tests {
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
+                            on_middle_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
                             tooltip: None,
@@ -1270,6 +1453,7 @@ mod tests {
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
+                            on_middle_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
                             tooltip: None,
@@ -1279,6 +1463,7 @@ mod tests {
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
+                            on_middle_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
                             tooltip: None,
@@ -1288,6 +1473,7 @@ mod tests {
                             children: vec![],
                             on_click: None,
                             on_right_click: None,
+                            on_middle_click: None,
                             on_scroll_up: None,
                             on_scroll_down: None,
                             tooltip: None,
@@ -1295,6 +1481,7 @@ mod tests {
                     ],
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
@@ -1302,6 +1489,7 @@ mod tests {
             ],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -1343,11 +1531,11 @@ mod tests {
                         height: Some(length(36.0)),
                         ..Default::default()
                     },
-                    on_change: Some("change_cb".to_string()),
-                    on_submit: Some("submit_cb".to_string()),
+                    on_change: Some("change_cb".into()),
+                    on_submit: Some("submit_cb".into()),
                 },
                 UiNode::Image {
-                    src: "/tmp/icon.png".to_string(),
+                    src: "/tmp/icon.png".into(),
                     style: NodeStyle {
                         width: Some(length(32.0)),
                         height: Some(length(32.0)),
@@ -1357,6 +1545,7 @@ mod tests {
             ],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -1389,9 +1578,10 @@ mod tests {
             children: vec![],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
-            tooltip: Some("Click to toggle Wi-Fi".to_string()),
+            tooltip: Some("Click to toggle Wi-Fi".into()),
         };
 
         let computed = engine.compute(&root, 200.0, 40.0);
@@ -1413,9 +1603,11 @@ mod tests {
             },
             children: vec![
                 UiNode::Text {
-                    text: "Initial Title".to_string(),
+                    text: "Initial Title".into(),
                     font_size: 16.0,
                     color: Color::rgb(255, 255, 255),
+                    font_family: None,
+                    font_weight: None,
                     style: NodeStyle::default(),
                 },
                 UiNode::Box {
@@ -1426,12 +1618,13 @@ mod tests {
                     },
                     children: vec![
                         UiNode::Image {
-                            src: "/path/to/icon.png".to_string(),
+                            src: "/path/to/icon.png".into(),
                             style: NodeStyle::default(),
                         }
                     ],
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
@@ -1439,6 +1632,7 @@ mod tests {
             ],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -1459,9 +1653,11 @@ mod tests {
             },
             children: vec![
                 UiNode::Text {
-                    text: "Updated Title".to_string(),
+                    text: "Updated Title".into(),
                     font_size: 16.0,
                     color: Color::rgb(200, 200, 200),
+                    font_family: None,
+                    font_weight: None,
                     style: NodeStyle::default(),
                 },
                 UiNode::Box {
@@ -1473,12 +1669,13 @@ mod tests {
                     },
                     children: vec![
                         UiNode::Image {
-                            src: "/path/to/icon.png".to_string(),
+                            src: "/path/to/icon.png".into(),
                             style: NodeStyle::default(),
                         }
                     ],
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
@@ -1486,6 +1683,7 @@ mod tests {
             ],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -1509,9 +1707,11 @@ mod tests {
             },
             children: vec![
                 UiNode::Text {
-                    text: "Updated Title".to_string(),
+                    text: "Updated Title".into(),
                     font_size: 16.0,
                     color: Color::rgb(200, 200, 200),
+                    font_family: None,
+                    font_weight: None,
                     style: NodeStyle::default(),
                 },
                 UiNode::Box {
@@ -1522,12 +1722,13 @@ mod tests {
                     },
                     children: vec![
                         UiNode::Image {
-                            src: "/path/to/icon.png".to_string(),
+                            src: "/path/to/icon.png".into(),
                             style: NodeStyle::default(),
                         }
                     ],
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
@@ -1541,6 +1742,7 @@ mod tests {
                     children: vec![],
                     on_click: None,
                     on_right_click: None,
+                    on_middle_click: None,
                     on_scroll_up: None,
                     on_scroll_down: None,
                     tooltip: None,
@@ -1548,6 +1750,7 @@ mod tests {
             ],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,

@@ -180,9 +180,24 @@ impl StorageEngine {
         }
     }
 
-    /// Atomically syncs a single modified key into config.json.
-    fn sync_key_to_config(config_path: &std::path::Path, key: &str, val: &JsonValue) -> Result<(), std::io::Error> {
-        if !config_path.exists() {
+    /// Checks if a key represents ephemeral session runtime state that should not cause disk writes or fsyncs.
+    pub fn is_ephemeral_key(key: &str) -> bool {
+        matches!(
+            key,
+            "system_idle"
+                | "system_activity"
+                | "settings_search_query"
+                | "search_query"
+                | "searchQuery"
+                | "selected_index"
+                | "selectedIndex"
+        ) || key.starts_with("ephemeral:")
+            || key.starts_with("temp:")
+    }
+
+    /// Atomically syncs a batch of modified keys into config.json in a single file write.
+    fn sync_batch_to_config(config_path: &std::path::Path, keys: &HashMap<String, JsonValue>) -> Result<(), std::io::Error> {
+        if !config_path.exists() || keys.is_empty() {
             return Ok(());
         }
         let content = fs::read_to_string(config_path)?;
@@ -192,32 +207,27 @@ impl StorageEngine {
         };
 
         if let JsonValue::Object(ref mut root_map) = root {
-            if let Some((section, inner_k)) = key.split_once('.') {
-                if let Some(JsonValue::Object(ref mut sec_map)) = root_map.get_mut(section) {
-                    sec_map.insert(inner_k.to_string(), val.clone());
-                }
-            } else {
-                let targets = Self::flat_key_to_sections(key);
-                if !targets.is_empty() {
-                    for (sec, target_k) in targets {
-                        if let Some(JsonValue::Object(ref mut sec_map)) = root_map.get_mut(sec) {
-                            sec_map.insert(target_k.to_string(), val.clone());
-                        }
+            for (key, val) in keys {
+                if let Some((section, inner_k)) = key.split_once('.') {
+                    if let Some(JsonValue::Object(ref mut sec_map)) = root_map.get_mut(section) {
+                        sec_map.insert(inner_k.to_string(), val.clone());
                     }
                 } else {
-                    let mut found = false;
-                    for sec_val in root_map.values_mut() {
-                        if let JsonValue::Object(ref mut sec_map) = sec_val {
-                            if sec_map.contains_key(key) {
-                                sec_map.insert(key.to_string(), val.clone());
-                                found = true;
+                    let targets = Self::flat_key_to_sections(key);
+                    if !targets.is_empty() {
+                        for (sec, target_k) in targets {
+                            if let Some(JsonValue::Object(ref mut sec_map)) = root_map.get_mut(sec) {
+                                sec_map.insert(target_k.to_string(), val.clone());
                             }
                         }
-                    }
-                    if !found {
-                        // Do not inject unknown/ephemeral session keys into config.json.
-                        // Ephemeral state remains safely persisted only in storage.json.
-                        return Ok(());
+                    } else {
+                        for sec_val in root_map.values_mut() {
+                            if let JsonValue::Object(ref mut sec_map) = sec_val {
+                                if sec_map.contains_key(key) {
+                                    sec_map.insert(key.to_string(), val.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -234,6 +244,8 @@ impl StorageEngine {
         {
             let mut file = File::create(&temp_path)?;
             file.write_all(json_str.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
         }
         fs::rename(&temp_path, config_path)?;
         Ok(())
@@ -294,35 +306,31 @@ impl StorageEngine {
                             Ok(StorageMsg::Flush(ack)) => {
                                 let _ = Self::flush_to_path(&cache, &file_path);
                                 if let Some(ref cp) = config_path {
-                                    for (k, v) in pending_keys.drain() {
-                                        let _ = Self::sync_key_to_config(cp, &k, &v);
-                                    }
+                                    let _ = Self::sync_batch_to_config(cp, &pending_keys);
+                                    pending_keys.clear();
                                 }
                                 let _ = ack.send(());
                             }
                             Ok(StorageMsg::Shutdown) => {
                                 let _ = Self::flush_to_path(&cache, &file_path);
                                 if let Some(ref cp) = config_path {
-                                    for (k, v) in pending_keys.drain() {
-                                        let _ = Self::sync_key_to_config(cp, &k, &v);
-                                    }
+                                    let _ = Self::sync_batch_to_config(cp, &pending_keys);
+                                    pending_keys.clear();
                                 }
                                 break;
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                 let _ = Self::flush_to_path(&cache, &file_path);
                                 if let Some(ref cp) = config_path {
-                                    for (k, v) in pending_keys.drain() {
-                                        let _ = Self::sync_key_to_config(cp, &k, &v);
-                                    }
+                                    let _ = Self::sync_batch_to_config(cp, &pending_keys);
+                                    pending_keys.clear();
                                 }
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                                 let _ = Self::flush_to_path(&cache, &file_path);
                                 if let Some(ref cp) = config_path {
-                                    for (k, v) in pending_keys.drain() {
-                                        let _ = Self::sync_key_to_config(cp, &k, &v);
-                                    }
+                                    let _ = Self::sync_batch_to_config(cp, &pending_keys);
+                                    pending_keys.clear();
                                 }
                                 break;
                             }
@@ -394,6 +402,9 @@ impl StorageEngine {
     pub fn set(&self, key: &str, val: JsonValue) -> Result<(), std::io::Error> {
         {
             let mut writer = self.cache.write().unwrap();
+            if writer.get(key) == Some(&val) {
+                return Ok(());
+            }
             writer.insert(key.to_string(), val.clone());
             if let Some((section, inner_k)) = key.split_once('.') {
                 let flat_k = Self::canonical_flat_key(section, inner_k);
@@ -410,6 +421,10 @@ impl StorageEngine {
                     writer.insert(dot_k, val.clone());
                 }
             }
+        }
+
+        if Self::is_ephemeral_key(key) {
+            return Ok(());
         }
 
         let _ = self.tx.send(StorageMsg::SyncKey {
@@ -436,9 +451,7 @@ impl StorageEngine {
     pub fn sync_to_config(&self) -> Result<(), std::io::Error> {
         if let Some(ref cp) = self.config_path {
             let reader = self.cache.read().unwrap();
-            for (k, v) in reader.iter() {
-                let _ = Self::sync_key_to_config(cp, k, v);
-            }
+            let _ = Self::sync_batch_to_config(cp, &reader);
         }
         Ok(())
     }
@@ -503,7 +516,12 @@ impl StorageEngine {
         let temp_path = file_path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
         let json_str = {
             let reader = cache.read().unwrap();
-            serde_json::to_string_pretty(&*reader)
+            let persistent: HashMap<_, _> = reader
+                .iter()
+                .filter(|(k, _)| !Self::is_ephemeral_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::to_string_pretty(&persistent)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
         };
 

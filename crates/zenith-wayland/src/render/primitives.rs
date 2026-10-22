@@ -14,10 +14,13 @@ layout(location = 4) in vec4 i_bg_color;
 layout(location = 5) in vec4 i_border_color;
 layout(location = 6) in vec4 i_shadow_color;
 layout(location = 7) in vec4 i_shadow_geom;
+layout(location = 8) in vec4 i_clip_rect;
 
 uniform vec2 u_resolution;
 
 out vec2 v_local_pos;
+out vec2 v_screen_pos;
+out vec4 v_clip_rect;
 out vec2 v_box_half_size;
 out float v_border_radius;
 out vec4 v_bg_color;
@@ -36,6 +39,8 @@ void main() {
 
     vec2 box_center = i_box.xy + i_box.zw * 0.5;
     v_local_pos = screen_pos - box_center;
+    v_screen_pos = screen_pos;
+    v_clip_rect = i_clip_rect;
     v_box_half_size = i_box.zw * 0.5;
     v_border_radius = i_radius_border_alpha.x;
     v_border_width = i_radius_border_alpha.y;
@@ -52,6 +57,8 @@ const SDF_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 
 in vec2 v_local_pos;
+in vec2 v_screen_pos;
+in vec4 v_clip_rect;
 in vec2 v_box_half_size;
 in float v_border_radius;
 in vec4 v_bg_color;
@@ -70,6 +77,13 @@ float sd_round_box(vec2 p, vec2 b, float r) {
 }
 
 void main() {
+    if (v_clip_rect.z > 0.0 && v_clip_rect.w > 0.0) {
+        if (v_screen_pos.x < v_clip_rect.x || v_screen_pos.x > v_clip_rect.x + v_clip_rect.z ||
+            v_screen_pos.y < v_clip_rect.y || v_screen_pos.y > v_clip_rect.y + v_clip_rect.w) {
+            discard;
+        }
+    }
+
     float r = min(v_border_radius, min(v_box_half_size.x, v_box_half_size.y));
     float d = sd_round_box(v_local_pos, v_box_half_size, r);
 
@@ -148,11 +162,13 @@ pub struct SdfInstance {
     pub border_color: [f32; 4],
     pub shadow_color: [f32; 4],
     pub shadow_geom: [f32; 4],
+    pub clip_rect: [f32; 4],
 }
 
 pub type BoxShadow = ((f32, f32, f32, f32), (f32, f32), f32);
 
 impl SdfInstance {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rect: (f32, f32, f32, f32),
         inner_box: (f32, f32, f32, f32),
@@ -162,6 +178,7 @@ impl SdfInstance {
         border_width: f32,
         shadow: Option<BoxShadow>,
         alpha_factor: f32,
+        clip_rect: Option<[f32; 4]>,
     ) -> Self {
         let (s_col, s_geom) = if let Some((s_c, s_off, s_blur)) = shadow {
             (
@@ -180,6 +197,7 @@ impl SdfInstance {
             border_color: [border_color.0, border_color.1, border_color.2, border_color.3],
             shadow_color: s_col,
             shadow_geom: s_geom,
+            clip_rect: clip_rect.unwrap_or([0.0, 0.0, 0.0, 0.0]),
         }
     }
 }
@@ -237,6 +255,7 @@ impl SdfRectShader {
             (5, 16),
             (6, 20),
             (7, 24),
+            (8, 28),
         ] {
             gl.enable_vertex_attrib_array(loc);
             gl.vertex_attrib_pointer_f32(loc, 4, glow::FLOAT, false, stride, offset_floats * 4);
@@ -334,6 +353,7 @@ impl SdfRectShader {
             border_color: [border_color.0, border_color.1, border_color.2, border_color.3],
             shadow_color: s_col,
             shadow_geom: s_geom,
+            clip_rect: [0.0; 4],
         };
 
         self.draw_batch(resolution, &[inst]);

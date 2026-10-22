@@ -135,14 +135,6 @@ local function Button(props: ButtonProps?)
         end
     end
 
-    -- Spring animation physics instance
-    if p.spring ~= false and Zenith.Spring then
-        local anim = Zenith.Spring(1.0, 1.0, 240, 18)
-        if anim and anim.current then
-            -- Spring node can wrap or scale
-        end
-    end
-
     return Zenith.Box({
         id = p.id,
         width = p.width,

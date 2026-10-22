@@ -15,7 +15,7 @@ export type PillProps = {
     variant: string?,
     height: number?,
     border_radius: number?,
-    padding: { x: number, y: number }?,
+    padding: (number | { x: number?, y: number?, horizontal: number?, vertical: number? })?,
     gap: number?,
     background: any?,
     border_color: any?,
@@ -34,7 +34,7 @@ local function Pill(props: PillProps?)
 
     local h = p.height or 26
     local r = p.border_radius or math.floor(h / 2)
-    local pad = p.padding or { x = 8, y = 2 }
+    local pad = p.padding or { horizontal = 8, vertical = 2 }
     local g = p.gap or 5
 
     local variant = p.variant or "default"

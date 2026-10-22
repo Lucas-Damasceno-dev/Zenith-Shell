@@ -462,7 +462,7 @@ function ExtraPages.render(page_id: number)
                 }),
                 Components.TaskNavigator({
                     tasks = {
-                        { id = "about", name = "Zenith Shell v0.2", icon = "󰌽" },
+                        { id = "about", name = "Zenith Shell v0.3.0", icon = "󰌽" },
                         { id = "cheatsheet", name = "Atalhos de Teclado", icon = "󰌌" },
                         { id = "diagnostics", name = "Diagnóstico", icon = "󰘵" },
                     },
@@ -471,7 +471,7 @@ function ExtraPages.render(page_id: number)
                 Components.CardSection({
                     title = "Arquitetura & Especificações Técnicas",
                     icon = "󰌽",
-                    badge = "Engine v0.2.0",
+                    badge = "Engine Base v3",
                     children = {
                         Components.ActionRow({
                             icon = "󰌽",
@@ -480,7 +480,7 @@ function ExtraPages.render(page_id: number)
                             button_label = "GitHub",
                             button_icon = "󰈔",
                             variant = "tonal",
-                            on_click = "cmd:xdg-open https://github.com",
+                            on_click = "cmd:xdg-open https://github.com/Lucas-Damasceno-dev/Zenith-Shell",
                         }),
                         Components.Divider(),
                         Components.ActionRow({

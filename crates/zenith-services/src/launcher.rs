@@ -97,7 +97,15 @@ impl LauncherService {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             match cmd.spawn() {
-                Ok(_) => Ok(()),
+                Ok(mut child) => {
+                    std::thread::Builder::new()
+                        .name("launcher-reaper".into())
+                        .spawn(move || {
+                            let _ = child.wait();
+                        })
+                        .ok();
+                    Ok(())
+                }
                 Err(_) => {
                     // Fallback to shell only if direct binary lookup fails
                     std::process::Command::new("sh")
@@ -106,7 +114,14 @@ impl LauncherService {
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .spawn()
-                        .map(|_| ())
+                        .map(|mut child| {
+                            std::thread::Builder::new()
+                                .name("launcher-reaper".into())
+                                .spawn(move || {
+                                    let _ = child.wait();
+                                })
+                                .ok();
+                        })
                 }
             }
         } else {

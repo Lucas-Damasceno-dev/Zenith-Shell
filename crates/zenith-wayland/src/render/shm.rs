@@ -192,7 +192,7 @@ impl ShmFallbackRenderer {
                         if cache.len() >= 128 {
                             cache.clear();
                         }
-                        let key = (src.clone(), target_w, target_h);
+                        let key = (src.to_string(), target_w, target_h);
                         let cached_opt = cache.entry(key).or_insert_with(|| {
                             if let Ok(decoded) = zenith_services::ImageService::load_image(src, Some(target_w), Some(target_h)) {
                                 if let Some(size) = tiny_skia::IntSize::from_wh(decoded.width, decoded.height) {
@@ -342,7 +342,7 @@ impl ShmFallbackRenderer {
                 }
 
                 let text_to_draw: Option<(std::borrow::Cow<'_, str>, zenith_layout::Color, f32)> = if let Some((ref text, color, font_size)) = b.text {
-                    Some((std::borrow::Cow::Borrowed(text.as_str()), color, font_size * scale_factor))
+                    Some((std::borrow::Cow::Borrowed(text.as_ref()), color, font_size * scale_factor))
                 } else if let Some(ref input) = b.text_input {
                     let (txt, col) = if input.text.is_empty() {
                         (std::borrow::Cow::Borrowed(input.placeholder.as_str()), input.placeholder_color)
@@ -363,10 +363,14 @@ impl ShmFallbackRenderer {
                     let is_complex = text.chars().any(|c| c as u32 > 0x0600);
                     let shaping = if is_complex { Shaping::Advanced } else { Shaping::Basic };
                     static FONT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-                    let font_family = FONT.get_or_init(|| std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string()));
+                    let default_font = FONT.get_or_init(|| std::env::var("ZENITH_FONT").unwrap_or_else(|_| "JetBrainsMono Nerd Font".to_string()));
+                    let font_family = b.font_family.as_deref().unwrap_or(default_font);
+                    let font_weight = b.font_weight.unwrap_or(400);
                     buffer.set_text(
                         &text,
-                        &cosmic_text::Attrs::new().family(cosmic_text::Family::Name(font_family)),
+                        &cosmic_text::Attrs::new()
+                            .family(cosmic_text::Family::Name(font_family))
+                            .weight(cosmic_text::Weight(font_weight)),
                         shaping,
                         None,
                     );

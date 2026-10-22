@@ -14,6 +14,7 @@ export type ApplicationItem = {
     description: string,
     score: number?,
     id: string?,
+    categories: { string }?,
 }
 
 function LauncherService.search(query: string?, limit: number?): { ApplicationItem }
@@ -28,6 +29,7 @@ function LauncherService.search(query: string?, limit: number?): { ApplicationIt
                 icon = app.icon or "application-default",
                 description = app.comment or app.description or "",
                 score = app.score or 0,
+                categories = app.categories or {},
             })
         end
         return list

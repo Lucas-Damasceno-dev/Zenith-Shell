@@ -330,22 +330,6 @@ function Store.get(key: string, fallback: any?): any
     end
 
     local final_val = if val ~= nil then val else default_val
-
-    -- Normalize normalized floats (0.0 .. 1.0) to integer percentages expected by Sliders
-    if key == "fontSizeScale" and type(final_val) == "number" and final_val <= 2.0 then
-        return math.floor(final_val * 100)
-    elseif key == "radiusScale" and type(final_val) == "number" and final_val <= 2.0 then
-        return math.floor(final_val * 100)
-    elseif key == "springDamping" and type(final_val) == "number" and final_val <= 1.0 then
-        return math.floor(final_val * 100)
-    elseif key == "aiTemperature" and type(final_val) == "number" and final_val <= 1.0 then
-        return math.floor(final_val * 100)
-    elseif key == "audioVolumeStep" and type(final_val) == "number" and final_val <= 0.20 then
-        return math.floor(final_val * 100)
-    elseif key == "barGlassOpacity" and type(final_val) == "number" and final_val <= 1.0 then
-        return math.floor(final_val * 100)
-    end
-
     return final_val
 end
 

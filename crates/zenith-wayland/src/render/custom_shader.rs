@@ -36,7 +36,7 @@ pub struct CompiledCustomShader {
 
 pub struct CustomShaderPipeline {
     gl: Arc<glow::Context>,
-    start_time: Instant,
+    pub(crate) start_time: Instant,
     vao: glow::NativeVertexArray,
     vbo: glow::NativeBuffer,
     pub vbo_capacity: usize,

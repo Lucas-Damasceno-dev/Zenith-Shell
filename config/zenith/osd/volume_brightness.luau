@@ -18,7 +18,7 @@ local function VolumeBrightnessOsd()
 
     if mode == "brightness" then
         label = "Brilho"
-        value = Store.get("brightness", 100)
+        value = Services.Hardware.brightness()
         icon = if value > 60 then "󰃠" elseif value > 20 then "󰃟" else "󰃞"
     else
         local audio = Services.Audio.status()

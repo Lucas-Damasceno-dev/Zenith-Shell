@@ -89,7 +89,7 @@ impl MprisService {
                             "/org/freedesktop/DBus",
                             Some("org.freedesktop.DBus"),
                             "AddMatch",
-                            &("type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged'"),
+                            &("type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0namespace='org.mpris.MediaPlayer2'"),
                         );
 
                         for msg in zbus::blocking::MessageIterator::from(&conn) {
@@ -226,13 +226,13 @@ impl MprisService {
         crate::dbus::resolve_session_bus_address()
     }
 
-    fn get_session_connection() -> Option<zbus::blocking::Connection> {
-        crate::dbus::get_session_connection().ok()
+    fn get_session_connection() -> Option<std::sync::Arc<zbus::blocking::Connection>> {
+        crate::dbus::get_shared_session_connection().ok()
     }
 
     fn find_mpris_players() -> Vec<String> {
         if let Some(conn) = Self::get_session_connection() {
-            if let Ok(dbus_proxy) = zbus::blocking::fdo::DBusProxy::new(&conn) {
+            if let Ok(dbus_proxy) = zbus::blocking::fdo::DBusProxy::new(&*conn) {
                 if let Ok(names) = dbus_proxy.list_names() {
                     return names
                         .into_iter()
@@ -311,7 +311,7 @@ impl MprisService {
         let mut first_match = None;
         for player_bus in players {
             let proxy = match zbus::blocking::Proxy::new(
-                &conn,
+                &*conn,
                 player_bus.clone(),
                 "/org/mpris/MediaPlayer2",
                 "org.mpris.MediaPlayer2.Player",

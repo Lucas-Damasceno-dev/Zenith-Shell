@@ -73,8 +73,15 @@ impl XdgIconResolver {
                 }
 
                 for s in &size_fallbacks {
+                    let size_dir = theme_dir.join(s);
+                    if !size_dir.is_dir() {
+                        continue;
+                    }
                     for cat in &categories {
-                        let candidate_dir = theme_dir.join(s).join(cat);
+                        let candidate_dir = size_dir.join(cat);
+                        if !candidate_dir.is_dir() {
+                            continue;
+                        }
                         for ext in &extensions {
                             let candidate = candidate_dir.join(format!("{}.{}", name, ext));
                             if candidate.exists() {

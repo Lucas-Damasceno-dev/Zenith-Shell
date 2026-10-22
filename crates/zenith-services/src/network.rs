@@ -95,11 +95,25 @@ impl NetworkService {
     /// Retrieve current network connectivity status with non-blocking cache.
     pub fn status() -> NetworkStatus {
         Self::ensure_signal_monitor_spawned();
+        static IS_UPDATING_STATUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
         if guard.last_status_scan.elapsed() > Duration::from_secs(30) {
-            guard.status = Self::query_system_status();
             guard.last_status_scan = Instant::now();
+            if !IS_UPDATING_STATUS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let cache_clone = cache_arc.clone();
+                std::thread::Builder::new()
+                    .name("zenith-network-status-bg".into())
+                    .spawn(move || {
+                        let fresh = Self::query_system_status();
+                        if let Ok(mut g) = cache_clone.lock() {
+                            g.status = fresh;
+                            g.last_status_scan = Instant::now();
+                        }
+                        IS_UPDATING_STATUS.store(false, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .ok();
+            }
         }
         guard.status.clone()
     }
@@ -107,11 +121,25 @@ impl NetworkService {
     /// Scan and return nearby Wi-Fi networks non-blockingly.
     pub fn scan_wifi() -> Vec<WifiNetwork> {
         Self::ensure_signal_monitor_spawned();
+        static IS_UPDATING_WIFI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let cache_arc = Self::cache();
         let mut guard = cache_arc.lock().unwrap();
         if guard.last_wifi_scan.elapsed() > Duration::from_secs(30) {
-            guard.wifi_list = Self::query_system_wifi();
             guard.last_wifi_scan = Instant::now();
+            if !IS_UPDATING_WIFI.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let cache_clone = cache_arc.clone();
+                std::thread::Builder::new()
+                    .name("zenith-wifi-scan-bg".into())
+                    .spawn(move || {
+                        let fresh_wifi = Self::query_system_wifi();
+                        if let Ok(mut g) = cache_clone.lock() {
+                            g.wifi_list = fresh_wifi;
+                            g.last_wifi_scan = Instant::now();
+                        }
+                        IS_UPDATING_WIFI.store(false, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .ok();
+            }
         }
         guard.wifi_list.clone()
     }
@@ -123,7 +151,7 @@ impl NetworkService {
 
     /// Connect to a Wi-Fi access point via native D-Bus NetworkManager.
     pub fn connect_wifi(ssid: &str, password: Option<&str>) -> Result<(), String> {
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             if let Ok(nm_proxy) = zbus::blocking::Proxy::new(
                 &conn,
                 "org.freedesktop.NetworkManager",
@@ -159,7 +187,7 @@ impl NetworkService {
 
     /// Enable or disable Wi-Fi radio via D-Bus NetworkManager or kernel sysfs rfkill.
     pub fn set_wifi_enabled(enabled: bool) -> Result<(), String> {
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             if let Ok(proxy) = zbus::blocking::Proxy::new(
                 &conn,
                 "org.freedesktop.NetworkManager",
@@ -263,7 +291,7 @@ impl NetworkService {
     }
 
     fn query_dbus_status() -> Option<NetworkStatus> {
-        let conn = zbus::blocking::Connection::system().ok()?;
+        let conn = crate::dbus::get_shared_system_connection().ok()?;
         let proxy = zbus::blocking::Proxy::new(
             &conn,
             "org.freedesktop.NetworkManager",
@@ -311,7 +339,7 @@ impl NetworkService {
     }
 
     fn query_system_wifi() -> Vec<WifiNetwork> {
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             if let Ok(nm_proxy) = zbus::blocking::Proxy::new(
                 &conn,
                 "org.freedesktop.NetworkManager",

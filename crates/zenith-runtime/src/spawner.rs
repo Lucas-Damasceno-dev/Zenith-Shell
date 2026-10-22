@@ -101,9 +101,21 @@ pub fn build_detached_command(cmd: &str) -> Command {
     command
 }
 
-/// Spawns a sanitized, detached external command asynchronously.
-pub fn spawn_detached(cmd: &str) -> std::io::Result<std::process::Child> {
-    build_detached_command(cmd).spawn()
+/// Spawns a background thread to wait on a child process and reap it when done,
+/// preventing zombie (<defunct>) processes.
+pub fn reap_child(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("proc-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+/// Spawns a sanitized, detached external command asynchronously and reaps it on exit.
+pub fn spawn_detached(cmd: &str) -> std::io::Result<()> {
+    let child = build_detached_command(cmd).spawn()?;
+    reap_child(child);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -151,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_spawn_detached_success() {
-        let child = spawn_detached("true");
-        assert!(child.is_ok());
+        let res = spawn_detached("true");
+        assert!(res.is_ok());
     }
 }

@@ -55,7 +55,7 @@ impl PowerProfileService {
 
         let prof_str = prof.to_string();
         std::thread::spawn(move || {
-            let sent_native = if let Ok(conn) = zbus::blocking::Connection::system() {
+            let sent_native = if let Ok(conn) = crate::dbus::get_shared_system_connection() {
                 if let Ok(proxy) = zbus::blocking::Proxy::new(
                     &conn,
                     "net.hadess.PowerProfiles",
@@ -79,7 +79,7 @@ impl PowerProfileService {
     }
 
     fn read_dbus_power_profile() -> Option<String> {
-        if let Ok(conn) = zbus::blocking::Connection::system() {
+        if let Ok(conn) = crate::dbus::get_shared_system_connection() {
             if let Ok(proxy) = zbus::blocking::Proxy::new(
                 &conn,
                 "net.hadess.PowerProfiles",
@@ -112,7 +112,7 @@ impl PowerProfileService {
     /// Suspend system via logind / systemd D-Bus or kernel /sys/power/state.
     pub fn suspend() {
         std::thread::spawn(|| {
-            if let Ok(conn) = zbus::blocking::Connection::system() {
+            if let Ok(conn) = crate::dbus::get_shared_system_connection() {
                 if let Ok(proxy) = zbus::blocking::Proxy::new(
                     &conn,
                     "org.freedesktop.login1",
@@ -141,7 +141,7 @@ impl PowerProfileService {
     /// Reboot system via logind / systemd D-Bus or kernel sysrq.
     pub fn reboot() {
         std::thread::spawn(|| {
-            if let Ok(conn) = zbus::blocking::Connection::system() {
+            if let Ok(conn) = crate::dbus::get_shared_system_connection() {
                 if let Ok(proxy) = zbus::blocking::Proxy::new(
                     &conn,
                     "org.freedesktop.login1",
@@ -170,7 +170,7 @@ impl PowerProfileService {
     /// Power off system via logind / systemd D-Bus or kernel sysrq.
     pub fn poweroff() {
         std::thread::spawn(|| {
-            if let Ok(conn) = zbus::blocking::Connection::system() {
+            if let Ok(conn) = crate::dbus::get_shared_system_connection() {
                 if let Ok(proxy) = zbus::blocking::Proxy::new(
                     &conn,
                     "org.freedesktop.login1",

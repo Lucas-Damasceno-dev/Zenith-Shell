@@ -19,7 +19,8 @@ use zenith_cli::ShellCommand;
 enum AppEvent {
     Reload(String),
     ReloadActiveTrees,
-    Redraw,
+    Tick,
+    StateChanged,
     DismissPopup,
 }
 
@@ -48,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "repl" => run_repl(),
         "sync" => send_socket_command("settings:sync"),
-        "reset-defaults" => send_socket_command("settings:reload"),
+        "reset-defaults" => send_socket_command("settings:reset_defaults"),
         "bluetooth-toggle" => {
             let _ = zenith_services::BluetoothService::toggle_power();
             Ok(())
@@ -76,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "launcher" => {
             if args.get(2).map(|s| s.as_str()) == Some("filter") {
                 if let Some(cat) = args.get(3) {
-                    send_socket_command(&format!("eval Zenith.Storage.set('launcher_category', '{}')", cat))?;
+                    send_socket_command(&format!("settings:set launcher_category {}", cat))?;
                 }
             }
             Ok(())
@@ -107,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "list" | "all" => send_socket_command("settings:list"),
                 "sync" => send_socket_command("settings:sync"),
                 "reload" => send_socket_command("settings:reload"),
+                "reset-defaults" | "reset_defaults" => send_socket_command("settings:reset_defaults"),
                 _ => {
                     eprintln!("Unknown settings action: '{}'. Valid actions: get, set, list, sync, reload.", action);
                     std::process::exit(1);
@@ -213,22 +215,8 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
     }
 
     // Auto-launch Dock if enabled in configuration
-    let home_cfg = std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/zenith/config.json"));
-    let mut config_paths = Vec::new();
-    if let Some(p) = home_cfg {
-        config_paths.push(p);
-    }
-    config_paths.push(PathBuf::from("config/zenith/config.json"));
-    config_paths.push(PathBuf::from("../../config/zenith/config.json"));
-
-    let dock_enabled = config_paths
-        .iter()
-        .find_map(|p| {
-            fs::read_to_string(p)
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                .and_then(|v| v.get("dock")?.get("enable")?.as_bool())
-        })
+    let dock_enabled = app.runtime.storage.get("dockEnabled")
+        .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
     if dock_enabled {
@@ -253,8 +241,6 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             match app_evt {
                 AppEvent::Reload(code) => {
                     info!("Hot-reload triggered, recomputing Luau UI tree...");
-                    zenith_services::LauncherService::reload();
-                    zenith_services::XdgIconResolver::invalidate_cache();
                     let start = std::time::Instant::now();
                     if let Err(e) = app.reload_script(&code) {
                         error!("Luau script error on hot-reload: {}", e);
@@ -269,8 +255,6 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                 }
                 AppEvent::ReloadActiveTrees => {
                     info!("Hot-reload triggered for module/overlay, refreshing Luau module cache and active trees...");
-                    zenith_services::LauncherService::reload();
-                    zenith_services::XdgIconResolver::invalidate_cache();
                     let start = std::time::Instant::now();
                     app.sync_autohide_settings();
                     let _ = app.update_bar_visibility();
@@ -280,7 +264,8 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     info!("Active trees and Luau module cache reloaded in {:?}!", elapsed);
                     needs_redraw_cb.store(true, Ordering::Release);
                 }
-                AppEvent::Redraw => {
+                AppEvent::Tick => {
+                    app.runtime.update_system_signals();
                     app.sync_autohide_settings();
                     let prev_bar_hidden = app.bar_hidden;
                     let prev_dock_hidden = app.dock_hidden;
@@ -295,6 +280,15 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     if (has_visible || visibility_changed) && !app.runtime.is_idle() {
                         needs_redraw_cb.store(true, Ordering::Release);
                     }
+                }
+                AppEvent::StateChanged => {
+                    let script = app.bar_script.clone();
+                    let _ = app.reload_script(&script);
+                    if !app.dock_hidden {
+                        let _ = app.reload_dock();
+                    }
+                    needs_redraw_cb.store(true, Ordering::Release);
+                    let _ = app.request_redraw();
                 }
                 AppEvent::DismissPopup => {
                     if let Some(ref popup) = app.popup {
@@ -440,6 +434,23 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                     };
                     let _ = tx.send(resp);
                 }
+                ShellCommand::SettingsResetDefaults(tx) => {
+                    let _ = app.runtime.storage.clear();
+                    let _ = app.runtime.storage.sync_to_config();
+                    let resp = match app.runtime.storage.reload_from_config() {
+                        Ok(_) => {
+                            app.sync_autohide_settings();
+                            let _ = app.update_bar_visibility();
+                            let _ = app.update_dock_visibility();
+                            app.reload_active_trees();
+                            cmd_needs_redraw.store(true, Ordering::Release);
+                            let _ = app.request_redraw();
+                            "OK: settings reset to defaults and UI updated\n".to_string()
+                        }
+                        Err(e) => format!("ERR: failed to reset settings: {}\n", e),
+                    };
+                    let _ = tx.send(resp);
+                }
                 ShellCommand::Lock => {
                     info!("IPC command: lock screen");
                     app.lock_session();
@@ -464,7 +475,7 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
     // Hook Hyprland compositor IPC change listener for sub-10ms UI updates (zero disk I/O)
     let hypr_sender = event_sender.clone();
     zenith_services::HyprlandService::set_change_listener(move || {
-        let _ = hypr_sender.send(AppEvent::Redraw);
+        let _ = hypr_sender.send(AppEvent::StateChanged);
     });
 
     let dismiss_sender = event_sender.clone();
@@ -475,14 +486,51 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
     // Hook Notification Daemon change listener for instant UI updates (zero disk I/O)
     let notif_sender = event_sender.clone();
     zenith_services::NotificationService::set_change_listener(move || {
-        let _ = notif_sender.send(AppEvent::Redraw);
+        let _ = notif_sender.send(AppEvent::StateChanged);
     });
 
     // Hook Audio change listener for instant volume/mute UI updates (zero polling)
     let audio_sender = event_sender.clone();
     zenith_services::AudioService::set_change_listener(move || {
-        let _ = audio_sender.send(AppEvent::Redraw);
+        let _ = audio_sender.send(AppEvent::StateChanged);
     });
+
+    // Hook MPRIS media change listener for instant track/playback UI updates
+    let mpris_sender = event_sender.clone();
+    zenith_services::MprisService::set_change_listener(move || {
+        let _ = mpris_sender.send(AppEvent::StateChanged);
+    });
+
+    // Hook Theme change listener for instant theme updates (zero polling)
+    let theme_sender = event_sender.clone();
+    zenith_services::ThemeWatcher::set_change_listener(move || {
+        let _ = theme_sender.send(AppEvent::ReloadActiveTrees);
+    });
+
+    // Hook worker pool completion ping to immediately dispatch async callbacks in calloop
+    let (worker_ping, worker_ping_source) = calloop::ping::make_ping()?;
+    let ping_needs_redraw = needs_redraw.clone();
+    loop_handle.insert_source(worker_ping_source, move |(), _, app: &mut WaylandApp| {
+        if let Ok(count) = app.poll_async_tasks() {
+            if count > 0 {
+                ping_needs_redraw.store(true, Ordering::Release);
+                let _ = app.request_redraw();
+            }
+        }
+    })?;
+    app.runtime.set_worker_completion_notifier(Arc::new(move || {
+        worker_ping.ping();
+    }));
+
+    // Integrated 1-second calloop timer for clock & hardware telemetry updates (zero wakeups when animations paused)
+    let ticker_sender = event_sender.clone();
+    let timer = calloop::timer::Timer::from_duration(Duration::from_secs(1));
+    loop_handle.insert_source(timer, move |_deadline, _, app: &mut WaylandApp| {
+        if !app.should_pause_animations() {
+            let _ = ticker_sender.send(AppEvent::Tick);
+        }
+        calloop::timer::TimeoutAction::ToDuration(Duration::from_secs(1))
+    })?;
 
     // Start background file watcher if config exists
     let _watcher = if let Some(ref path) = script_path {
@@ -502,6 +550,16 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
                                 || name.ends_with(".tmp")
                         });
                         if is_ephemeral_or_config {
+                            return;
+                        }
+
+                        let is_theme_change = event.paths.iter().any(|p| {
+                            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            name == "colors.json" || name == "theme.json" || name == "palette.json"
+                        });
+                        if is_theme_change {
+                            zenith_services::SystemService::invalidate_theme_cache();
+                            let _ = watcher_sender.send(AppEvent::ReloadActiveTrees);
                             return;
                         }
 
@@ -544,19 +602,22 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             info!("Hot-reload watcher active on file: {} (recursive)", path.display());
         }
 
+        // Add native inotify watchers for theme directories without polling disk
+        if let Ok(home) = std::env::var("HOME") {
+            let matugen_cache = std::path::PathBuf::from(&home).join(".cache/matugen");
+            if matugen_cache.exists() {
+                let _ = watcher.watch(&matugen_cache, RecursiveMode::Recursive);
+            }
+            let zenith_config = std::path::PathBuf::from(&home).join(".config/zenith");
+            if zenith_config.exists() && Some(zenith_config.as_path()) != path.parent() {
+                let _ = watcher.watch(&zenith_config, RecursiveMode::Recursive);
+            }
+        }
+
         Some(watcher)
     } else {
         None
     };
-
-    // Spawn 1-second ticker thread for clock & hardware telemetry updates (zero disk I/O)
-    let ticker_sender = event_sender.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let _ = ticker_sender.send(AppEvent::Redraw);
-        }
-    });
 
     info!("Wayland connection established. Entering unified event loop...");
 
@@ -570,8 +631,16 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             .map(|t| autohide_delay.saturating_sub(t.elapsed()))
             .min();
 
+        let any_frame_pending = app.bars.iter().any(|b| b.frame_callback_pending)
+            || app.dock.as_ref().map(|d| d.frame_callback_pending).unwrap_or(false)
+            || app.popup.as_ref().map(|p| p.frame_callback_pending).unwrap_or(false);
+
         let timeout = if needs_redraw.load(Ordering::Acquire) {
-            Some(Duration::from_millis(8))
+            if !any_frame_pending {
+                Some(Duration::ZERO)
+            } else {
+                Some(Duration::from_millis(8))
+            }
         } else if let Some(lt) = leave_timeout {
             Some(lt.max(Duration::from_millis(1)))
         } else if app.tooltip_hover.is_some() {
@@ -584,12 +653,6 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
 
         if app.tooltip_hover.is_some() && app.check_tooltip_timer() {
             needs_redraw.store(true, Ordering::Release);
-        }
-
-        if let Ok(count) = app.poll_async_tasks() {
-            if count > 0 {
-                needs_redraw.store(true, Ordering::Release);
-            }
         }
 
         if app.runtime.check_close_requested() {
@@ -619,7 +682,7 @@ fn run_daemon(custom_path: Option<PathBuf>, inspect_mode: bool) -> Result<(), Bo
             }
         }
 
-        if needs_redraw.load(Ordering::Acquire) && last_draw.elapsed() >= Duration::from_millis(8) {
+        if needs_redraw.load(Ordering::Acquire) && (!any_frame_pending || last_draw.elapsed() >= Duration::from_millis(8)) {
             needs_redraw.store(false, Ordering::Release);
             last_draw = std::time::Instant::now();
             if let Err(e) = app.request_redraw() {

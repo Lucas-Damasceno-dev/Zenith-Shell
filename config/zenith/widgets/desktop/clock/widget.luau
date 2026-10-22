@@ -5,6 +5,7 @@
 local Pill = Zenith.import("widgets/shared/pill/init")
 local Theme = Zenith.import("core/theme")
 local PopupManager = Zenith.import("core/popup_manager")
+local Store = Zenith.import("core/store")
 
 type ClockProps = {
     reactive: boolean?,
@@ -18,11 +19,14 @@ local function Clock(props: ClockProps?)
     end
     local hm = if #time_str >= 5 then time_str:sub(1, 5) else time_str
 
+    local second_precision = Store.get("secondPrecision", false)
+    local display_time = if second_precision then time_str else hm
+
     local screen = if Zenith.Services and Zenith.Services.Screen then Zenith.Services.Screen() else { width = 1366 }
     local screen_w = screen.width or 1366
     local show_date = screen_w >= 1200
 
-    local time_binding = if Zenith.Signals and Zenith.Signals.Time then Zenith.Signals.Time else hm
+    local time_binding = if Zenith.Signals and Zenith.Signals.Time then Zenith.Signals.Time else display_time
     local date_binding = if Zenith.Signals and Zenith.Signals.Date then Zenith.Signals.Date else date_str
 
     local children = {

@@ -1,4 +1,4 @@
-# Zenith Desktop Shell (Engine v2) — Developer Workflow
+# Zenith Desktop Shell (Engine Base v3) — Developer Workflow
 set shell := ["bash", "-c"]
 cargo_bin := `if pkg-config --exists wayland-client >/dev/null 2>&1; then echo "cargo"; else echo "nix develop --command cargo"; fi`
 

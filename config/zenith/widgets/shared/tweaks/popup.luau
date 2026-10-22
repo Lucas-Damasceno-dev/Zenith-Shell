@@ -77,7 +77,7 @@ local function TweaksPopup()
                     Zenith.Text({ text = "Efeito de Blur no Vidro", font_size = 11, color = Zenith.hex(theme.on_surface) }),
                     Zenith.Switch({
                         id = "tweaks_blur_switch",
-                        checked = Store.get("glassEffect") or true,
+                        checked = Store.get("glassEffect", true),
                         active_color = theme.primary,
                         on_toggle = "storage:toggle:glassEffect",
                     }),

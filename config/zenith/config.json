@@ -8,9 +8,9 @@
   },
   "bar": {
     "autoHide": true,
-    "customRounding": 5,
-    "height": 29,
-    "position": "Top"
+    "customRounding": 6.4927735,
+    "height": 28,
+    "position": "top"
   },
   "dock": {
     "autoHide": true,

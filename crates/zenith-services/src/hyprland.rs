@@ -84,6 +84,7 @@ struct HyprlandState {
     clients: Vec<ClientItem>,
     monitors: Vec<MonitorItem>,
     gaps_out: u32,
+    active_layout: String,
     socket_dir: Option<PathBuf>,
 }
 
@@ -112,44 +113,39 @@ impl HyprlandService {
         r.active_window.clone()
     }
 
-    /// Retrieve current client windows snapshot.
-    pub fn clients_snapshot() -> Vec<ClientItem> {
-        static LAST_SYNC: OnceLock<std::sync::Mutex<std::time::Instant>> = OnceLock::new();
+    /// Retrieve active keyboard layout abbreviated to 2-letter ISO code.
+    pub fn active_layout() -> String {
         let state = Self::get_state();
-
-        let should_sync = {
-            let mut sync_lock = LAST_SYNC
-                .get_or_init(|| std::sync::Mutex::new(std::time::Instant::now() - Duration::from_secs(1)))
-                .lock()
-                .unwrap();
-            if sync_lock.elapsed() >= Duration::from_millis(150) {
-                *sync_lock = std::time::Instant::now();
-                true
+        let r = state.read().unwrap();
+        let raw = &r.active_layout;
+        let lower = raw.to_ascii_lowercase();
+        if lower.contains("brazil") || lower.contains("abnt") || lower.contains("portuguese") {
+            "BR".to_string()
+        } else if lower.contains("english") || lower.contains("us") {
+            "US".to_string()
+        } else if lower.contains("spanish") || lower.contains("es") {
+            "ES".to_string()
+        } else if lower.contains("german") || lower.contains("de") {
+            "DE".to_string()
+        } else if lower.contains("french") || lower.contains("fr") {
+            "FR".to_string()
+        } else if lower.contains("japanese") || lower.contains("jp") {
+            "JP".to_string()
+        } else if lower.contains("russian") || lower.contains("ru") {
+            "RU".to_string()
+        } else {
+            let code: String = raw.chars().filter(|c| c.is_alphabetic()).take(2).collect();
+            if code.is_empty() {
+                "BR".to_string()
             } else {
-                false
-            }
-        };
-
-        if should_sync {
-            let (is_hypr, socket_dir) = {
-                let r = state.read().unwrap();
-                (r.is_hyprland, r.socket_dir.clone())
-            };
-            if is_hypr {
-                let cmd_sock = socket_dir
-                    .map(|d| d.join(".socket.sock"))
-                    .or_else(|| resolve_hypr_dir().map(|d| d.join(".socket.sock")));
-                if let Some(sock) = cmd_sock {
-                    if let Ok(resp) = send_socket_command(&sock, "j/clients") {
-                        let clients = parse_clients_json(&resp);
-                        if let Ok(mut w) = state.write() {
-                            w.clients = clients;
-                        }
-                    }
-                }
+                code.to_uppercase()
             }
         }
+    }
 
+    /// Retrieve current client windows snapshot without synchronous socket blocks.
+    pub fn clients_snapshot() -> Vec<ClientItem> {
+        let state = Self::get_state();
         let r = state.read().unwrap();
         r.clients.clone()
     }
@@ -163,22 +159,44 @@ impl HyprlandService {
 
     /// Parses JSON array from `j/monitors` into a list of MonitorItems.
     pub fn parse_monitors_json(resp: &str) -> Vec<MonitorItem> {
-        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(resp) {
-            let mut list = Vec::new();
-            for item in items {
-                list.push(MonitorItem {
-                    id: item["id"].as_i64().unwrap_or(0),
-                    name: item["name"].as_str().unwrap_or("").to_string(),
-                    width: item["width"].as_u64().unwrap_or(1920) as u32,
-                    height: item["height"].as_u64().unwrap_or(1080) as u32,
-                    refresh_rate: item["refreshRate"].as_f64().unwrap_or(60.0) as f32,
-                    scale: item["scale"].as_f64().unwrap_or(1.0) as f32,
-                    focused: item["focused"].as_bool().unwrap_or(false),
-                    x: item["x"].as_i64().unwrap_or(0) as i32,
-                    y: item["y"].as_i64().unwrap_or(0) as i32,
-                });
-            }
-            list
+        #[derive(Deserialize)]
+        struct RawMonitorJson {
+            #[serde(default)]
+            id: i64,
+            #[serde(default)]
+            name: String,
+            #[serde(default = "default_width")]
+            width: u32,
+            #[serde(default = "default_height")]
+            height: u32,
+            #[serde(rename = "refreshRate", default = "default_refresh_rate")]
+            refresh_rate: f32,
+            #[serde(default = "default_scale")]
+            scale: f32,
+            #[serde(default)]
+            focused: bool,
+            #[serde(default)]
+            x: i32,
+            #[serde(default)]
+            y: i32,
+        }
+        fn default_width() -> u32 { 1920 }
+        fn default_height() -> u32 { 1080 }
+        fn default_refresh_rate() -> f32 { 60.0 }
+        fn default_scale() -> f32 { 1.0 }
+
+        if let Ok(items) = serde_json::from_str::<Vec<RawMonitorJson>>(resp) {
+            items.into_iter().map(|item| MonitorItem {
+                id: item.id,
+                name: item.name,
+                width: item.width,
+                height: item.height,
+                refresh_rate: item.refresh_rate,
+                scale: item.scale,
+                focused: item.focused,
+                x: item.x,
+                y: item.y,
+            }).collect()
         } else {
             Vec::new()
         }
@@ -494,6 +512,7 @@ impl HyprlandService {
                     clients,
                     monitors,
                     gaps_out,
+                    active_layout: "Portuguese (Brazil)".to_string(),
                     socket_dir: Some(dir),
                 }));
 
@@ -623,6 +642,7 @@ impl HyprlandService {
                         y: 0,
                     }],
                     gaps_out: 10,
+                    active_layout: "Portuguese (Brazil)".to_string(),
                     socket_dir: None,
                 }))
             }
@@ -872,7 +892,6 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     }
                     ensure_minimum_workspaces(&mut w.workspaces, ws_id, 4);
                 }
-                resync_clients(cmd_sock, state);
                 notify_focus_change();
                 changed = true;
             }
@@ -906,7 +925,6 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 changed = true;
             }
             "activewindowv2" => {
-                resync_clients(cmd_sock, state);
                 let addr = data.split(',').next().unwrap_or("").trim().to_string();
                 let has_focused_client = !addr.is_empty() && addr != ",";
                 let mut w = state.write().unwrap();
@@ -916,11 +934,27 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                     let a2 = addr.trim_start_matches("0x");
                     !a1.is_empty() && a1.eq_ignore_ascii_case(a2)
                 }).map(|c| (c.class.clone(), c.title.clone()));
+
                 if let Some((cls, ttl)) = client_info {
                     w.active_window.class = cls;
                     w.active_window.title = ttl;
+                    drop(w);
+                } else {
+                    drop(w);
+                    if has_focused_client {
+                        resync_clients(cmd_sock, state);
+                        let mut w = state.write().unwrap();
+                        let client_info = w.clients.iter().find(|c| {
+                            let a1 = c.address.trim_start_matches("0x");
+                            let a2 = addr.trim_start_matches("0x");
+                            !a1.is_empty() && a1.eq_ignore_ascii_case(a2)
+                        }).map(|c| (c.class.clone(), c.title.clone()));
+                        if let Some((cls, ttl)) = client_info {
+                            w.active_window.class = cls;
+                            w.active_window.title = ttl;
+                        }
+                    }
                 }
-                drop(w);
                 if has_focused_client {
                     notify_focus_change();
                 }
@@ -928,7 +962,6 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
             }
             "activewindow" => {
                 // Format: WINDOWCLASS,WINDOWTITLE
-                resync_clients(cmd_sock, state);
                 let (class, title) = if let Some((c, t)) = data.split_once(',') {
                     (c.trim().to_string(), t.trim().to_string())
                 } else {
@@ -941,6 +974,16 @@ fn handle_event_line(line: &str, cmd_sock: &Path, state: &Arc<RwLock<HyprlandSta
                 if let Some(c) = w.clients.iter().find(|c| c.class == class && c.title == title) {
                     w.active_window.address = c.address.clone();
                 }
+                changed = true;
+            }
+            "activelayout" => {
+                let layout = if let Some((_kb, lay)) = data.split_once(',') {
+                    lay.trim().to_string()
+                } else {
+                    data.trim().to_string()
+                };
+                let mut w = state.write().unwrap();
+                w.active_layout = layout;
                 changed = true;
             }
             "createworkspace" | "createworkspacev2" => {
@@ -1028,58 +1071,105 @@ pub fn query_gaps_out(cmd_sock: &Path) -> u32 {
     8
 }
 
+#[derive(Deserialize)]
+struct RawWorkspaceRef {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawBoolOrInt {
+    Bool(bool),
+    Int(i64),
+}
+
+impl RawBoolOrInt {
+    fn is_true(&self) -> bool {
+        match self {
+            RawBoolOrInt::Bool(b) => *b,
+            RawBoolOrInt::Int(i) => *i != 0,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawClientJson {
+    #[serde(default)]
+    address: String,
+    #[serde(default = "default_client_mapped")]
+    mapped: bool,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    class: String,
+    #[serde(rename = "initialClass", default)]
+    initial_class: String,
+    #[serde(default)]
+    workspace: Option<RawWorkspaceRef>,
+    #[serde(default)]
+    floating: bool,
+    #[serde(default)]
+    fullscreen: Option<RawBoolOrInt>,
+    #[serde(rename = "fullscreenClient", default)]
+    fullscreen_client: Option<RawBoolOrInt>,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    monitor: i64,
+    #[serde(default)]
+    pid: i32,
+    #[serde(default)]
+    at: Option<(i32, i32)>,
+    #[serde(default)]
+    size: Option<(i32, i32)>,
+}
+fn default_client_mapped() -> bool { true }
+
+#[derive(Deserialize)]
+struct RawWorkspaceJson {
+    #[serde(default)]
+    id: i32,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    monitor: String,
+    #[serde(default)]
+    windows: u32,
+    #[serde(default)]
+    urgent: bool,
+}
+
 /// Parse JSON output from `j/clients` into structured `ClientItem` vec.
 pub fn parse_clients_json(json_str: &str) -> Vec<ClientItem> {
     let mut result = Vec::new();
-    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(json_str) {
+    if let Ok(items) = serde_json::from_str::<Vec<RawClientJson>>(json_str) {
         for item in items {
-            let address = item["address"].as_str().unwrap_or("").to_string();
-            let mapped = item["mapped"].as_bool().unwrap_or(true);
-            if !mapped || address.is_empty() {
+            if !item.mapped || item.address.is_empty() {
                 continue;
             }
-            let title = item["title"].as_str().unwrap_or("").to_string();
-            let class = item["class"].as_str().unwrap_or("").to_string();
-            let initial_class = item["initialClass"].as_str().unwrap_or("").to_string();
-            let workspace = &item["workspace"];
-            let workspace_id = workspace["id"].as_i64().unwrap_or(0) as i32;
-            let workspace_name = workspace["name"].as_str().unwrap_or("").to_string();
-            let floating = item["floating"].as_bool().unwrap_or(false);
-            let fullscreen = match &item["fullscreen"] {
-                Value::Bool(b) => *b,
-                Value::Number(n) => n.as_i64().is_some_and(|v| v != 0),
-                _ => false,
-            } || match &item["fullscreenClient"] {
-                Value::Bool(b) => *b,
-                Value::Number(n) => n.as_i64().is_some_and(|v| v != 0),
-                _ => false,
-            };
-            let hidden = item["hidden"].as_bool().unwrap_or(false);
-            let monitor = item["monitor"].as_i64().unwrap_or(0);
-            let pid = item["pid"].as_i64().unwrap_or(0) as i32;
-            let at = (
-                item["at"][0].as_i64().unwrap_or(0) as i32,
-                item["at"][1].as_i64().unwrap_or(0) as i32,
-            );
-            let size = (
-                item["size"][0].as_i64().unwrap_or(0) as i32,
-                item["size"][1].as_i64().unwrap_or(0) as i32,
-            );
+            let (ws_id, ws_name) = item.workspace
+                .map(|w| (w.id as i32, w.name))
+                .unwrap_or((0, String::new()));
+            let fullscreen = item.fullscreen.as_ref().map(|f| f.is_true()).unwrap_or(false)
+                || item.fullscreen_client.as_ref().map(|f| f.is_true()).unwrap_or(false);
 
             result.push(ClientItem {
-                address,
-                title,
-                class,
-                initial_class,
-                workspace_id,
-                workspace_name,
-                floating,
+                address: item.address,
+                title: item.title,
+                class: item.class,
+                initial_class: item.initial_class,
+                workspace_id: ws_id,
+                workspace_name: ws_name,
+                floating: item.floating,
                 fullscreen,
-                hidden,
-                monitor,
-                pid,
-                at,
-                size,
+                hidden: item.hidden,
+                monitor: item.monitor,
+                pid: item.pid,
+                at: item.at.unwrap_or((0, 0)),
+                size: item.size.unwrap_or((0, 0)),
             });
         }
     }
@@ -1098,26 +1188,21 @@ fn resync_clients(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
 /// Re-query workspaces list via command socket to synchronize window counts and list.
 fn resync_workspaces(cmd_sock: &Path, state: &Arc<RwLock<HyprlandState>>) {
     if let Ok(resp) = send_socket_command(cmd_sock, "j/workspaces") {
-        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&resp) {
+        if let Ok(items) = serde_json::from_str::<Vec<RawWorkspaceJson>>(&resp) {
             let active_id = state.read().unwrap().active_workspace;
             let mut list = Vec::new();
             for item in items {
-                let id = item["id"].as_i64().unwrap_or(0) as i32;
-                let name = item["name"].as_str().unwrap_or("").to_string();
-                if id < 0 || name.starts_with("special") {
+                if item.id < 0 || item.name.starts_with("special") {
                     continue;
                 }
-                let monitor = item["monitor"].as_str().unwrap_or("").to_string();
-                let windows = item["windows"].as_u64().unwrap_or(0) as u32;
-                let urgent = item["urgent"].as_bool().unwrap_or(false);
-                let active = id == active_id;
+                let active = item.id == active_id;
                 list.push(WorkspaceItem {
-                    id,
-                    name,
-                    monitor,
+                    id: item.id,
+                    name: item.name,
+                    monitor: item.monitor,
                     active,
-                    urgent,
-                    windows,
+                    urgent: item.urgent,
+                    windows: item.windows,
                 });
             }
 
@@ -1221,6 +1306,7 @@ mod tests {
             }],
             socket_dir: None,
             gaps_out: 0,
+            active_layout: "Portuguese (Brazil)".to_string(),
         }));
 
         let dummy_path = Path::new("/dev/null");
@@ -1294,5 +1380,38 @@ mod tests {
         let _ = HyprlandService::focus_window(kitty_addr);
         let win = HyprlandService::active_window_snapshot();
         assert_eq!(win.class, clients[0].class);
+    }
+
+    #[test]
+    fn test_active_layout_abbreviation() {
+        let layout = HyprlandService::active_layout();
+        assert_eq!(layout.len(), 2, "Active layout must be abbreviated to 2 ISO chars");
+        assert!(layout.chars().all(|c| c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_parse_monitors_json_typed() {
+        let raw = r#"[
+            {
+                "id": 0,
+                "name": "eDP-1",
+                "width": 1920,
+                "height": 1080,
+                "refreshRate": 144.0,
+                "scale": 1.25,
+                "focused": true,
+                "x": 0,
+                "y": 0
+            }
+        ]"#;
+        let mons = HyprlandService::parse_monitors_json(raw);
+        assert_eq!(mons.len(), 1);
+        assert_eq!(mons[0].id, 0);
+        assert_eq!(mons[0].name, "eDP-1");
+        assert_eq!(mons[0].width, 1920);
+        assert_eq!(mons[0].height, 1080);
+        assert_eq!(mons[0].refresh_rate, 144.0);
+        assert_eq!(mons[0].scale, 1.25);
+        assert!(mons[0].focused);
     }
 }

@@ -1,9 +1,8 @@
 //! Zenith Services - Native hardware telemetry, system metrics, Matugen theming, and SVG rendering.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use serde_json::Value;
 
@@ -72,6 +71,12 @@ pub use brightness::{BrightnessService, BrightnessSnapshot};
 
 pub mod disk;
 pub use disk::{DiskService, DiskSnapshot};
+
+pub mod clipboard;
+pub use clipboard::{ClipboardItem, ClipboardService};
+
+pub mod toplevel;
+pub use toplevel::{ToplevelAction, ToplevelInfo, ToplevelService};
 
 pub mod power;
 pub use power::{PowerProfileService, PowerService};
@@ -383,13 +388,31 @@ impl SystemService {
         snap
     }
 
-    /// Read battery capacity and charging status from `/sys/class/power_supply/`.
+    /// Read battery capacity and charging status from `/sys/class/power_supply/` with 2-second caching and hardware property memoization.
     pub fn battery_snapshot() -> Option<BatterySnapshot> {
+        static BAT_CACHE: OnceLock<RwLock<(Option<BatterySnapshot>, Instant)>> = OnceLock::new();
+        static STATIC_BAT_INFO: OnceLock<(String, Option<f64>)> = OnceLock::new();
+
+        let cache = BAT_CACHE.get_or_init(|| {
+            RwLock::new((None, Instant::now() - Duration::from_secs(10)))
+        });
+
+        if let Ok(guard) = cache.read() {
+            if guard.1.elapsed() < Duration::from_secs(2) {
+                return guard.0.clone();
+            }
+        }
+
         let ps_path = Path::new("/sys/class/power_supply");
         if !ps_path.exists() {
+            if let Ok(mut guard) = cache.write() {
+                guard.0 = None;
+                guard.1 = Instant::now();
+            }
             return None;
         }
 
+        let mut result = None;
         if let Ok(entries) = fs::read_dir(ps_path) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -414,18 +437,20 @@ impl SystemService {
                         .and_then(|s| s.trim().parse::<i32>().ok())
                         .unwrap_or(-1);
 
-                    let model_name = fs::read_to_string(entry.path().join("model_name"))
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|| "Primary Battery".to_string());
+                    let (model_name, energy_full_design) = STATIC_BAT_INFO.get_or_init(|| {
+                        let mn = fs::read_to_string(entry.path().join("model_name"))
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| "Primary Battery".to_string());
+                        let efd = fs::read_to_string(entry.path().join("energy_full_design"))
+                            .or_else(|_| fs::read_to_string(entry.path().join("charge_full_design")))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok());
+                        (mn, efd)
+                    }).clone();
 
                     let energy_full = fs::read_to_string(entry.path().join("energy_full"))
                         .or_else(|_| fs::read_to_string(entry.path().join("charge_full")))
-                        .ok()
-                        .and_then(|s| s.trim().parse::<f64>().ok());
-
-                    let energy_full_design = fs::read_to_string(entry.path().join("energy_full_design"))
-                        .or_else(|_| fs::read_to_string(entry.path().join("charge_full_design")))
                         .ok()
                         .and_then(|s| s.trim().parse::<f64>().ok());
 
@@ -446,7 +471,7 @@ impl SystemService {
                         })
                         .unwrap_or_else(|| "0h 0m".to_string());
 
-                    return Some(BatterySnapshot {
+                    result = Some(BatterySnapshot {
                         percentage: cap,
                         status,
                         is_charging,
@@ -455,11 +480,16 @@ impl SystemService {
                         model_name,
                         uptime_str,
                     });
+                    break;
                 }
             }
         }
 
-        None
+        if let Ok(mut guard) = cache.write() {
+            guard.0 = result.clone();
+            guard.1 = Instant::now();
+        }
+        result
     }
 
     /// Queries current volume and mute status from PipeWire / WirePlumber.
@@ -514,7 +544,7 @@ impl SystemService {
         });
 
         let needs_update = if let Ok(guard) = cache_lock.read() {
-            guard.1.elapsed() >= Duration::from_millis(1000)
+            guard.1.elapsed() >= Duration::from_secs(30)
         } else {
             false
         };
@@ -872,25 +902,8 @@ impl SystemService {
         palette
     }
 
-    /// Rasterize an SVG string into an RGBA pixel buffer at `[width, height]` with in-memory caching.
+    /// Rasterize an SVG string into an RGBA pixel buffer at `[width, height]`.
     pub fn render_svg(svg_str: &str, width: u32, height: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        type SvgCacheMap = Arc<RwLock<HashMap<(u64, u32, u32), Vec<u8>>>>;
-        static SVG_CACHE: OnceLock<SvgCacheMap> = OnceLock::new();
-        let cache = SVG_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())));
-
-        let mut hasher = DefaultHasher::new();
-        svg_str.hash(&mut hasher);
-        let key = (hasher.finish(), width, height);
-
-        if let Ok(guard) = cache.read() {
-            if let Some(cached) = guard.get(&key) {
-                return Ok(cached.clone());
-            }
-        }
-
         let opt = resvg::usvg::Options::default();
         let tree = resvg::usvg::Tree::from_str(svg_str, &opt)?;
 
@@ -904,11 +917,7 @@ impl SystemService {
         let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
 
         resvg::render(&tree, transform, &mut pixmap.as_mut());
-        let buf = pixmap.take();
-        if let Ok(mut guard) = cache.write() {
-            guard.insert(key, buf.clone());
-        }
-        Ok(buf)
+        Ok(pixmap.take())
     }
 
     /// Rasterize an SVG file from disk into an RGBA pixel buffer at `[width, height]`.

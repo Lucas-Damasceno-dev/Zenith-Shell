@@ -82,7 +82,7 @@ mod tests {
                 track_color: Color::rgba(255, 255, 255, 30),
                 active_track_color: Color::rgb(100, 150, 250),
                 thumb_color: Color::rgb(255, 255, 255),
-                on_change: Some("vol_change".to_string()),
+                on_change: Some("vol_change".into()),
             }),
             switch: None,
             overflow: zenith_layout::Overflow::Visible,
@@ -90,10 +90,13 @@ mod tests {
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let switch_box = ComputedBox {
@@ -117,17 +120,20 @@ mod tests {
                 active_color: Color::rgb(50, 120, 240),
                 inactive_color: Color::rgba(255, 255, 255, 30),
                 thumb_color: Color::rgb(255, 255, 255),
-                on_toggle: Some("wifi_toggle".to_string()),
+                on_toggle: Some("wifi_toggle".into()),
             }),
             overflow: zenith_layout::Overflow::Visible,
             scroll_offset_y: 0.0,
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let res = ShmFallbackRenderer::render_boxes(

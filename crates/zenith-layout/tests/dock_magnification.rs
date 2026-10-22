@@ -23,10 +23,13 @@ fn make_box(x: f32, y: f32, size: f32) -> ComputedBox {
         clip_rect: None,
         on_click: None,
         on_right_click: None,
+        on_middle_click: None,
         on_scroll_up: None,
         on_scroll_down: None,
         tooltip: None,
         tooltip_active: false,
+        font_family: None,
+        font_weight: None,
     }
 }
 

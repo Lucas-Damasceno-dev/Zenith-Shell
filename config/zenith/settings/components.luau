@@ -90,7 +90,7 @@ function Components.Header(props: {
                                 color = pal.colOnSurface,
                             }),
                             Zenith.Text({
-                                text = "lucas@meu-nixos",
+                                text = if Zenith.user then (Zenith.user() .. "@" .. (if Zenith.host then Zenith.host() else "zenith")) else "zenith@host",
                                 font_family = "Inter",
                                 font_size = 11,
                                 color = pal.colSubtext,

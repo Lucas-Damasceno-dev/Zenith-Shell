@@ -74,9 +74,13 @@ impl ImageService {
         };
 
         if let Ok(mut guard) = cache.write() {
-            // Keep memory bounded: purge if cache exceeds 128 images
+            // Keep memory bounded: evict 16 oldest LRU items if cache exceeds 128 images
             if guard.len() > 128 {
-                guard.clear();
+                let mut entries: Vec<(String, Instant)> = guard.iter().map(|(k, (_, inst))| (k.clone(), *inst)).collect();
+                entries.sort_unstable_by_key(|(_, inst)| *inst);
+                for (k, _) in entries.into_iter().take(16) {
+                    guard.remove(&k);
+                }
             }
             guard.insert(key, (decoded.clone(), Instant::now()));
         }
@@ -146,5 +150,19 @@ mod tests {
         assert_eq!(img.width, 16);
         assert_eq!(img.height, 16);
         assert_eq!(img.rgba.len(), 16 * 16 * 4);
+    }
+
+    #[test]
+    fn test_image_cache_lru_eviction() {
+        // Fill cache past 128 items and ensure it evicts without crashing or clearing everything
+        for i in 0..140 {
+            let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="8"><rect width="4" height="8" fill="red"/></svg>"#, i + 1);
+            let _ = ImageService::load_image(&svg, Some(8), Some(8));
+        }
+        if let Some(cache_arc) = IMAGE_CACHE.get() {
+            let cache = cache_arc.read().unwrap();
+            assert!(cache.len() <= 128);
+            assert!(cache.len() > 100);
+        }
     }
 }

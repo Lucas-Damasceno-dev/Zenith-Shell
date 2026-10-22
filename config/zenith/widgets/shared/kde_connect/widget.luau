@@ -15,8 +15,8 @@ local function KdeConnectWidget()
         border_radius = 13,
         padding = { horizontal = 8, vertical = 2 },
         tooltip = "KDE Connect (Mobile)\n• Clique: Abrir Gerenciador de Dispositivos\n• Botão Direito: Atualizar Dispositivos",
-        on_click = "cmd:kdeconnect-app &",
-        on_right_click = "cmd:kdeconnect-cli --refresh &",
+        on_click = "cmd:kdeconnect-app",
+        on_right_click = "cmd:kdeconnect-cli --refresh",
     })
 end
 

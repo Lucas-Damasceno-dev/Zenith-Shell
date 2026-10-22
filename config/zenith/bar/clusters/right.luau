@@ -51,7 +51,9 @@ local function RightCluster(props: { compact: boolean?, zen_mode: boolean?, heig
         table.insert(children, Widgets.Clipboard())
     end
 
-    table.insert(children, Widgets.USB())
+    if Store.get("showUsbWidget", true) then
+        table.insert(children, Widgets.USB())
+    end
 
     if Store.get("showSystemTray", true) then
         local tray = Widgets.Tray()

@@ -3,6 +3,7 @@
 -- Full keyboard navigation, live search, categories, and native compositor integration
 
 local Theme = Zenith.import("core/theme")
+local Store = Zenith.import("core/store")
 local Services = Zenith.import("core/services/init")
 local LauncherDefaults = Zenith.import("launcher/defaults")
 local LauncherHeader = Zenith.import("launcher/header")
@@ -26,6 +27,40 @@ local function Launcher(props: { query: string?, selected_index: number? }?)
 
     local apps = Services.Launcher.search(query, LauncherDefaults.max_results)
 
+    local active_category = Store.get("launcher_category", "Todos")
+    local category_map: { [string]: { string } } = {
+        Desenvolvimento = { "development", "ide", "programming" },
+        Internet = { "network", "webbrowser", "internet" },
+        ["Multimídia"] = { "audiovideo", "audio", "video", "multimedia", "graphics" },
+        ["Utilitários"] = { "utility", "accessories", "utilities" },
+        Sistema = { "system", "settings" },
+    }
+
+    local filtered_apps = {}
+    if active_category == "Todos" or active_category == "" then
+        filtered_apps = apps
+    else
+        local allowed = category_map[active_category] or { string.lower(active_category) }
+        for _, app in ipairs(apps) do
+            local matched = false
+            if app.categories and type(app.categories) == "table" then
+                for _, cat in ipairs(app.categories) do
+                    local cl = string.lower(cat)
+                    for _, target in ipairs(allowed) do
+                        if string.find(cl, target, 1, true) then
+                            matched = true
+                            break
+                        end
+                    end
+                    if matched then break end
+                end
+            end
+            if matched then
+                table.insert(filtered_apps, app)
+            end
+        end
+    end
+
     return Zenith.Box({
         direction = "column",
         width = LauncherDefaults.width,
@@ -40,16 +75,16 @@ local function Launcher(props: { query: string?, selected_index: number? }?)
         children = {
             LauncherHeader({
                 query = query,
-                result_count = #apps,
+                result_count = #filtered_apps,
             }),
-            LauncherCategories({ active = "Todos" }),
+            LauncherCategories({ active = active_category }),
             Zenith.Box({
                 direction = "column",
                 width = "100%",
                 height = 360,
                 children = {
                     LauncherGrid({
-                        apps = apps,
+                        apps = filtered_apps,
                         selected_index = selected_index,
                     }),
                 },

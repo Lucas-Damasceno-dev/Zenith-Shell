@@ -9,9 +9,6 @@
 /// - Returns `min` if `val < min`.
 /// - Returns `max` if `val > max`.
 /// - Returns `val` otherwise.
-///
-/// # Skeletons / Stubs
-/// Concrete logic will be implemented in Stage 2 (Dev).
 #[inline]
 pub fn clamp<T: PartialOrd>(val: T, min: T, max: T) -> T {
     if val < min {
@@ -29,9 +26,6 @@ pub fn clamp<T: PartialOrd>(val: T, min: T, max: T) -> T {
 /// # Contract
 /// - Normalizes bounds if `min > max` so the interval is valid `[min(a, b), max(a, b)]`.
 /// - Clamps `val` to the normalized bounds.
-///
-/// # Skeletons / Stubs
-/// Concrete logic will be implemented in Stage 2 (Dev).
 #[inline]
 pub fn clamp_safe<T: PartialOrd + Copy>(val: T, min: T, max: T) -> T {
     let (min, max) = if min > max { (max, min) } else { (min, max) };

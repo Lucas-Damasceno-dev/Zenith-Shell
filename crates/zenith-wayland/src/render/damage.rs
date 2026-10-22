@@ -482,10 +482,13 @@ mod tests {
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let old = vec![b1.clone()];
@@ -507,7 +510,7 @@ mod tests {
             border_radius: 0.0,
             shadow: None,
             custom_shader: None,
-            text: Some(("12:00".to_string(), Color::rgb(255, 255, 255), 14.0)),
+            text: Some(("12:00".into(), Color::rgb(255, 255, 255), 14.0)),
             image: None,
             text_input: None,
             slider: None,
@@ -517,14 +520,17 @@ mod tests {
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let mut b2 = b1.clone();
-        b2.text = Some(("12:01".to_string(), Color::rgb(255, 255, 255), 14.0));
+        b2.text = Some(("12:01".into(), Color::rgb(255, 255, 255), 14.0));
 
         let old = vec![b1];
         let new = vec![b2];
@@ -560,10 +566,13 @@ mod tests {
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let rect_outside = DamageRect::new(200, 200, 50, 50);
@@ -656,10 +665,13 @@ mod tests {
             clip_rect: None,
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
-            tooltip: Some("Tooltip Title".to_string()),
+            tooltip: Some("Tooltip Title".into()),
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let mut b2 = b1.clone();
@@ -693,10 +705,13 @@ mod tests {
             clip_rect: Some([0.0, 0.0, 50.0, 50.0]),
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
             tooltip_active: false,
+            font_family: None,
+            font_weight: None,
         };
 
         let mut b2 = b1.clone();

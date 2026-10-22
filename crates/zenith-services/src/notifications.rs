@@ -71,9 +71,32 @@ static DND_ENABLED: AtomicBool = AtomicBool::new(false);
 pub struct NotificationService;
 
 impl NotificationService {
-    /// Retrieve all active notifications with explicit error handling.
+    /// Retrieve all active notifications with explicit error handling and automatic expiration cleanup.
     pub fn try_list_active() -> Result<Vec<NotificationItem>, NotificationError> {
         let state = Self::get_state();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let mut w = state.write().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
+            let before = w.active.len();
+            w.active.retain(|item| {
+                if item.expire_timeout_ms > 0 {
+                    let expire_secs = (item.expire_timeout_ms as u64 + 999) / 1000;
+                    if now >= item.timestamp_secs + expire_secs {
+                        return false;
+                    }
+                }
+                true
+            });
+            if w.active.len() != before {
+                drop(w);
+                Self::notify_change();
+                let r = state.read().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
+                return Ok(r.active.clone());
+            }
+        }
         let r = state.read().map_err(|e| NotificationError::LockPoisoned(e.to_string()))?;
         Ok(r.active.clone())
     }
@@ -198,6 +221,26 @@ impl NotificationService {
 
         drop(w);
         Self::notify_change();
+
+        if expire_timeout_ms > 0 {
+            let timeout = Duration::from_millis(expire_timeout_ms as u64);
+            std::thread::Builder::new()
+                .name("zenith-notif-expire".into())
+                .spawn(move || {
+                    std::thread::sleep(timeout);
+                    let state = Self::get_state();
+                    if let Ok(mut w) = state.write() {
+                        let before = w.active.len();
+                        w.active.retain(|n| n.id != id);
+                        if w.active.len() != before {
+                            drop(w);
+                            Self::notify_change();
+                        }
+                    }
+                })
+                .ok();
+        }
+
         Ok(id)
     }
 

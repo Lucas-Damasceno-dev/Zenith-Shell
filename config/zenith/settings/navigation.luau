@@ -202,7 +202,7 @@ local PAGES: { NavigationItem } = {
         desc = "Versão do motor, runtime Luau, atalhos do teclado e diagnóstico",
         essential = true,
         tasks = {
-            { id = "about", name = "Zenith Shell v0.2", icon = "󰌽" },
+            { id = "about", name = "Zenith Shell v0.3.0", icon = "󰌽" },
             { id = "cheatsheet", name = "Atalhos de Teclado", icon = "󰌌" },
             { id = "diagnostics", name = "Diagnóstico", icon = "󰘵" },
         },

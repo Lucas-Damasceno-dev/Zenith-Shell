@@ -29,6 +29,7 @@ pub enum ShellCommand {
     SettingsList(std::sync::mpsc::Sender<String>),
     SettingsSync(std::sync::mpsc::Sender<String>),
     SettingsReload(std::sync::mpsc::Sender<String>),
+    SettingsResetDefaults(std::sync::mpsc::Sender<String>),
 }
 
 /// Resolves the UNIX domain socket path for Zenith IPC.
@@ -407,6 +408,17 @@ where
                     }
                     Err(_) => {
                         let _ = stream.write_all(b"ERR: settings reload timeout\n");
+                    }
+                }
+            } else if trimmed == "settings:reset_defaults" || trimmed == "settings:reset-defaults" {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = handler_ref(ShellCommand::SettingsResetDefaults(tx));
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => {
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(_) => {
+                        let _ = stream.write_all(b"ERR: settings reset_defaults timeout\n");
                     }
                 }
             } else {

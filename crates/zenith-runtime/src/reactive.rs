@@ -16,7 +16,7 @@ static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static ACTIVE_EFFECT: RefCell<Option<EffectId>> = const { RefCell::new(None) };
-    static CURRENT_MOUNTING_TREE: RefCell<Option<String>> = const { RefCell::new(None) };
+    pub(crate) static CURRENT_MOUNTING_TREE: RefCell<Option<String>> = const { RefCell::new(None) };
     static BATCH_DEPTH: RefCell<usize> = const { RefCell::new(0) };
     static PENDING_CHANGES: RefCell<Vec<(SignalId, SignalValue)>> = const { RefCell::new(Vec::new()) };
 }
@@ -48,6 +48,20 @@ impl SignalValue {
             SignalValue::Float(f) => std::borrow::Cow::Owned(f.to_string()),
             SignalValue::Boolean(b) => std::borrow::Cow::Borrowed(if *b { "true" } else { "false" }),
             SignalValue::Color(_) => std::borrow::Cow::Borrowed(""),
+        }
+    }
+
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            SignalValue::Boolean(b) => Some(*b),
+            SignalValue::Float(f) => Some(*f != 0.0),
+            SignalValue::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            },
+            SignalValue::Color(_) => None,
         }
     }
 
@@ -97,6 +111,10 @@ pub struct ReactiveGraph {
     mounted_trees: RwLock<HashMap<String, MountedTree>>,
     /// Signal values cached in Rust
     signal_values: RwLock<HashMap<SignalId, SignalValue>>,
+    /// Associated effects per mounted tree ID for zero-leak cleanup
+    tree_effects: RwLock<HashMap<String, Vec<EffectId>>>,
+    /// Associated signals per mounted tree ID for zero-leak cleanup
+    tree_signals: RwLock<HashMap<String, Vec<SignalId>>>,
 }
 
 impl Default for ReactiveGraph {
@@ -113,6 +131,8 @@ impl ReactiveGraph {
             node_bindings: RwLock::new(HashMap::new()),
             mounted_trees: RwLock::new(HashMap::new()),
             signal_values: RwLock::new(HashMap::new()),
+            tree_effects: RwLock::new(HashMap::new()),
+            tree_signals: RwLock::new(HashMap::new()),
         }
     }
 
@@ -143,6 +163,12 @@ impl ReactiveGraph {
         let key = lua.create_registry_value(callback.clone())?;
 
         self.effects.write().unwrap().insert(effect_id, Arc::new(key));
+
+        CURRENT_MOUNTING_TREE.with(|tree| {
+            if let Some(ref t) = *tree.borrow() {
+                self.tree_effects.write().unwrap().entry(t.clone()).or_default().push(effect_id);
+            }
+        });
 
         // Run effect callback immediately with tracking enabled
         ACTIVE_EFFECT.with(|eff| {
@@ -185,11 +211,53 @@ impl ReactiveGraph {
 
     /// Binds a specific node in a mounted UI tree to a signal.
     pub fn bind_node(&self, signal_id: SignalId, binding: NodeBinding) {
+        CURRENT_MOUNTING_TREE.with(|tree| {
+            if let Some(ref t) = *tree.borrow() {
+                self.tree_signals.write().unwrap().entry(t.clone()).or_default().push(signal_id);
+            }
+        });
         let mut bindings = self.node_bindings.write().unwrap();
         bindings.entry(signal_id).or_default().push(binding);
     }
 
-    /// Stores current tree under tree_id and resets dirty flag.
+    /// Cleans stale node bindings, effects, and signals for a specific tree before re-evaluation.
+    pub fn clear_tree(&self, tree_id: &str) {
+        // 1. Clean stale node bindings
+        {
+            let mut bindings = self.node_bindings.write().unwrap();
+            for (_, list) in bindings.iter_mut() {
+                list.retain(|b| b.tree_id != tree_id);
+            }
+        }
+        // 2. Clean stale effects
+        {
+            let mut tree_effs = self.tree_effects.write().unwrap();
+            if let Some(eff_ids) = tree_effs.remove(tree_id) {
+                let mut effects = self.effects.write().unwrap();
+                let mut subs = self.subscribers.write().unwrap();
+                for id in &eff_ids {
+                    effects.remove(id);
+                }
+                for (_, list) in subs.iter_mut() {
+                    list.retain(|id| !eff_ids.contains(id));
+                }
+            }
+        }
+        // 3. Clean stale signals
+        {
+            let mut tree_sigs = self.tree_signals.write().unwrap();
+            if let Some(sig_ids) = tree_sigs.remove(tree_id) {
+                let mut sig_values = self.signal_values.write().unwrap();
+                let mut subs = self.subscribers.write().unwrap();
+                for id in &sig_ids {
+                    sig_values.remove(id);
+                    subs.remove(id);
+                }
+            }
+        }
+    }
+
+    /// Stores current tree under tree_id and sets dirty flag.
     pub fn mount_tree(&self, tree_id: &str, root: UiNode) {
         let mut trees = self.mounted_trees.write().unwrap();
         trees.insert(
@@ -228,6 +296,14 @@ impl ReactiveGraph {
         let mut trees = self.mounted_trees.write().unwrap();
         if let Some(t) = trees.get_mut(tree_id) {
             t.is_dirty = false;
+        }
+    }
+
+    /// Marks the tree as dirty, forcing re-evaluation or re-render on the next frame.
+    pub fn mark_tree_dirty(&self, tree_id: &str) {
+        let mut trees = self.mounted_trees.write().unwrap();
+        if let Some(t) = trees.get_mut(tree_id) {
+            t.is_dirty = true;
         }
     }
 
@@ -298,6 +374,16 @@ impl ReactiveGraph {
         result
     }
 
+    /// Retrieves the current cached value for a signal ID.
+    pub fn get_signal_value(&self, signal_id: SignalId) -> Option<SignalValue> {
+        self.signal_values.read().unwrap().get(&signal_id).cloned()
+    }
+
+    /// Sets or initializes the cached value for a signal ID without firing triggers.
+    pub fn set_signal_value(&self, signal_id: SignalId, val: SignalValue) {
+        self.signal_values.write().unwrap().insert(signal_id, val);
+    }
+
     /// Notifies the graph that a signal value has changed.
     /// Updates bound node properties in-place without AST re-parsing,
     /// marks affected mounted trees dirty, and runs subscriber effects.
@@ -319,6 +405,10 @@ impl ReactiveGraph {
     }
 
     fn apply_signal_value_change(&self, lua: &Lua, signal_id: SignalId, val: SignalValue) {
+        if self.signal_values.read().unwrap().get(&signal_id) == Some(&val) {
+            return;
+        }
+
         // 1. Update cached value in Rust
         self.signal_values.write().unwrap().insert(signal_id, val.clone());
 
@@ -391,7 +481,7 @@ impl ReactiveGraph {
         if path.is_empty() {
             match property {
                 BoundProperty::Text => match node {
-                    UiNode::Text { text, .. } => *text = val.as_str().into_owned(),
+                    UiNode::Text { text, .. } => *text = std::sync::Arc::from(val.as_str().as_ref()),
                     UiNode::TextInput { text, .. } => *text = val.as_str().into_owned(),
                     _ => {}
                 },
@@ -481,6 +571,7 @@ mod tests {
             children: vec![],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -540,6 +631,7 @@ mod tests {
             children: vec![],
             on_click: None,
             on_right_click: None,
+            on_middle_click: None,
             on_scroll_up: None,
             on_scroll_down: None,
             tooltip: None,
@@ -586,5 +678,50 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_identical_signal_value_short_circuits() {
+        let graph = Arc::new(ReactiveGraph::new());
+        let lua = Lua::new();
+        let sig = ReactiveGraph::next_signal_id();
+
+        let root = UiNode::Box {
+            style: zenith_layout::NodeStyle {
+                width: Some(zenith_layout::length(100.0)),
+                ..Default::default()
+            },
+            children: vec![],
+            on_click: None,
+            on_right_click: None,
+            on_middle_click: None,
+            on_scroll_up: None,
+            on_scroll_down: None,
+            tooltip: None,
+        };
+        graph.mount_tree("test_tree", root);
+        graph.bind_node(
+            sig,
+            NodeBinding {
+                tree_id: "test_tree".to_string(),
+                node_path: vec![],
+                property: BoundProperty::Width,
+            },
+        );
+
+        // First notification changes the value and marks tree dirty
+        graph.notify_signal_value_change(&lua, sig, SignalValue::Float(100.0));
+        assert!(graph.mounted_trees.read().unwrap().get("test_tree").unwrap().is_dirty);
+
+        // Clear dirty flag
+        graph.mounted_trees.write().unwrap().get_mut("test_tree").unwrap().is_dirty = false;
+
+        // Re-notifying with IDENTICAL value must short-circuit without dirtying tree
+        graph.notify_signal_value_change(&lua, sig, SignalValue::Float(100.0));
+        assert!(!graph.mounted_trees.read().unwrap().get("test_tree").unwrap().is_dirty);
+
+        // Notifying with a different value must update and dirty the tree
+        graph.notify_signal_value_change(&lua, sig, SignalValue::Float(200.0));
+        assert!(graph.mounted_trees.read().unwrap().get("test_tree").unwrap().is_dirty);
     }
 }

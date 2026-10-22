@@ -29,7 +29,7 @@ return function(props: any?)
                 gap = 4,
                 children = {
                     Zenith.Text({ text = Icons.glyphs.cpu, font_family = "JetBrainsMono Nerd Font", font_size = 13, color = t.primary or "#7c4dff" }),
-                    Zenith.Text({ text = string.format("%d%%", math.floor(cpu_val)), font_family = "JetBrainsMono Nerd Font", font_size = 11, color = t.on_surface or "#ffffff" }),
+                    Zenith.Text({ text = (Zenith.Signals and Zenith.Signals.Cpu) or string.format("%d%%", math.floor(cpu_val)), font_family = "JetBrainsMono Nerd Font", font_size = 11, color = t.on_surface or "#ffffff" }),
                 },
             }),
             Zenith.Box({
@@ -38,7 +38,7 @@ return function(props: any?)
                 gap = 4,
                 children = {
                     Zenith.Text({ text = Icons.glyphs.memory, font_family = "JetBrainsMono Nerd Font", font_size = 13, color = t.secondary or "#625b71" }),
-                    Zenith.Text({ text = string.format("%d%%", math.floor(mem_val)), font_family = "JetBrainsMono Nerd Font", font_size = 11, color = t.on_surface or "#ffffff" }),
+                    Zenith.Text({ text = (Zenith.Signals and Zenith.Signals.Memory) or string.format("%d%%", math.floor(mem_val)), font_family = "JetBrainsMono Nerd Font", font_size = 11, color = t.on_surface or "#ffffff" }),
                 },
             }),
         },

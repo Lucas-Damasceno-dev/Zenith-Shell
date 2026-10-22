@@ -42,6 +42,12 @@ static IS_UPDATING_SINKS: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 pub struct AudioService;
 
+enum AudioCommand {
+    Volume(u8),
+    Mute(bool),
+    DefaultSink(u32),
+}
+
 impl AudioService {
     /// Invalidate sinks cache non-blockingly and trigger background refresh.
     pub fn invalidate_sinks_cache() {
@@ -113,8 +119,54 @@ impl AudioService {
         UnixStream::connect(path).is_ok()
     }
 
-    /// Discover audio playback sinks via PipeWire native socket and kernel ALSA telemetry without subprocesses.
+    /// Parses `wpctl status` output to extract genuine PipeWire node IDs, human names, and active default status.
+    pub fn parse_wpctl_sinks(output: &str) -> Vec<AudioDevice> {
+        let mut sinks = Vec::new();
+        let mut in_sinks = false;
+
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("Sinks:") {
+                in_sinks = true;
+                continue;
+            }
+            if in_sinks {
+                if trimmed.contains("Sources:") || trimmed.contains("Filters:") || trimmed.contains("Streams:") || trimmed.starts_with("Video") {
+                    break;
+                }
+                let is_default = line.contains('*');
+                let cleaned = line.replace(['│', '├', '─', '└', '*'], " ");
+                let cleaned = cleaned.trim();
+                if let Some((id_str, rest)) = cleaned.split_once('.') {
+                    if let Ok(id) = id_str.trim().parse::<u32>() {
+                        let name = if let Some((n, _)) = rest.split_once("[vol:") {
+                            n.trim().to_string()
+                        } else {
+                            rest.trim().to_string()
+                        };
+                        sinks.push(AudioDevice {
+                            id,
+                            name,
+                            is_default,
+                        });
+                    }
+                }
+            }
+        }
+        sinks
+    }
+
+    /// Discover audio playback sinks via PipeWire `wpctl status` with fallback to kernel ALSA telemetry.
     pub fn query_wpctl_audio_sinks() -> Vec<AudioDevice> {
+        if let Ok(output) = std::process::Command::new("wpctl").args(["status"]).output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let sinks = Self::parse_wpctl_sinks(&text);
+                if !sinks.is_empty() {
+                    return sinks;
+                }
+            }
+        }
         let mut sinks = Self::query_kernel_audio_sinks();
         if Self::is_pipewire_socket_active() {
             let selected_id = SELECTED_SINK_ID.load(Ordering::SeqCst);
@@ -263,34 +315,47 @@ impl AudioService {
             .output();
     }
 
-    fn get_volume_worker() -> &'static std::sync::mpsc::SyncSender<u8> {
-        static WORKER: std::sync::OnceLock<std::sync::mpsc::SyncSender<u8>> = std::sync::OnceLock::new();
+    fn get_audio_worker() -> &'static std::sync::mpsc::SyncSender<AudioCommand> {
+        static WORKER: std::sync::OnceLock<std::sync::mpsc::SyncSender<AudioCommand>> = std::sync::OnceLock::new();
         WORKER.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<u8>(16);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<AudioCommand>(32);
             std::thread::Builder::new()
-                .name("zenith-audio-volume".into())
+                .name("zenith-audio-worker".into())
                 .spawn(move || {
-                    while let Ok(mut vol) = rx.recv() {
-                        // Coalesce / debounce rapid bursts (e.g. 500Hz-1000Hz mouse drag)
-                        while let Ok(next) = rx.try_recv() {
-                            vol = next;
+                    while let Ok(cmd) = rx.recv() {
+                        match cmd {
+                            AudioCommand::Volume(mut vol) => {
+                                // Coalesce rapid volume adjustments
+                                while let Ok(AudioCommand::Volume(next)) = rx.try_recv() {
+                                    vol = next;
+                                }
+                                Self::dispatch_native_volume(vol);
+                            }
+                            AudioCommand::Mute(is_muted) => {
+                                Self::dispatch_native_mute(is_muted);
+                            }
+                            AudioCommand::DefaultSink(id) => {
+                                Self::dispatch_native_default_sink(id);
+                                Self::invalidate_sinks_cache();
+                                crate::invalidate_audio_cache();
+                                Self::notify_change();
+                            }
                         }
-                        Self::dispatch_native_volume(vol);
                     }
                 })
-                .expect("Failed to spawn zenith audio volume worker");
+                .expect("Failed to spawn zenith audio worker");
             tx
         })
     }
 
     /// Try setting volume percentage on default audio sink.
     pub fn try_set_volume(percent: u8) -> Result<(), AudioError> {
-        let clamped = percent.min(100);
+        let clamped = percent.min(150);
         crate::SystemService::update_audio_cache(|snap| {
             snap.volume = clamped;
         });
         Self::notify_change();
-        match Self::get_volume_worker().try_send(clamped) {
+        match Self::get_audio_worker().try_send(AudioCommand::Volume(clamped)) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
         }
@@ -306,12 +371,12 @@ impl AudioService {
         let mut new_vol = 0;
         crate::SystemService::update_audio_cache(|snap| {
             let cur = snap.volume as i32;
-            let target = cur.saturating_add(delta).clamp(0, 100) as u8;
+            let target = cur.saturating_add(delta).clamp(0, 150) as u8;
             snap.volume = target;
             new_vol = target;
         });
         Self::notify_change();
-        match Self::get_volume_worker().try_send(new_vol) {
+        match Self::get_audio_worker().try_send(AudioCommand::Volume(new_vol)) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
         }
@@ -328,10 +393,10 @@ impl AudioService {
             snap.is_muted = !snap.is_muted;
         }).is_muted;
         Self::notify_change();
-        std::thread::spawn(move || {
-            Self::dispatch_native_mute(is_muted);
-        });
-        Ok(())
+        match Self::get_audio_worker().try_send(AudioCommand::Mute(is_muted)) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
+        }
     }
 
     /// Toggle mute state for default audio sink instantly.
@@ -344,13 +409,10 @@ impl AudioService {
         SELECTED_SINK_ID.store(id, Ordering::SeqCst);
         Self::invalidate_sinks_cache();
         Self::notify_change();
-        std::thread::spawn(move || {
-            Self::dispatch_native_default_sink(id);
-            Self::invalidate_sinks_cache();
-            crate::invalidate_audio_cache();
-            Self::notify_change();
-        });
-        Ok(())
+        match Self::get_audio_worker().try_send(AudioCommand::DefaultSink(id)) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(AudioError::ChannelDisconnected),
+        }
     }
 
     /// Set default audio output sink by ID via PipeWire native socket and WirePlumber D-Bus.
@@ -390,5 +452,12 @@ mod tests {
         let sinks = AudioService::list_sinks();
         assert!(!sinks.is_empty());
         assert!(sinks.iter().any(|s| !s.name.is_empty()));
+    }
+
+    #[test]
+    fn test_optimistic_volume_cache_retention() {
+        let _ = AudioService::try_set_volume(72);
+        let snap = crate::SystemService::audio_snapshot();
+        assert_eq!(snap.volume, 72, "Optimistic audio cache should immediately retain updated volume");
     }
 }
